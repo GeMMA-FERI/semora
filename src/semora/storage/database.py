@@ -89,11 +89,14 @@ class Database:
 
     def insert_newspaper(self, newspaper: Newspaper) -> None:
         """Insert one newspaper issue and its source metadata."""
-        metadata_json = json.dumps(newspaper.metadata or {}, ensure_ascii=False)
-        normalized = normalize_newspaper_metadata(newspaper.metadata)
+        self.insert_newspapers([newspaper])
 
+    def insert_newspapers(self, newspapers: list[Newspaper]) -> None:
+        """Insert multiple newspaper issues in one transaction."""
+        if not newspapers:
+            return
         with self.conn:
-            self.conn.execute(
+            self.conn.executemany(
                 """
                 INSERT INTO newspapers (
                     newspaper_id,
@@ -107,23 +110,11 @@ class Database:
                     title,
                     urn,
                     issue,
-                    volume
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    volume,
+                    relative_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    newspaper.newspaper_id,
-                    newspaper.run_id,
-                    newspaper.content,
-                    metadata_json,
-                    normalized["date"],
-                    normalized["publisher"],
-                    normalized["source"],
-                    normalized["rights"],
-                    normalized["title"],
-                    normalized["urn"],
-                    normalized["issue"],
-                    normalized["volume"],
-                ),
+                [_newspaper_values(newspaper) for newspaper in newspapers],
             )
 
     def insert_article(self, article: Article) -> None:
@@ -139,17 +130,47 @@ class Database:
                     newspaper_id,
                     title,
                     content,
-                    metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    article.article_id,
-                    article.run_id,
-                    article.newspaper_id,
-                    article.title,
-                    article.content,
                     metadata_json,
-                ),
+                    char_start,
+                    char_end,
+                    line_start,
+                    line_end,
+                    is_valid,
+                    cleaning_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _article_values(article, metadata_json),
+            )
+
+    def insert_articles(self, articles: list[Article]) -> None:
+        """Insert multiple articles in one transaction."""
+        if not articles:
+            return
+        with self.conn:
+            self.conn.executemany(
+                """
+                INSERT INTO articles (
+                    article_id,
+                    run_id,
+                    newspaper_id,
+                    title,
+                    content,
+                    metadata_json,
+                    char_start,
+                    char_end,
+                    line_start,
+                    line_end,
+                    is_valid,
+                    cleaning_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    _article_values(
+                        article,
+                        json.dumps(article.metadata or {}, ensure_ascii=False),
+                    )
+                    for article in articles
+                ],
             )
 
     def insert_chunking_run(self, chunking_run: ChunkingRun) -> None:
@@ -186,8 +207,12 @@ class Database:
                     chunking_run_id,
                     chunk_index,
                     method,
-                    text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    text,
+                    char_start,
+                    char_end,
+                    line_start,
+                    line_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _chunk_values(chunk),
             )
@@ -207,8 +232,12 @@ class Database:
                     chunking_run_id,
                     chunk_index,
                     method,
-                    text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    text,
+                    char_start,
+                    char_end,
+                    line_start,
+                    line_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [_chunk_values(chunk) for chunk in chunks],
             )
@@ -1107,6 +1136,46 @@ def _chunk_values(chunk: Chunk) -> tuple:
         chunk.chunk_index,
         chunk.method,
         chunk.text,
+        chunk.char_start,
+        chunk.char_end,
+        chunk.line_start,
+        chunk.line_end,
+    )
+
+
+def _newspaper_values(newspaper: Newspaper) -> tuple:
+    normalized = normalize_newspaper_metadata(newspaper.metadata)
+    return (
+        newspaper.newspaper_id,
+        newspaper.run_id,
+        newspaper.content,
+        json.dumps(newspaper.metadata or {}, ensure_ascii=False),
+        normalized["date"],
+        normalized["publisher"],
+        normalized["source"],
+        normalized["rights"],
+        normalized["title"],
+        normalized["urn"],
+        normalized["issue"],
+        normalized["volume"],
+        newspaper.relative_path,
+    )
+
+
+def _article_values(article: Article, metadata_json: str) -> tuple:
+    return (
+        article.article_id,
+        article.run_id,
+        article.newspaper_id,
+        article.title,
+        article.content,
+        metadata_json,
+        article.char_start,
+        article.char_end,
+        article.line_start,
+        article.line_end,
+        article.is_valid,
+        article.cleaning_reason,
     )
 
 
@@ -1118,5 +1187,4 @@ def _embedding_values(embedding: Embedding) -> tuple:
         embedding.tensor_blob,
         embedding.chunk_id,
     )
-
 

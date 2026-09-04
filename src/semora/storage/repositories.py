@@ -42,8 +42,14 @@ class DocumentRepository:
     def add_newspaper(self, newspaper: Newspaper) -> None:
         self.database.insert_newspaper(newspaper)
 
+    def add_newspapers(self, newspapers: list[Newspaper]) -> None:
+        self.database.insert_newspapers(newspapers)
+
     def add_article(self, article: Article) -> None:
         self.database.insert_article(article)
+
+    def add_articles(self, articles: list[Article]) -> None:
+        self.database.insert_articles(articles)
 
     def list_newspapers(self) -> list[sqlite3.Row]:
         return self.database.get_newspapers()

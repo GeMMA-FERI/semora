@@ -32,3 +32,10 @@ finally:
 
 The domain repositories cover common operations. Advanced batch and analytical
 queries remain available directly on `Database`.
+
+Newspaper records may include a POSIX-style path relative to `corpus/`.
+Articles and chunks may include `char_start`, `char_end`, `line_start`, and
+`line_end` positions in the original Markdown issue. Character offsets are
+zero-based and end-exclusive; line numbers are one-based and inclusive. These
+fields let search clients retrieve nearby source context without reconstructing
+positions from cleaned text.

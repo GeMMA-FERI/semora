@@ -1,11 +1,15 @@
 import re
 from abc import ABC, abstractmethod
-from typing import cast
+from typing import Any, cast
 
 try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore[import-not-found]
+    import langchain_text_splitters as _langchain_splitters
 except ImportError:  # pragma: no cover - handled when split processor is used
-    RecursiveCharacterTextSplitter = None
+    _langchain_splitters = None  # type: ignore[assignment]
+
+RecursiveCharacterTextSplitter: Any = (
+    _langchain_splitters.RecursiveCharacterTextSplitter if _langchain_splitters else None
+)
 
 
 class TextProcessor(ABC):

@@ -24,11 +24,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = [
+    "tqdm>=4.66",
+]
 
 [project.optional-dependencies]
 chunking = [
     "langchain-text-splitters>=0.2",
+    "tqdm>=4.66",
     "transformers>=4.41",
 ]
 embeddings = [
@@ -53,6 +56,7 @@ projection = [
 ]
 retrieval = [
     "faiss-cpu>=1.8",
+    "numpy>=1.26",
     "scikit-learn>=1.4",
     "sentence-transformers>=3.0",
     "torch>=2.2",
@@ -77,6 +81,7 @@ dev = [
 ]
 
 [project.scripts]
+semora = "semora.cli.main:main"
 semora-project-embeddings = "semora.projection.projector:main"
 semora-query = "semora.retrieval.search:main"
 semora-serve = "semora.retrieval.server:main"

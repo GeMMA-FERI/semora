@@ -24,6 +24,7 @@ class Newspaper:
     run_id: str
     content: str
     metadata: dict | None = None
+    relative_path: str | None = None
 
 
 @dataclass
@@ -34,6 +35,12 @@ class Article:
     title: str | None
     content: str
     metadata: dict | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    is_valid: bool | None = None
+    cleaning_reason: str | None = None
 
 
 @dataclass
@@ -53,6 +60,10 @@ class Chunk:
     chunk_index: int
     method: str
     text: str
+    char_start: int | None = None
+    char_end: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
 
 
 @dataclass
