@@ -11,22 +11,70 @@ from semora.corpus import DEFAULT_MODEL_ID
 from semora.storage import Database
 
 
-def build_bm25_index(database_path: str | Path = "indexes/semora.sqlite") -> int:
+def build_bm25_index(
+    database_path: str | Path = "indexes/semora.sqlite",
+    *,
+    max_chunks: int | None = None,
+    batch_size: int = 10_000,
+    rebuild: bool = False,
+) -> int:
+    """Build or resume the contentless BM25 index up to a total chunk target."""
+    if max_chunks is not None and max_chunks < 0:
+        raise ValueError("max_chunks must be non-negative.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
     database = Database(database_path)
     try:
         database.initialize()
-        with database.conn:
-            database.conn.execute("DELETE FROM chunk_fts")
-            database.conn.execute(
+        if rebuild:
+            with database.conn:
+                database.conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')")
+                database.conn.execute("DELETE FROM chunk_fts_map")
+        indexed = int(database.conn.execute("SELECT COUNT(*) FROM chunk_fts_map").fetchone()[0])
+        last_row = database.conn.execute(
+            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id DESC LIMIT 1"
+        ).fetchone()
+        next_fts_id = int(last_row["fts_id"]) + 1 if last_row is not None else 1
+        last_chunk_id = str(last_row["chunk_id"]) if last_row is not None else ""
+        while max_chunks is None or indexed < max_chunks:
+            limit = batch_size if max_chunks is None else min(batch_size, max_chunks - indexed)
+            rows = database.conn.execute(
                 """
-                INSERT INTO chunk_fts (chunk_id, title, text)
-                SELECT chunks.chunk_id, COALESCE(articles.title, ''), chunks.text
+                SELECT chunks.chunk_id, COALESCE(articles.title, '') AS title, chunks.text
                 FROM chunks
                 JOIN articles ON articles.article_id = chunks.article_id
                 WHERE articles.is_valid = 1
-                """
-            )
-        return int(database.conn.execute("SELECT COUNT(*) FROM chunk_fts").fetchone()[0])
+                  AND chunks.chunk_id > ?
+                ORDER BY chunks.chunk_id
+                LIMIT ?
+                """,
+                (last_chunk_id, limit),
+            ).fetchall()
+            if not rows:
+                break
+            mapping = [
+                (next_fts_id + offset, str(row["chunk_id"]))
+                for offset, row in enumerate(rows)
+            ]
+            documents = [
+                (next_fts_id + offset, str(row["title"]), str(row["text"]))
+                for offset, row in enumerate(rows)
+            ]
+            with database.conn:
+                database.conn.executemany(
+                    "INSERT INTO chunk_fts_map (fts_id, chunk_id) VALUES (?, ?)",
+                    mapping,
+                )
+                database.conn.executemany(
+                    "INSERT INTO chunk_fts (rowid, title, text) VALUES (?, ?, ?)",
+                    documents,
+                )
+            added = len(rows)
+            indexed += added
+            next_fts_id += added
+            last_chunk_id = str(rows[-1]["chunk_id"])
+            print(f"BM25 indexed chunks: {indexed:,}", file=sys.stderr)
+        return indexed
     finally:
         database.close()
 

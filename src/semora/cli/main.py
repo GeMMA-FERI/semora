@@ -45,7 +45,13 @@ def main() -> None:
         )
         return
     if args.command == "index" and args.index_type == "bm25":
-        _print_json({"indexed_chunks": build_bm25_index(database_path), "index": "bm25"})
+        indexed = build_bm25_index(
+            database_path,
+            max_chunks=args.max_chunks,
+            batch_size=args.batch_size,
+            rebuild=args.rebuild,
+        )
+        _print_json({"indexed_chunks": indexed, "index": "bm25"})
         return
     if args.command == "index" and args.index_type == "semantic":
         count = build_semantic_index(
@@ -110,7 +116,10 @@ def _parser() -> argparse.ArgumentParser:
 
     index = commands.add_parser("index", help="Build a retrieval index from indexes/semora.sqlite.")
     index_types = index.add_subparsers(dest="index_type", required=True)
-    index_types.add_parser("bm25", help="Build the SQLite FTS5 BM25 index.")
+    bm25 = index_types.add_parser("bm25", help="Build or resume the SQLite FTS5 BM25 index.")
+    bm25.add_argument("--max-chunks", type=int, help="Stop when the index reaches this total size.")
+    bm25.add_argument("--batch-size", type=int, default=10_000)
+    bm25.add_argument("--rebuild", action="store_true", help="Clear the BM25 index before adding chunks.")
     semantic = index_types.add_parser("semantic", help="Build the persistent FAISS semantic index.")
     semantic.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     semantic.add_argument("--batch-size", type=int, default=64)

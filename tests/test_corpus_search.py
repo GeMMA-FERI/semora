@@ -145,6 +145,9 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     assert args.articles is True
     assert args.chunks is False
 
+    index_args = _parser().parse_args(["index", "bm25", "--max-chunks", "100000"])
+    assert index_args.max_chunks == 100_000
+
 
 def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
@@ -177,6 +180,40 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert values[1] == {"id": "stop", "ok": True}
     finally:
         engine.close()
+
+
+def test_contentless_bm25_index_resumes_to_total_target(tmp_path: Path, monkeypatch) -> None:
+    root, _ = _build_corpus(tmp_path, monkeypatch)
+    database_path = root / "indexes" / "semora.sqlite"
+
+    assert build_bm25_index(database_path, max_chunks=2, batch_size=1) == 2
+    database = Database(database_path)
+    try:
+        first_mapping = database.conn.execute(
+            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id"
+        ).fetchall()
+        schema = database.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'"
+        ).fetchone()["sql"]
+        stored_columns = database.conn.execute("SELECT title, text FROM chunk_fts LIMIT 1").fetchone()
+        assert "content = ''" in schema
+        assert tuple(stored_columns) == (None, None)
+    finally:
+        database.close()
+
+    assert build_bm25_index(database_path, max_chunks=3, batch_size=1) == 3
+    assert build_bm25_index(database_path, max_chunks=3, batch_size=1) == 3
+    database = Database(database_path)
+    try:
+        resumed_mapping = database.conn.execute(
+            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id"
+        ).fetchall()
+        assert [tuple(row) for row in resumed_mapping[:2]] == [tuple(row) for row in first_mapping]
+    finally:
+        database.close()
+
+    assert build_bm25_index(database_path, batch_size=1) == 4
+    assert build_bm25_index(database_path, max_chunks=1, rebuild=True) == 1
 
 
 def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, monkeypatch) -> None:

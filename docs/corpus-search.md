@@ -23,6 +23,7 @@ Run these commands from the repository containing `corpus/`:
 semora ingest --newspapers --replace
 semora ingest --articles
 semora ingest --chunks
+semora index bm25 --max-chunks 100000
 semora index bm25
 semora index semantic
 ```
@@ -36,8 +37,16 @@ process. Stage flags may also be combined, and omitting all stage flags runs all
 three in order. `--replace` is only valid when `--newspapers` is selected and
 removes the previous database before rebuilding it.
 
-`index bm25` rebuilds the SQLite FTS5 index. `index semantic` encodes valid
-chunks and creates a normalized inner-product FAISS index in
+`index bm25` builds a contentless SQLite FTS5 index, so indexed title and chunk
+text are not stored for a second time. A small mapping table connects FTS row
+IDs to canonical chunk IDs. Writes commit in batches and resume after the last
+committed chunk. `--max-chunks N` is a total target: rerunning the same target
+is a no-op, increasing it adds more chunks, and omitting it indexes everything
+remaining. Use `--batch-size` to control transaction size or `--rebuild` to
+clear the lexical index first. A target below the current indexed count does
+not remove rows.
+
+`index semantic` encodes valid chunks and creates a normalized inner-product FAISS index in
 `indexes/semantic/`; its manifest records the model and chunk configuration.
 
 The default model is gated. Accept the

@@ -22,6 +22,17 @@ semora ingest --articles
 semora ingest --chunks
 ```
 
+BM25 indexing supports bounded experiments and continuation:
+
+```sh
+semora index bm25 --max-chunks 100000
+semora index bm25 --max-chunks 1000000
+semora index bm25
+```
+
+The limit is the desired total index size, not the number added by that one
+command. Use `--rebuild` when a fresh lexical index is required.
+
 Semora also installs lower-level commands:
 
 ```sh

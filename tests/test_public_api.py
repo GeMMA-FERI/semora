@@ -30,6 +30,6 @@ def test_public_storage_api_and_repositories() -> None:
         assert [row["article_id"] for row in rows] == ["article-1"]
         assert [row["version"] for row in database.conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        )] == [1, 2, 3, 4, 5]
+        )] == [1, 2, 3, 4, 5, 6]
     finally:
         database.close()

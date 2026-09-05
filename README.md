@@ -83,6 +83,7 @@ SQLite corpus, BM25 index, and EmbeddingGemma FAISS index under `indexes/`:
 semora ingest --newspapers --replace
 semora ingest --articles
 semora ingest --chunks
+semora index bm25 --max-chunks 100000
 semora index bm25
 semora index semantic
 semora search bm25 "search terms"
@@ -97,6 +98,10 @@ persistent NDJSON interface intended for agent integrations.
 
 Running `semora ingest --replace` without stage flags performs all three
 ingestion stages in the same order.
+
+BM25 indexing is contentless and resumable. `--max-chunks` specifies the total
+desired index size, so increasing it continues from the last committed batch;
+omitting it indexes all remaining valid chunks.
 
 ## Command-line tools
 

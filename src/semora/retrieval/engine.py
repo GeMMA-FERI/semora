@@ -106,9 +106,10 @@ class SearchEngine:
                    newspapers.source, newspapers.title AS newspaper_title,
                    newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
                    newspapers.relative_path,
-                   bm25(chunk_fts, 0.0, 2.0, 1.0) AS rank
+                   bm25(chunk_fts, 2.0, 1.0) AS rank
             FROM chunk_fts
-            JOIN chunks ON chunks.chunk_id = chunk_fts.chunk_id
+            JOIN chunk_fts_map ON chunk_fts_map.fts_id = chunk_fts.rowid
+            JOIN chunks ON chunks.chunk_id = chunk_fts_map.chunk_id
             JOIN articles ON articles.article_id = chunks.article_id
             JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
             WHERE chunk_fts MATCH ?
