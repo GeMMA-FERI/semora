@@ -25,6 +25,8 @@ semora ingest --articles
 semora ingest --chunks
 semora index bm25 --max-chunks 100000
 semora index bm25
+semora models download-classla
+semora index lemma
 semora index semantic
 ```
 
@@ -46,6 +48,26 @@ remaining. Use `--batch-size` to control transaction size or `--rebuild` to
 clear the lexical index first. A target below the current indexed count does
 not remove rows.
 
+`index lemma` uses CLASSLA's Slovene tokenizer, POS tagger, and lemmatizer. It
+processes each selected article once, maps the resulting lemmas back onto the
+chunks already present in the surface BM25 sample, and stores them in a second
+contentless FTS5 index. Commits occur every `--batch-articles` articles and
+`--max-articles N` is a resumable total target. If the surface BM25 sample or
+CLASSLA pipeline type changes, rebuild the lemma index with `--rebuild`.
+
+Install the `classla` extra and download its language resources before the
+first lemma-indexing run:
+
+```sh
+pip install "semora[classla]"
+semora models download-classla
+```
+
+Use `--classla-device cpu` to force CPU execution or `cuda` to require a CUDA
+device. `--classla-resources-dir` selects a non-default resource directory.
+The default CLASSLA pipeline targets standard Slovene; historical spelling and
+OCR errors will not always normalize correctly, so surface BM25 remains useful.
+
 `index semantic` encodes valid chunks and creates a normalized inner-product FAISS index in
 `indexes/semantic/`; its manifest records the model and chunk configuration.
 
@@ -58,6 +80,8 @@ indexing accept model and batching overrides; use `--help` for details.
 
 ```sh
 semora search bm25 "Ljubljana gledališče" --limit 20
+semora search bm25-lemma "ljubljanska gledališča" --limit 20
+semora search bm25-combined "ljubljanska gledališča" --lemma-weight 1.0
 semora search regex "Ljubljan[ae]" --ignore-case --context-lines 4
 semora search semantic "reports about theatre in Ljubljana" --before 1 --after 1
 ```
@@ -69,6 +93,11 @@ include adjacent chunks from the same article. `--context-lines` expands the
 snippet using lines from the original newspaper issue. Searches may be filtered
 with `--newspaper`, `--date-from`, and `--date-to`.
 
+`bm25-lemma` lemmatizes the query and searches only normalized terms.
+`bm25-combined` merges surface and lemma BM25 scores; `--lemma-weight` controls
+the lemma contribution. Lemma queries are interpreted as natural text, whereas
+surface `bm25` queries retain SQLite FTS5 query syntax.
+
 ## Persistent agent process
 
 `semora stdio` loads the database, FAISS index, and embedding model once, then
@@ -78,6 +107,7 @@ Diagnostics go to stderr, leaving stdout machine-readable.
 ```json
 {"id":"q1","op":"search","mode":"semantic","query":"reports about theatre","limit":5,"before":1,"after":1}
 {"id":"q2","op":"search","mode":"bm25","query":"Ljubljana","date_from":"1934-01-01"}
+{"id":"q3","op":"search","mode":"bm25-combined","query":"ljubljanska gledališča","lemma_weight":1.0}
 {"id":"health","op":"health"}
 {"id":"done","op":"shutdown"}
 ```

@@ -29,6 +29,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+classla = [
+    "classla",
+]
 chunking = [
     "langchain-text-splitters>=0.2",
     "tqdm>=4.66",

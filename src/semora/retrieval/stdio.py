@@ -24,7 +24,12 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
             if operation == "health":
                 _write(
                     output_stream,
-                    {"id": request_id, "ok": True, "semantic_loaded": engine.semantic_loaded},
+                    {
+                        "id": request_id,
+                        "ok": True,
+                        "semantic_loaded": engine.semantic_loaded,
+                        "lemma_loaded": engine.lemma_loaded,
+                    },
                 )
                 continue
             if operation != "search":
@@ -40,6 +45,7 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                 newspaper=request.get("newspaper"),
                 date_from=request.get("date_from"),
                 date_to=request.get("date_to"),
+                lemma_weight=float(request.get("lemma_weight", 1.0)),
             )
             _write(output_stream, {"id": request_id, "hits": [hit.as_dict() for hit in hits]})
         except Exception as exc:

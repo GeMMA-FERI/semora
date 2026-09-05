@@ -33,6 +33,20 @@ semora index bm25
 The limit is the desired total index size, not the number added by that one
 command. Use `--rebuild` when a fresh lexical index is required.
 
+Slovene lemma search is an optional second lexical index:
+
+```sh
+semora models download-classla
+semora index lemma --max-articles 10000
+semora index lemma
+semora search bm25-lemma "gledališča"
+semora search bm25-combined "ljubljanska gledališča" --lemma-weight 1.0
+```
+
+The article limit is a total target, so lemma indexing resumes after its last
+committed article. Run `semora index lemma --rebuild` after rebuilding or
+expanding the surface BM25 index.
+
 Semora also installs lower-level commands:
 
 ```sh

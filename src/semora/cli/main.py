@@ -8,8 +8,9 @@ from pathlib import Path
 
 from semora.corpus import DEFAULT_MODEL_ID, DEFAULT_TOKEN_COUNT, DEFAULT_TOKEN_OVERLAP, ingest_corpus
 from semora.retrieval.engine import SearchEngine
-from semora.retrieval.indexing import build_bm25_index, build_semantic_index
+from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
+from semora.text import download_classla_models
 
 
 def main() -> None:
@@ -63,8 +64,41 @@ def main() -> None:
         )
         _print_json({"indexed_chunks": count, "index": "semantic", "model_id": args.model_id})
         return
+    if args.command == "index" and args.index_type == "lemma":
+        lemma_stats = build_lemma_index(
+            database_path,
+            max_articles=args.max_articles,
+            batch_articles=args.batch_articles,
+            rebuild=args.rebuild,
+            pipeline_type=args.classla_type,
+            device=args.classla_device,
+            resources_dir=args.classla_resources_dir,
+        )
+        _print_json(
+            {
+                "index": "lemma",
+                "surface_chunks": lemma_stats.surface_chunks,
+                "processed_articles": lemma_stats.processed_articles,
+                "indexed_chunks": lemma_stats.indexed_chunks,
+                "complete": lemma_stats.complete,
+            }
+        )
+        return
+    if args.command == "models" and args.model_command == "download-classla":
+        download_classla_models(
+            pipeline_type=args.classla_type,
+            resources_dir=args.classla_resources_dir,
+        )
+        _print_json({"model": "classla", "language": "sl", "type": args.classla_type})
+        return
     if args.command == "search":
-        engine = SearchEngine(database_path, semantic_dir)
+        engine = SearchEngine(
+            database_path,
+            semantic_dir,
+            classla_type=args.classla_type,
+            classla_device=args.classla_device,
+            classla_resources_dir=args.classla_resources_dir,
+        )
         try:
             hits = engine.search(
                 args.mode,
@@ -77,13 +111,21 @@ def main() -> None:
                 newspaper=args.newspaper,
                 date_from=args.date_from,
                 date_to=args.date_to,
+                lemma_weight=args.lemma_weight,
             )
             _print_json({"hits": [hit.as_dict() for hit in hits]})
         finally:
             engine.close()
         return
     if args.command == "stdio":
-        engine = SearchEngine(database_path, semantic_dir, load_semantic=not args.no_semantic)
+        engine = SearchEngine(
+            database_path,
+            semantic_dir,
+            load_semantic=not args.no_semantic,
+            classla_type=args.classla_type,
+            classla_device=args.classla_device,
+            classla_resources_dir=args.classla_resources_dir,
+        )
         try:
             run_stdio(engine)
         finally:
@@ -124,11 +166,23 @@ def _parser() -> argparse.ArgumentParser:
     semantic.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     semantic.add_argument("--batch-size", type=int, default=64)
     semantic.add_argument("--device", default=None, help="Sentence Transformers device, such as cpu or cuda.")
+    lemma = index_types.add_parser("lemma", help="Build or resume the CLASSLA lemma BM25 index.")
+    lemma.add_argument("--max-articles", type=int, help="Stop when this total number of articles is processed.")
+    lemma.add_argument("--batch-articles", type=int, default=50)
+    lemma.add_argument("--rebuild", action="store_true", help="Clear the lemma index before processing.")
+    _add_classla_options(lemma)
+
+    models = commands.add_parser("models", help="Manage optional external language models.")
+    model_commands = models.add_subparsers(dest="model_command", required=True)
+    classla = model_commands.add_parser("download-classla", help="Download Slovene CLASSLA models.")
+    classla.add_argument("--classla-type", default="default", help="CLASSLA pipeline type (default: default).")
+    classla.add_argument("--classla-resources-dir", help="Custom CLASSLA resources directory.")
 
     search = commands.add_parser("search", help="Run one search and write JSON to stdout.")
-    search.add_argument("mode", choices=("bm25", "regex", "semantic"))
+    search.add_argument("mode", choices=("bm25", "bm25-lemma", "bm25-combined", "regex", "semantic"))
     search.add_argument("query")
     _add_search_options(search)
+    _add_classla_options(search)
 
     stdio = commands.add_parser("stdio", help="Serve newline-delimited JSON requests on stdin/stdout.")
     stdio.add_argument(
@@ -136,6 +190,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not preload FAISS and EmbeddingGemma; semantic requests will load them lazily.",
     )
+    _add_classla_options(stdio)
     return parser
 
 
@@ -148,6 +203,23 @@ def _add_search_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--newspaper", help="Restrict matches to a normalized source or newspaper title.")
     parser.add_argument("--date-from", help="Restrict matches to this ISO date or later.")
     parser.add_argument("--date-to", help="Restrict matches to this ISO date or earlier.")
+    parser.add_argument(
+        "--lemma-weight",
+        type=float,
+        default=1.0,
+        help="Weight of lemma BM25 scores in bm25-combined mode (default: 1.0).",
+    )
+
+
+def _add_classla_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--classla-type", default="default", help="CLASSLA pipeline type (default: default).")
+    parser.add_argument(
+        "--classla-device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="CLASSLA execution device (default: auto).",
+    )
+    parser.add_argument("--classla-resources-dir", help="Custom CLASSLA resources directory.")
 
 
 def _print_json(value: dict) -> None:

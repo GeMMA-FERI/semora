@@ -9,6 +9,7 @@ from typing import Any
 
 from semora.retrieval.models import SearchHit
 from semora.storage import Database
+from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
 
 class SearchEngine:
@@ -18,6 +19,10 @@ class SearchEngine:
         semantic_dir: str | Path = "indexes/semantic",
         *,
         load_semantic: bool = False,
+        lemmatizer: Lemmatizer | None = None,
+        classla_type: str = "default",
+        classla_device: str = "auto",
+        classla_resources_dir: str | Path | None = None,
     ) -> None:
         self.database = Database(database_path)
         self.database.initialize()
@@ -26,6 +31,10 @@ class SearchEngine:
         self._semantic_model: Any = None
         self._semantic_chunk_ids: list[str] = []
         self._semantic_manifest: dict[str, Any] | None = None
+        self._lemmatizer = lemmatizer
+        self._classla_type = classla_type
+        self._classla_device = classla_device
+        self._classla_resources_dir = classla_resources_dir
         if load_semantic:
             self.load_semantic()
 
@@ -35,6 +44,10 @@ class SearchEngine:
     @property
     def semantic_loaded(self) -> bool:
         return self._semantic_index is not None
+
+    @property
+    def lemma_loaded(self) -> bool:
+        return self._lemmatizer is not None
 
     def load_semantic(self) -> None:
         if self._semantic_index is not None:
@@ -69,11 +82,25 @@ class SearchEngine:
         newspaper: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        lemma_weight: float = 1.0,
     ) -> list[SearchHit]:
         if limit < 1 or before < 0 or after < 0 or context_lines < 0:
             raise ValueError("limit must be positive and context values must be non-negative.")
+        if lemma_weight < 0:
+            raise ValueError("lemma_weight must be non-negative.")
         if mode == "bm25":
             matches = self._search_bm25(query, limit, newspaper, date_from, date_to)
+        elif mode == "bm25-lemma":
+            matches = self._search_lemma_bm25(query, limit, newspaper, date_from, date_to)
+        elif mode == "bm25-combined":
+            matches = self._search_combined_bm25(
+                query,
+                limit,
+                newspaper,
+                date_from,
+                date_to,
+                lemma_weight,
+            )
         elif mode == "regex":
             matches = self._search_regex(
                 query,
@@ -100,19 +127,66 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
+        return self._search_fts("chunk_fts", query, limit, newspaper, date_from, date_to)
+
+    def _search_lemma_bm25(
+        self,
+        query: str,
+        limit: int,
+        newspaper: str | None,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> list[tuple[Any, float]]:
+        lemma_query = self._lemmatize_query(query)
+        if not lemma_query:
+            return []
+        return self._search_fts("chunk_lemma_fts", lemma_query, limit, newspaper, date_from, date_to)
+
+    def _search_combined_bm25(
+        self,
+        query: str,
+        limit: int,
+        newspaper: str | None,
+        date_from: str | None,
+        date_to: str | None,
+        lemma_weight: float,
+    ) -> list[tuple[Any, float]]:
+        candidate_limit = max(50, limit * 5)
+        surface = self._search_bm25(query, candidate_limit, newspaper, date_from, date_to)
+        lemma = self._search_lemma_bm25(query, candidate_limit, newspaper, date_from, date_to)
+        combined: dict[str, tuple[Any, float]] = {}
+        for row, score in surface:
+            combined[str(row["chunk_id"])] = (row, score)
+        for row, score in lemma:
+            chunk_id = str(row["chunk_id"])
+            previous = combined.get(chunk_id)
+            combined[chunk_id] = (row, lemma_weight * score + (previous[1] if previous else 0.0))
+        return sorted(combined.values(), key=lambda item: item[1], reverse=True)[:limit]
+
+    def _search_fts(
+        self,
+        table: str,
+        query: str,
+        limit: int,
+        newspaper: str | None,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> list[tuple[Any, float]]:
+        if table not in {"chunk_fts", "chunk_lemma_fts"}:
+            raise ValueError(f"Unsupported FTS table: {table}")
         rows = self.database.conn.execute(
-            """
+            f"""
             SELECT chunks.*, articles.title AS article_title,
                    newspapers.source, newspapers.title AS newspaper_title,
                    newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
                    newspapers.relative_path,
-                   bm25(chunk_fts, 2.0, 1.0) AS rank
-            FROM chunk_fts
-            JOIN chunk_fts_map ON chunk_fts_map.fts_id = chunk_fts.rowid
+                   bm25({table}, 2.0, 1.0) AS rank
+            FROM {table}
+            JOIN chunk_fts_map ON chunk_fts_map.fts_id = {table}.rowid
             JOIN chunks ON chunks.chunk_id = chunk_fts_map.chunk_id
             JOIN articles ON articles.article_id = chunks.article_id
             JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
-            WHERE chunk_fts MATCH ?
+            WHERE {table} MATCH ?
               AND (? IS NULL OR newspapers.source = ? OR newspapers.title = ?)
               AND (? IS NULL OR newspapers.date >= ?)
               AND (? IS NULL OR newspapers.date <= ?)
@@ -132,6 +206,26 @@ class SearchEngine:
             ),
         ).fetchall()
         return [(row, -float(row["rank"])) for row in rows]
+
+    def _lemmatize_query(self, query: str) -> str:
+        state = self.database.conn.execute(
+            "SELECT indexed_chunks FROM lemma_index_state WHERE state_id = 1"
+        ).fetchone()
+        if state is None or int(state["indexed_chunks"]) == 0:
+            raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
+        if self._lemmatizer is None:
+            self._lemmatizer = ClasslaLemmatizer(
+                pipeline_type=self._classla_type,
+                device=self._classla_device,
+                resources_dir=self._classla_resources_dir,
+            )
+        lemmas = (
+            lemma
+            for token in self._lemmatizer.annotate(query)
+            for lemma in token.lemmas
+            if any(character.isalnum() for character in lemma)
+        )
+        return " ".join(f'"{lemma.replace(chr(34), chr(34) * 2)}"' for lemma in lemmas)
 
     def _search_regex(
         self,

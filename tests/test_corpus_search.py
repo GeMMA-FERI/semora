@@ -12,9 +12,10 @@ import numpy as np
 from semora.cli.main import _parser
 from semora.corpus import indexer
 from semora.retrieval import SearchEngine
-from semora.retrieval.indexing import build_bm25_index, build_semantic_index
+from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
 from semora.storage import Database
+from semora.text import LemmaToken
 
 
 class WordTokenizer:
@@ -22,6 +23,27 @@ class WordTokenizer:
 
     def __call__(self, text: str, **_kwargs) -> dict:
         return {"offset_mapping": [match.span() for match in re.finditer(r"\S+", text)]}
+
+
+class FakeSloveneLemmatizer:
+    def __init__(self) -> None:
+        self.annotated_articles = 0
+
+    def annotate(self, text: str) -> list[LemmaToken]:
+        if "\n" in text:
+            self.annotated_articles += 1
+        normalized = {"appears": "appear", "appeared": "appear"}
+        return [
+            LemmaToken(
+                match.start(),
+                match.end(),
+                (normalized.get(match.group().casefold(), match.group().casefold()),),
+            )
+            for match in re.finditer(r"[^\W\d_]+", text, re.UNICODE)
+        ]
+
+    def lemmatize(self, text: str) -> str:
+        return " ".join(lemma for token in self.annotate(text) for lemma in token.lemmas)
 
 
 def _build_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
@@ -148,6 +170,16 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     index_args = _parser().parse_args(["index", "bm25", "--max-chunks", "100000"])
     assert index_args.max_chunks == 100_000
 
+    lemma_args = _parser().parse_args(["index", "lemma", "--max-articles", "1000", "--classla-device", "cpu"])
+    assert lemma_args.max_articles == 1_000
+    assert lemma_args.classla_device == "cpu"
+
+    search_args = _parser().parse_args(["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5"])
+    assert search_args.lemma_weight == 0.5
+
+    model_args = _parser().parse_args(["models", "download-classla"])
+    assert model_args.classla_type == "default"
+
 
 def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
@@ -214,6 +246,54 @@ def test_contentless_bm25_index_resumes_to_total_target(tmp_path: Path, monkeypa
 
     assert build_bm25_index(database_path, batch_size=1) == 4
     assert build_bm25_index(database_path, max_chunks=1, rebuild=True) == 1
+
+
+def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: Path, monkeypatch) -> None:
+    root, _ = _build_corpus(tmp_path, monkeypatch)
+    database_path = root / "indexes" / "semora.sqlite"
+    assert build_bm25_index(database_path) == 4
+    lemmatizer = FakeSloveneLemmatizer()
+
+    partial = build_lemma_index(
+        database_path,
+        max_articles=1,
+        batch_articles=1,
+        lemmatizer=lemmatizer,
+    )
+    assert partial.processed_articles == 1
+    assert partial.complete is False
+    finished = build_lemma_index(database_path, batch_articles=1, lemmatizer=lemmatizer)
+    assert finished.processed_articles == 2
+    assert finished.indexed_chunks == 4
+    assert finished.complete is True
+    assert lemmatizer.annotated_articles == 2
+
+    database = Database(database_path)
+    try:
+        schema = database.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'chunk_lemma_fts'"
+        ).fetchone()["sql"]
+        stored_columns = database.conn.execute(
+            "SELECT title, text FROM chunk_lemma_fts LIMIT 1"
+        ).fetchone()
+        assert "content = ''" in schema
+        assert tuple(stored_columns) == (None, None)
+    finally:
+        database.close()
+
+    engine = SearchEngine(
+        database_path,
+        root / "indexes" / "semantic",
+        lemmatizer=lemmatizer,
+    )
+    try:
+        assert engine.search("bm25", "appeared") == []
+        lemma_hits = engine.search("bm25-lemma", "appeared", limit=1)
+        assert "Needle appears here." in lemma_hits[0].snippet
+        combined_hits = engine.search("bm25-combined", "Needle appeared", limit=1)
+        assert "Needle appears here." in combined_hits[0].snippet
+    finally:
+        engine.close()
 
 
 def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, monkeypatch) -> None:

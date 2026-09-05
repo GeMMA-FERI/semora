@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import json
-import sys
+import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tqdm import tqdm
+
 from semora.corpus import DEFAULT_MODEL_ID
 from semora.storage import Database
+from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
+
+
+@dataclass(frozen=True)
+class LemmaIndexStats:
+    surface_chunks: int
+    processed_articles: int
+    indexed_chunks: int
+    complete: bool
 
 
 def build_bm25_index(
@@ -36,47 +48,249 @@ def build_bm25_index(
         ).fetchone()
         next_fts_id = int(last_row["fts_id"]) + 1 if last_row is not None else 1
         last_chunk_id = str(last_row["chunk_id"]) if last_row is not None else ""
-        while max_chunks is None or indexed < max_chunks:
-            limit = batch_size if max_chunks is None else min(batch_size, max_chunks - indexed)
-            rows = database.conn.execute(
+        available = int(
+            database.conn.execute(
                 """
-                SELECT chunks.chunk_id, COALESCE(articles.title, '') AS title, chunks.text
+                SELECT COUNT(*)
                 FROM chunks
                 JOIN articles ON articles.article_id = chunks.article_id
                 WHERE articles.is_valid = 1
-                  AND chunks.chunk_id > ?
-                ORDER BY chunks.chunk_id
-                LIMIT ?
-                """,
-                (last_chunk_id, limit),
-            ).fetchall()
-            if not rows:
-                break
-            mapping = [
-                (next_fts_id + offset, str(row["chunk_id"]))
-                for offset, row in enumerate(rows)
-            ]
-            documents = [
-                (next_fts_id + offset, str(row["title"]), str(row["text"]))
-                for offset, row in enumerate(rows)
-            ]
-            with database.conn:
-                database.conn.executemany(
-                    "INSERT INTO chunk_fts_map (fts_id, chunk_id) VALUES (?, ?)",
-                    mapping,
-                )
-                database.conn.executemany(
-                    "INSERT INTO chunk_fts (rowid, title, text) VALUES (?, ?, ?)",
-                    documents,
-                )
-            added = len(rows)
-            indexed += added
-            next_fts_id += added
-            last_chunk_id = str(rows[-1]["chunk_id"])
-            print(f"BM25 indexed chunks: {indexed:,}", file=sys.stderr)
+                """
+            ).fetchone()[0]
+        )
+        target = available if max_chunks is None else min(max_chunks, available)
+        with tqdm(
+            total=max(indexed, target),
+            initial=indexed,
+            desc="Indexing surface BM25",
+            unit="chunk",
+            dynamic_ncols=True,
+        ) as progress:
+            while max_chunks is None or indexed < max_chunks:
+                limit = batch_size if max_chunks is None else min(batch_size, max_chunks - indexed)
+                rows = database.conn.execute(
+                    """
+                    SELECT chunks.chunk_id, COALESCE(articles.title, '') AS title, chunks.text
+                    FROM chunks
+                    JOIN articles ON articles.article_id = chunks.article_id
+                    WHERE articles.is_valid = 1
+                      AND chunks.chunk_id > ?
+                    ORDER BY chunks.chunk_id
+                    LIMIT ?
+                    """,
+                    (last_chunk_id, limit),
+                ).fetchall()
+                if not rows:
+                    break
+                mapping = [
+                    (next_fts_id + offset, str(row["chunk_id"]))
+                    for offset, row in enumerate(rows)
+                ]
+                documents = [
+                    (next_fts_id + offset, str(row["title"]), str(row["text"]))
+                    for offset, row in enumerate(rows)
+                ]
+                with database.conn:
+                    database.conn.executemany(
+                        "INSERT INTO chunk_fts_map (fts_id, chunk_id) VALUES (?, ?)",
+                        mapping,
+                    )
+                    database.conn.executemany(
+                        "INSERT INTO chunk_fts (rowid, title, text) VALUES (?, ?, ?)",
+                        documents,
+                    )
+                added = len(rows)
+                indexed += added
+                next_fts_id += added
+                last_chunk_id = str(rows[-1]["chunk_id"])
+                progress.update(added)
         return indexed
     finally:
         database.close()
+
+
+def build_lemma_index(
+    database_path: str | Path = "indexes/semora.sqlite",
+    *,
+    max_articles: int | None = None,
+    batch_articles: int = 50,
+    rebuild: bool = False,
+    pipeline_type: str = "default",
+    device: str = "auto",
+    resources_dir: str | Path | None = None,
+    lemmatizer: Lemmatizer | None = None,
+) -> LemmaIndexStats:
+    """Lemmatize each article once and index chunks present in the surface index."""
+    if max_articles is not None and max_articles < 0:
+        raise ValueError("max_articles must be non-negative.")
+    if batch_articles <= 0:
+        raise ValueError("batch_articles must be positive.")
+    database = Database(database_path)
+    try:
+        database.initialize()
+        if rebuild:
+            with database.conn:
+                database.conn.execute("INSERT INTO chunk_lemma_fts(chunk_lemma_fts) VALUES('delete-all')")
+                database.conn.execute("DELETE FROM lemma_index_state")
+        surface_chunks = int(database.conn.execute("SELECT COUNT(*) FROM chunk_fts_map").fetchone()[0])
+        if surface_chunks == 0:
+            raise ValueError("Build the surface BM25 index before building the lemma index.")
+        state = database.conn.execute("SELECT * FROM lemma_index_state WHERE state_id = 1").fetchone()
+        if state is None:
+            with database.conn:
+                database.conn.execute(
+                    """
+                    INSERT INTO lemma_index_state (state_id, surface_chunks, pipeline_type)
+                    VALUES (1, ?, ?)
+                    """,
+                    (surface_chunks, pipeline_type),
+                )
+            last_article_id = ""
+            processed_articles = indexed_chunks = 0
+            complete = False
+        else:
+            if int(state["surface_chunks"]) != surface_chunks:
+                raise ValueError("The surface BM25 sample changed; rebuild the lemma index with --rebuild.")
+            if str(state["pipeline_type"]) != pipeline_type:
+                raise ValueError("The CLASSLA pipeline type changed; rebuild the lemma index with --rebuild.")
+            last_article_id = str(state["last_article_id"])
+            processed_articles = int(state["processed_articles"])
+            indexed_chunks = int(state["indexed_chunks"])
+            complete = bool(state["complete"])
+        if complete or (max_articles is not None and processed_articles >= max_articles):
+            return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
+
+        active_lemmatizer = lemmatizer
+        available_articles = int(
+            database.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM articles
+                WHERE articles.is_valid = 1
+                  AND articles.char_end IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM chunks
+                      JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
+                      WHERE chunks.article_id = articles.article_id
+                  )
+                """
+            ).fetchone()[0]
+        )
+        target_articles = (
+            available_articles if max_articles is None else min(max_articles, available_articles)
+        )
+        with tqdm(
+            total=max(processed_articles, target_articles),
+            initial=processed_articles,
+            desc="Indexing lemma BM25",
+            unit="article",
+            dynamic_ncols=True,
+        ) as progress:
+            progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+            while max_articles is None or processed_articles < max_articles:
+                limit = (
+                    batch_articles
+                    if max_articles is None
+                    else min(batch_articles, max_articles - processed_articles)
+                )
+                articles = database.conn.execute(
+                    """
+                    SELECT articles.article_id, articles.title, articles.content, articles.char_end
+                    FROM articles
+                    WHERE articles.is_valid = 1
+                      AND articles.char_end IS NOT NULL
+                      AND articles.article_id > ?
+                      AND EXISTS (
+                          SELECT 1
+                          FROM chunks
+                          JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
+                          WHERE chunks.article_id = articles.article_id
+                      )
+                    ORDER BY articles.article_id
+                    LIMIT ?
+                    """,
+                    (last_article_id, limit),
+                ).fetchall()
+                if not articles:
+                    complete = True
+                    with database.conn:
+                        database.conn.execute(
+                            """
+                            UPDATE lemma_index_state
+                            SET complete = 1, updated_at = CURRENT_TIMESTAMP
+                            WHERE state_id = 1
+                            """
+                        )
+                    break
+                if active_lemmatizer is None:
+                    active_lemmatizer = ClasslaLemmatizer(
+                        pipeline_type=pipeline_type,
+                        device=device,
+                        resources_dir=resources_dir,
+                    )
+                documents: list[tuple[int, str, str]] = []
+                for article in articles:
+                    documents.extend(_lemma_documents(database, article, active_lemmatizer))
+                last_article_id = str(articles[-1]["article_id"])
+                processed_articles += len(articles)
+                indexed_chunks += len(documents)
+                with database.conn:
+                    database.conn.executemany(
+                        "INSERT INTO chunk_lemma_fts (rowid, title, text) VALUES (?, ?, ?)",
+                        documents,
+                    )
+                    database.conn.execute(
+                        """
+                        UPDATE lemma_index_state
+                        SET last_article_id = ?, processed_articles = ?, indexed_chunks = ?,
+                            complete = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE state_id = 1
+                        """,
+                        (last_article_id, processed_articles, indexed_chunks),
+                    )
+                progress.update(len(articles))
+                progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+        return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
+    finally:
+        database.close()
+
+
+def _lemma_documents(database: Database, article: sqlite3.Row, lemmatizer: Lemmatizer) -> list[tuple[int, str, str]]:
+    title = str(article["title"] or "")
+    content = str(article["content"])
+    prefix = f"{title}\n" if title else ""
+    tokens = lemmatizer.annotate(prefix + content)
+    title_end = len(title)
+    lemma_title = " ".join(
+        lemma
+        for token in tokens
+        if token.start < title_end
+        for lemma in token.lemmas
+    ) or title
+    content_char_start = int(article["char_end"]) - len(content)
+    chunks = database.conn.execute(
+        """
+        SELECT chunk_fts_map.fts_id, chunks.text, chunks.char_start, chunks.char_end
+        FROM chunks
+        JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
+        WHERE chunks.article_id = ?
+        ORDER BY chunks.chunk_index
+        """,
+        (article["article_id"],),
+    ).fetchall()
+    documents: list[tuple[int, str, str]] = []
+    for chunk in chunks:
+        local_start = int(chunk["char_start"]) - content_char_start + len(prefix)
+        local_end = int(chunk["char_end"]) - content_char_start + len(prefix)
+        lemma_text = " ".join(
+            lemma
+            for token in tokens
+            if token.start < local_end and token.end > local_start
+            for lemma in token.lemmas
+        ) or str(chunk["text"])
+        documents.append((int(chunk["fts_id"]), lemma_title, lemma_text))
+    return documents
 
 
 def build_semantic_index(
@@ -122,23 +336,38 @@ def build_semantic_index(
             ORDER BY chunks.chunk_id
             """
         )
-        while batch := rows.fetchmany(batch_size):
-            texts = [str(row["text"]) for row in batch]
-            encode = getattr(model, "encode_document", model.encode)
-            vectors = encode(
-                texts,
-                batch_size=batch_size,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            matrix = np.asarray(vectors, dtype="float32")
-            if index is None:
-                index = faiss.IndexFlatIP(matrix.shape[1])
-            index.add(matrix)
-            chunk_ids.extend(str(row["chunk_id"]) for row in batch)
-            if len(chunk_ids) % (batch_size * 100) == 0:
-                print(f"Embedded {len(chunk_ids):,} chunks", file=sys.stderr)
+        total_chunks = int(
+            database.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM chunks
+                JOIN articles ON articles.article_id = chunks.article_id
+                WHERE articles.is_valid = 1
+                """
+            ).fetchone()[0]
+        )
+        with tqdm(
+            total=total_chunks,
+            desc="Building semantic index",
+            unit="chunk",
+            dynamic_ncols=True,
+        ) as progress:
+            while batch := rows.fetchmany(batch_size):
+                texts = [str(row["text"]) for row in batch]
+                encode = getattr(model, "encode_document", model.encode)
+                vectors = encode(
+                    texts,
+                    batch_size=batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                matrix = np.asarray(vectors, dtype="float32")
+                if index is None:
+                    index = faiss.IndexFlatIP(matrix.shape[1])
+                index.add(matrix)
+                chunk_ids.extend(str(row["chunk_id"]) for row in batch)
+                progress.update(len(batch))
         if index is None:
             raise ValueError("The database contains no valid chunks to index.")
         index_temp = target / ".index.faiss.tmp"

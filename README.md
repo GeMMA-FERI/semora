@@ -17,7 +17,7 @@ Install optional capabilities as needed:
 
 ```sh
 pip install ".[chunking,embeddings,openai-batch,projection]"
-pip install ".[retrieval,server]"
+pip install ".[classla,retrieval,server]"
 ```
 
 For development:
@@ -85,8 +85,11 @@ semora ingest --articles
 semora ingest --chunks
 semora index bm25 --max-chunks 100000
 semora index bm25
+semora models download-classla
+semora index lemma
 semora index semantic
 semora search bm25 "search terms"
+semora search bm25-combined "iskanje po pregibnih oblikah"
 semora search regex "regular expression" --context-lines 3
 semora search semantic "natural-language query" --before 1 --after 1
 ```
@@ -102,6 +105,10 @@ ingestion stages in the same order.
 BM25 indexing is contentless and resumable. `--max-chunks` specifies the total
 desired index size, so increasing it continues from the last committed batch;
 omitting it indexes all remaining valid chunks.
+
+The optional CLASSLA index lemmatizes each Slovene article once and stores a
+second contentless FTS index. It supports lemma-only and combined surface-plus-
+lemma BM25 search without changing the original text or snippets.
 
 ## Command-line tools
 
