@@ -37,15 +37,19 @@ Slovene lemma search is an optional second lexical index:
 
 ```sh
 semora models download-classla
-semora index lemma --max-articles 10000
+semora index lemma --max-articles 10000 --batch-articles 50 --profile
 semora index lemma
 semora search bm25-lemma "gledališča"
 semora search bm25-combined "ljubljanska gledališča" --lemma-weight 1.0
 ```
 
 The article limit is a total target, so lemma indexing resumes after its last
-committed article. Run `semora index lemma --rebuild` after rebuilding or
-expanding the surface BM25 index.
+committed article. Each article batch is processed in one CLASSLA call and one
+SQLite transaction. `--classla-pos-batch-size` and
+`--classla-lemma-batch-size` override CLASSLA's internal inference batches;
+`--profile` prints processor timings and CUDA-memory usage. Run
+`semora index lemma --rebuild` after rebuilding or expanding the surface BM25
+index.
 
 Semora also installs lower-level commands:
 

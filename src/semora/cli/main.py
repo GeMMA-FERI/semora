@@ -73,6 +73,9 @@ def main() -> None:
             pipeline_type=args.classla_type,
             device=args.classla_device,
             resources_dir=args.classla_resources_dir,
+            pos_batch_size=args.classla_pos_batch_size,
+            lemma_batch_size=args.classla_lemma_batch_size,
+            profile=args.profile,
         )
         _print_json(
             {
@@ -170,6 +173,21 @@ def _parser() -> argparse.ArgumentParser:
     lemma.add_argument("--max-articles", type=int, help="Stop when this total number of articles is processed.")
     lemma.add_argument("--batch-articles", type=int, default=50)
     lemma.add_argument("--rebuild", action="store_true", help="Clear the lemma index before processing.")
+    lemma.add_argument(
+        "--classla-pos-batch-size",
+        type=int,
+        help="Override CLASSLA's POS inference batch size (model default: 5000).",
+    )
+    lemma.add_argument(
+        "--classla-lemma-batch-size",
+        type=int,
+        help="Override CLASSLA's lemma inference batch size (model default: 50).",
+    )
+    lemma.add_argument(
+        "--profile",
+        action="store_true",
+        help="Report database, CLASSLA processor, throughput, and CUDA-memory timings per batch.",
+    )
     _add_classla_options(lemma)
 
     models = commands.add_parser("models", help="Manage optional external language models.")

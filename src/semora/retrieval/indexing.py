@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +14,7 @@ from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
 from semora.storage import Database
-from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
+from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer, LemmaToken
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,9 @@ def build_lemma_index(
     pipeline_type: str = "default",
     device: str = "auto",
     resources_dir: str | Path | None = None,
+    pos_batch_size: int | None = None,
+    lemma_batch_size: int | None = None,
+    profile: bool = False,
     lemmatizer: Lemmatizer | None = None,
 ) -> LemmaIndexStats:
     """Lemmatize each article once and index chunks present in the surface index."""
@@ -161,27 +166,8 @@ def build_lemma_index(
             return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
 
         active_lemmatizer = lemmatizer
-        available_articles = int(
-            database.conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM articles
-                WHERE articles.is_valid = 1
-                  AND articles.char_end IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM chunks
-                      JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
-                      WHERE chunks.article_id = articles.article_id
-                  )
-                """
-            ).fetchone()[0]
-        )
-        target_articles = (
-            available_articles if max_articles is None else min(max_articles, available_articles)
-        )
         with tqdm(
-            total=max(processed_articles, target_articles),
+            total=max(processed_articles, max_articles) if max_articles is not None else None,
             initial=processed_articles,
             desc="Indexing lemma BM25",
             unit="article",
@@ -194,6 +180,7 @@ def build_lemma_index(
                     if max_articles is None
                     else min(batch_articles, max_articles - processed_articles)
                 )
+                fetch_started = time.perf_counter()
                 articles = database.conn.execute(
                     """
                     SELECT articles.article_id, articles.title, articles.content, articles.char_end
@@ -212,6 +199,7 @@ def build_lemma_index(
                     """,
                     (last_article_id, limit),
                 ).fetchall()
+                fetch_seconds = time.perf_counter() - fetch_started
                 if not articles:
                     complete = True
                     with database.conn:
@@ -224,17 +212,26 @@ def build_lemma_index(
                         )
                     break
                 if active_lemmatizer is None:
+                    print("Loading CLASSLA pipeline...", file=sys.stderr)
+                    load_started = time.perf_counter()
                     active_lemmatizer = ClasslaLemmatizer(
                         pipeline_type=pipeline_type,
                         device=device,
                         resources_dir=resources_dir,
+                        pos_batch_size=pos_batch_size,
+                        lemma_batch_size=lemma_batch_size,
                     )
-                documents: list[tuple[int, str, str]] = []
-                for article in articles:
-                    documents.extend(_lemma_documents(database, article, active_lemmatizer))
+                    print(
+                        f"CLASSLA pipeline loaded in {time.perf_counter() - load_started:.2f}s.",
+                        file=sys.stderr,
+                    )
+                processing_started = time.perf_counter()
+                documents = _lemma_documents_batch(database, articles, active_lemmatizer)
+                processing_seconds = time.perf_counter() - processing_started
                 last_article_id = str(articles[-1]["article_id"])
                 processed_articles += len(articles)
                 indexed_chunks += len(documents)
+                write_started = time.perf_counter()
                 with database.conn:
                     database.conn.executemany(
                         "INSERT INTO chunk_lemma_fts (rowid, title, text) VALUES (?, ?, ?)",
@@ -249,18 +246,48 @@ def build_lemma_index(
                         """,
                         (last_article_id, processed_articles, indexed_chunks),
                     )
+                write_seconds = time.perf_counter() - write_started
                 progress.update(len(articles))
                 progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+                if profile:
+                    _print_lemma_profile(
+                        active_lemmatizer,
+                        fetch_seconds=fetch_seconds,
+                        processing_seconds=processing_seconds,
+                        write_seconds=write_seconds,
+                    )
         return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
     finally:
         database.close()
 
 
-def _lemma_documents(database: Database, article: sqlite3.Row, lemmatizer: Lemmatizer) -> list[tuple[int, str, str]]:
+def _lemma_documents_batch(
+    database: Database,
+    articles: list[sqlite3.Row],
+    lemmatizer: Lemmatizer,
+) -> list[tuple[int, str, str]]:
+    payloads = []
+    for article in articles:
+        title = str(article["title"] or "")
+        content = str(article["content"])
+        payloads.append(f"{title}\n{content}" if title else content)
+    annotations = lemmatizer.annotate_many(payloads)
+    if len(annotations) != len(articles):
+        raise ValueError("The lemmatizer returned a different number of documents than it received.")
+    documents: list[tuple[int, str, str]] = []
+    for article, tokens in zip(articles, annotations, strict=True):
+        documents.extend(_lemma_documents(database, article, tokens))
+    return documents
+
+
+def _lemma_documents(
+    database: Database,
+    article: sqlite3.Row,
+    tokens: list[LemmaToken],
+) -> list[tuple[int, str, str]]:
     title = str(article["title"] or "")
     content = str(article["content"])
     prefix = f"{title}\n" if title else ""
-    tokens = lemmatizer.annotate(prefix + content)
     title_end = len(title)
     lemma_title = " ".join(
         lemma
@@ -291,6 +318,35 @@ def _lemma_documents(database: Database, article: sqlite3.Row, lemmatizer: Lemma
         ) or str(chunk["text"])
         documents.append((int(chunk["fts_id"]), lemma_title, lemma_text))
     return documents
+
+
+def _print_lemma_profile(
+    lemmatizer: Lemmatizer,
+    *,
+    fetch_seconds: float,
+    processing_seconds: float,
+    write_seconds: float,
+) -> None:
+    classla_profile = getattr(lemmatizer, "last_profile", None)
+    if classla_profile is None:
+        print(
+            f"Profile: fetch={fetch_seconds:.3f}s process={processing_seconds:.3f}s "
+            f"write={write_seconds:.3f}s",
+            file=sys.stderr,
+        )
+        return
+    print(
+        "Profile: "
+        f"fetch={fetch_seconds:.3f}s "
+        f"tokenize={classla_profile.tokenize_seconds:.3f}s "
+        f"pos={classla_profile.pos_seconds:.3f}s "
+        f"lemma={classla_profile.lemma_seconds:.3f}s "
+        f"map={max(0.0, processing_seconds - classla_profile.total_seconds):.3f}s "
+        f"write={write_seconds:.3f}s "
+        f"tokens/s={classla_profile.tokens_per_second:,.0f} "
+        f"peak_cuda={classla_profile.peak_cuda_bytes / 1024**2:,.0f}MiB",
+        file=sys.stderr,
+    )
 
 
 def build_semantic_index(

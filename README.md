@@ -106,9 +106,11 @@ BM25 indexing is contentless and resumable. `--max-chunks` specifies the total
 desired index size, so increasing it continues from the last committed batch;
 omitting it indexes all remaining valid chunks.
 
-The optional CLASSLA index lemmatizes each Slovene article once and stores a
-second contentless FTS index. It supports lemma-only and combined surface-plus-
-lemma BM25 search without changing the original text or snippets.
+The optional CLASSLA index lemmatizes Slovene articles in multi-document
+batches and stores a second contentless FTS index. It supports lemma-only and
+combined surface-plus-lemma BM25 search without changing the original text or
+snippets. Use `semora index lemma --profile` to inspect processor throughput
+and CUDA-memory usage.
 
 ## Command-line tools
 

@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import types
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,9 @@ class FakeSloveneLemmatizer:
             )
             for match in re.finditer(r"[^\W\d_]+", text, re.UNICODE)
         ]
+
+    def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
+        return [self.annotate(text) for text in texts]
 
     def lemmatize(self, text: str) -> str:
         return " ".join(lemma for token in self.annotate(text) for lemma in token.lemmas)
@@ -170,9 +174,26 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     index_args = _parser().parse_args(["index", "bm25", "--max-chunks", "100000"])
     assert index_args.max_chunks == 100_000
 
-    lemma_args = _parser().parse_args(["index", "lemma", "--max-articles", "1000", "--classla-device", "cpu"])
+    lemma_args = _parser().parse_args(
+        [
+            "index",
+            "lemma",
+            "--max-articles",
+            "1000",
+            "--classla-device",
+            "cpu",
+            "--classla-pos-batch-size",
+            "10000",
+            "--classla-lemma-batch-size",
+            "200",
+            "--profile",
+        ]
+    )
     assert lemma_args.max_articles == 1_000
     assert lemma_args.classla_device == "cpu"
+    assert lemma_args.classla_pos_batch_size == 10_000
+    assert lemma_args.classla_lemma_batch_size == 200
+    assert lemma_args.profile is True
 
     search_args = _parser().parse_args(["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5"])
     assert search_args.lemma_weight == 0.5

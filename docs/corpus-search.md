@@ -49,11 +49,12 @@ clear the lexical index first. A target below the current indexed count does
 not remove rows.
 
 `index lemma` uses CLASSLA's Slovene tokenizer, POS tagger, and lemmatizer. It
-processes each selected article once, maps the resulting lemmas back onto the
-chunks already present in the surface BM25 sample, and stores them in a second
-contentless FTS5 index. Commits occur every `--batch-articles` articles and
-`--max-articles N` is a resumable total target. If the surface BM25 sample or
-CLASSLA pipeline type changes, rebuild the lemma index with `--rebuild`.
+combines each `--batch-articles` group into one CLASSLA call, separates source
+documents with an explicit EOD sentinel, and validates token positions while
+mapping the lemmas back onto the original articles and chunks. The same group
+is then committed in one SQLite transaction. `--max-articles N` is a resumable
+total target. If the surface BM25 sample or CLASSLA pipeline type changes,
+rebuild the lemma index with `--rebuild`.
 
 Install the `classla` extra and download its language resources before the
 first lemma-indexing run:
@@ -67,6 +68,21 @@ Use `--classla-device cpu` to force CPU execution or `cuda` to require a CUDA
 device. `--classla-resources-dir` selects a non-default resource directory.
 The default CLASSLA pipeline targets standard Slovene; historical spelling and
 OCR errors will not always normalize correctly, so surface BM25 remains useful.
+
+CLASSLA's model initialization can take roughly two minutes on a large model
+installation, but happens only once per indexing or persistent search process.
+Use profiling while tuning inference batches:
+
+```sh
+semora index lemma --batch-articles 50 --profile
+semora index lemma --batch-articles 50 --classla-pos-batch-size 10000 \
+  --classla-lemma-batch-size 200 --profile
+```
+
+The profile reports database fetch/write time, tokenizer/POS/lemma time,
+tokens per second, and peak CUDA memory. Larger processor batches can improve
+GPU utilization but require more GPU memory. Omitting the overrides retains
+CLASSLA's model defaults.
 
 `index semantic` encodes valid chunks and creates a normalized inner-product FAISS index in
 `indexes/semantic/`; its manifest records the model and chunk configuration.
