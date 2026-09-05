@@ -51,6 +51,34 @@ SQLite transaction. `--classla-pos-batch-size` and
 `semora index lemma --rebuild` after rebuilding or expanding the surface BM25
 index.
 
+After benchmarking, enable independent CLASSLA processes explicitly:
+
+```sh
+semora index lemma --workers 4 --batch-articles 25 --profile
+```
+
+`--batch-articles` is the number processed per worker. The parent fetches up to
+`workers × batch-articles`, sends one batch to each worker, then commits all
+results in source order through its single SQLite connection. Four workers use
+approximately 35 GB of host RAM with the current Slovene models.
+
+Two read-only commands diagnose CLASSLA without modifying the lemma index:
+
+```sh
+semora profile classla --articles 1
+semora benchmark classla --articles 500 --batch-articles 50 --workers 1 2 3 4
+```
+
+The profiler writes a PyTorch CPU/CUDA Chrome trace and operator summary below
+`indexes/profiles/`. The benchmark uses the same deterministic article sample
+for every worker count and writes `indexes/classla_benchmark.json`. It reports
+steady-state throughput, worker initialization and memory, and sampled NVIDIA
+GPU utilization, memory, and power.
+
+Operator profiling is limited to five articles because CLASSLA's recurrent POS
+model generates very large event traces. For larger samples, use the lightweight
+`semora index lemma --profile` stage timings instead.
+
 Semora also installs lower-level commands:
 
 ```sh

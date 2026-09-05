@@ -7,6 +7,12 @@ import json
 from pathlib import Path
 
 from semora.corpus import DEFAULT_MODEL_ID, DEFAULT_TOKEN_COUNT, DEFAULT_TOKEN_OVERLAP, ingest_corpus
+from semora.diagnostics.classla import (
+    benchmark_classla,
+    load_classla_workload,
+    profile_classla,
+    save_diagnostics,
+)
 from semora.retrieval.engine import SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
@@ -76,6 +82,7 @@ def main() -> None:
             pos_batch_size=args.classla_pos_batch_size,
             lemma_batch_size=args.classla_lemma_batch_size,
             profile=args.profile,
+            workers=args.workers,
         )
         _print_json(
             {
@@ -93,6 +100,36 @@ def main() -> None:
             resources_dir=args.classla_resources_dir,
         )
         _print_json({"model": "classla", "language": "sl", "type": args.classla_type})
+        return
+    if args.command == "benchmark" and args.benchmark_type == "classla":
+        texts = load_classla_workload(database_path, args.articles)
+        results = benchmark_classla(
+            texts,
+            worker_counts=args.workers,
+            batch_articles=args.batch_articles,
+            pipeline_type=args.classla_type,
+            device=args.classla_device,
+            resources_dir=args.classla_resources_dir,
+            pos_batch_size=args.classla_pos_batch_size,
+            lemma_batch_size=args.classla_lemma_batch_size,
+        )
+        output_path = _resolve_output(root, args.output, "indexes/classla_benchmark.json")
+        results["output"] = str(save_diagnostics(results, output_path))
+        _print_json(results)
+        return
+    if args.command == "profile" and args.profile_type == "classla":
+        texts = load_classla_workload(database_path, args.articles)
+        output_path = _resolve_output(root, args.output, "indexes/profiles/classla_trace.json")
+        results = profile_classla(
+            texts,
+            output_path,
+            pipeline_type=args.classla_type,
+            device=args.classla_device,
+            resources_dir=args.classla_resources_dir,
+            pos_batch_size=args.classla_pos_batch_size,
+            lemma_batch_size=args.classla_lemma_batch_size,
+        )
+        _print_json(results)
         return
     if args.command == "search":
         engine = SearchEngine(
@@ -172,17 +209,14 @@ def _parser() -> argparse.ArgumentParser:
     lemma = index_types.add_parser("lemma", help="Build or resume the CLASSLA lemma BM25 index.")
     lemma.add_argument("--max-articles", type=int, help="Stop when this total number of articles is processed.")
     lemma.add_argument("--batch-articles", type=int, default=50)
+    lemma.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Independent CLASSLA worker processes; SQLite writes remain in the parent (default: 1).",
+    )
     lemma.add_argument("--rebuild", action="store_true", help="Clear the lemma index before processing.")
-    lemma.add_argument(
-        "--classla-pos-batch-size",
-        type=int,
-        help="Override CLASSLA's POS inference batch size (model default: 5000).",
-    )
-    lemma.add_argument(
-        "--classla-lemma-batch-size",
-        type=int,
-        help="Override CLASSLA's lemma inference batch size (model default: 50).",
-    )
+    _add_classla_batch_options(lemma)
     lemma.add_argument(
         "--profile",
         action="store_true",
@@ -195,6 +229,29 @@ def _parser() -> argparse.ArgumentParser:
     classla = model_commands.add_parser("download-classla", help="Download Slovene CLASSLA models.")
     classla.add_argument("--classla-type", default="default", help="CLASSLA pipeline type (default: default).")
     classla.add_argument("--classla-resources-dir", help="Custom CLASSLA resources directory.")
+
+    benchmark = commands.add_parser("benchmark", help="Run read-only performance benchmarks.")
+    benchmark_types = benchmark.add_subparsers(dest="benchmark_type", required=True)
+    classla_benchmark = benchmark_types.add_parser("classla", help="Compare CLASSLA process counts.")
+    classla_benchmark.add_argument("--articles", type=int, default=500)
+    classla_benchmark.add_argument("--batch-articles", type=int, default=50)
+    classla_benchmark.add_argument("--workers", type=int, nargs="+", default=[1, 2, 3, 4])
+    classla_benchmark.add_argument("--output", help="JSON output path relative to the repository root.")
+    _add_classla_options(classla_benchmark)
+    _add_classla_batch_options(classla_benchmark)
+
+    profile = commands.add_parser("profile", help="Capture detailed performance profiles.")
+    profile_types = profile.add_subparsers(dest="profile_type", required=True)
+    classla_profile = profile_types.add_parser("classla", help="Capture a PyTorch CLASSLA trace.")
+    classla_profile.add_argument(
+        "--articles",
+        type=int,
+        default=1,
+        help="Number of articles to trace; limited to 5 because CLASSLA produces very large traces.",
+    )
+    classla_profile.add_argument("--output", help="Chrome trace path relative to the repository root.")
+    _add_classla_options(classla_profile)
+    _add_classla_batch_options(classla_profile)
 
     search = commands.add_parser("search", help="Run one search and write JSON to stdout.")
     search.add_argument("mode", choices=("bm25", "bm25-lemma", "bm25-combined", "regex", "semantic"))
@@ -238,6 +295,24 @@ def _add_classla_options(parser: argparse.ArgumentParser) -> None:
         help="CLASSLA execution device (default: auto).",
     )
     parser.add_argument("--classla-resources-dir", help="Custom CLASSLA resources directory.")
+
+
+def _add_classla_batch_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--classla-pos-batch-size",
+        type=int,
+        help="Override CLASSLA's POS inference batch size (model default: 5000).",
+    )
+    parser.add_argument(
+        "--classla-lemma-batch-size",
+        type=int,
+        help="Override CLASSLA's lemma inference batch size (model default: 50).",
+    )
+
+
+def _resolve_output(root: Path, value: str | None, default: str) -> Path:
+    path = Path(value or default)
+    return path if path.is_absolute() else root / path
 
 
 def _print_json(value: dict) -> None:

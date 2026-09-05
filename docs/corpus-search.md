@@ -84,6 +84,29 @@ tokens per second, and peak CUDA memory. Larger processor batches can improve
 GPU utilization but require more GPU memory. Omitting the overrides retains
 CLASSLA's model defaults.
 
+Use the read-only diagnostics before enabling concurrent indexing:
+
+```sh
+semora profile classla --articles 1
+semora benchmark classla --articles 500 --batch-articles 50 --workers 1 2 3 4
+```
+
+The first command writes a PyTorch Chrome trace and operator table. The second
+compares independent CLASSLA worker processes over exactly the same articles
+and records steady-state throughput plus NVIDIA GPU and worker-memory metrics.
+
+Production indexing can use the measured worker count while retaining a single
+ordered SQLite writer:
+
+```sh
+semora index lemma --workers 4 --batch-articles 25 --profile
+```
+
+Each worker owns one CLASSLA model. With four workers, the current Slovene
+models require approximately 35 GB of host RAM. The parent commits only after
+the whole ordered group returns, so interruption cannot advance the resume
+position past an unfinished batch.
+
 `index semantic` encodes valid chunks and creates a normalized inner-product FAISS index in
 `indexes/semantic/`; its manifest records the model and chunk configuration.
 

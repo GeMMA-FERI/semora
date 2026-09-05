@@ -6,15 +6,23 @@ import json
 import sqlite3
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from multiprocessing import get_context
 from pathlib import Path
+from typing import Any
 
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
 from semora.storage import Database
-from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer, LemmaToken
+from semora.text.lemmatization import (
+    ClasslaLemmatizer,
+    LemmatizationProfile,
+    Lemmatizer,
+    LemmaToken,
+)
 
 
 @dataclass(frozen=True)
@@ -23,6 +31,18 @@ class LemmaIndexStats:
     processed_articles: int
     indexed_chunks: int
     complete: bool
+
+
+@dataclass(frozen=True)
+class _WorkerAnnotations:
+    documents: list[list[LemmaToken]]
+    profile: LemmatizationProfile | None
+    initialization_seconds: float
+
+
+_INDEX_WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
+_INDEX_WORKER_INITIALIZATION_SECONDS = 0.0
+_INDEX_WORKER_REPORT_INITIALIZATION = False
 
 
 def build_bm25_index(
@@ -123,6 +143,7 @@ def build_lemma_index(
     pos_batch_size: int | None = None,
     lemma_batch_size: int | None = None,
     profile: bool = False,
+    workers: int = 1,
     lemmatizer: Lemmatizer | None = None,
 ) -> LemmaIndexStats:
     """Lemmatize each article once and index chunks present in the surface index."""
@@ -130,7 +151,12 @@ def build_lemma_index(
         raise ValueError("max_articles must be non-negative.")
     if batch_articles <= 0:
         raise ValueError("batch_articles must be positive.")
+    if workers <= 0:
+        raise ValueError("workers must be positive.")
+    if workers > 1 and lemmatizer is not None:
+        raise ValueError("A custom lemmatizer can only be used with one worker.")
     database = Database(database_path)
+    executor: ProcessPoolExecutor | None = None
     try:
         database.initialize()
         if rebuild:
@@ -166,6 +192,21 @@ def build_lemma_index(
             return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
 
         active_lemmatizer = lemmatizer
+        worker_config: dict[str, Any] = {
+            "pipeline_type": pipeline_type,
+            "device": device,
+            "resources_dir": str(resources_dir) if resources_dir is not None else None,
+            "pos_batch_size": pos_batch_size,
+            "lemma_batch_size": lemma_batch_size,
+        }
+        if workers > 1:
+            print(f"Starting {workers} CLASSLA worker processes...", file=sys.stderr)
+            executor = ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=get_context("spawn"),
+                initializer=_initialize_index_worker,
+                initargs=(worker_config,),
+            )
         with tqdm(
             total=max(processed_articles, max_articles) if max_articles is not None else None,
             initial=processed_articles,
@@ -176,9 +217,9 @@ def build_lemma_index(
             progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
             while max_articles is None or processed_articles < max_articles:
                 limit = (
-                    batch_articles
+                    batch_articles * workers
                     if max_articles is None
-                    else min(batch_articles, max_articles - processed_articles)
+                    else min(batch_articles * workers, max_articles - processed_articles)
                 )
                 fetch_started = time.perf_counter()
                 articles = database.conn.execute(
@@ -211,7 +252,7 @@ def build_lemma_index(
                             """
                         )
                     break
-                if active_lemmatizer is None:
+                if active_lemmatizer is None and executor is None:
                     print("Loading CLASSLA pipeline...", file=sys.stderr)
                     load_started = time.perf_counter()
                     active_lemmatizer = ClasslaLemmatizer(
@@ -226,7 +267,23 @@ def build_lemma_index(
                         file=sys.stderr,
                     )
                 processing_started = time.perf_counter()
-                documents = _lemma_documents_batch(database, articles, active_lemmatizer)
+                payloads = _article_payloads(articles)
+                worker_profiles: list[_WorkerAnnotations] = []
+                if executor is None:
+                    assert active_lemmatizer is not None
+                    annotations = active_lemmatizer.annotate_many(payloads)
+                else:
+                    payload_batches = [
+                        payloads[index : index + batch_articles]
+                        for index in range(0, len(payloads), batch_articles)
+                    ]
+                    worker_profiles = list(executor.map(_annotate_index_worker, payload_batches))
+                    annotations = [
+                        document
+                        for worker_result in worker_profiles
+                        for document in worker_result.documents
+                    ]
+                documents = _lemma_documents_from_annotations(database, articles, annotations)
                 processing_seconds = time.perf_counter() - processing_started
                 last_article_id = str(articles[-1]["article_id"])
                 processed_articles += len(articles)
@@ -250,34 +307,72 @@ def build_lemma_index(
                 progress.update(len(articles))
                 progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
                 if profile:
-                    _print_lemma_profile(
-                        active_lemmatizer,
-                        fetch_seconds=fetch_seconds,
-                        processing_seconds=processing_seconds,
-                        write_seconds=write_seconds,
-                    )
+                    if executor is None:
+                        assert active_lemmatizer is not None
+                        _print_lemma_profile(
+                            active_lemmatizer,
+                            fetch_seconds=fetch_seconds,
+                            processing_seconds=processing_seconds,
+                            write_seconds=write_seconds,
+                        )
+                    else:
+                        _print_worker_profiles(
+                            worker_profiles,
+                            fetch_seconds=fetch_seconds,
+                            processing_seconds=processing_seconds,
+                            write_seconds=write_seconds,
+                        )
         return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         database.close()
 
 
-def _lemma_documents_batch(
-    database: Database,
-    articles: list[sqlite3.Row],
-    lemmatizer: Lemmatizer,
-) -> list[tuple[int, str, str]]:
+def _article_payloads(articles: list[sqlite3.Row]) -> list[str]:
     payloads = []
     for article in articles:
         title = str(article["title"] or "")
         content = str(article["content"])
         payloads.append(f"{title}\n{content}" if title else content)
-    annotations = lemmatizer.annotate_many(payloads)
+    return payloads
+
+
+def _lemma_documents_from_annotations(
+    database: Database,
+    articles: list[sqlite3.Row],
+    annotations: list[list[LemmaToken]],
+) -> list[tuple[int, str, str]]:
     if len(annotations) != len(articles):
         raise ValueError("The lemmatizer returned a different number of documents than it received.")
     documents: list[tuple[int, str, str]] = []
     for article, tokens in zip(articles, annotations, strict=True):
         documents.extend(_lemma_documents(database, article, tokens))
     return documents
+
+
+def _initialize_index_worker(config: dict[str, Any]) -> None:
+    global _INDEX_WORKER_INITIALIZATION_SECONDS, _INDEX_WORKER_LEMMATIZER, _INDEX_WORKER_REPORT_INITIALIZATION
+    started = time.perf_counter()
+    _INDEX_WORKER_LEMMATIZER = ClasslaLemmatizer(**config)
+    _INDEX_WORKER_INITIALIZATION_SECONDS = time.perf_counter() - started
+    _INDEX_WORKER_REPORT_INITIALIZATION = True
+
+
+def _annotate_index_worker(texts: list[str]) -> _WorkerAnnotations:
+    global _INDEX_WORKER_REPORT_INITIALIZATION
+    if _INDEX_WORKER_LEMMATIZER is None:
+        raise RuntimeError("CLASSLA index worker was not initialized.")
+    documents = _INDEX_WORKER_LEMMATIZER.annotate_many(texts)
+    initialization_seconds = (
+        _INDEX_WORKER_INITIALIZATION_SECONDS if _INDEX_WORKER_REPORT_INITIALIZATION else 0.0
+    )
+    _INDEX_WORKER_REPORT_INITIALIZATION = False
+    return _WorkerAnnotations(
+        documents=documents,
+        profile=_INDEX_WORKER_LEMMATIZER.last_profile,
+        initialization_seconds=initialization_seconds,
+    )
 
 
 def _lemma_documents(
@@ -345,6 +440,33 @@ def _print_lemma_profile(
         f"write={write_seconds:.3f}s "
         f"tokens/s={classla_profile.tokens_per_second:,.0f} "
         f"peak_cuda={classla_profile.peak_cuda_bytes / 1024**2:,.0f}MiB",
+        file=sys.stderr,
+    )
+
+
+def _print_worker_profiles(
+    results: list[_WorkerAnnotations],
+    *,
+    fetch_seconds: float,
+    processing_seconds: float,
+    write_seconds: float,
+) -> None:
+    profiles = [result.profile for result in results if result.profile is not None]
+    tokens = sum(profile.tokens for profile in profiles)
+    initialization_seconds = max(result.initialization_seconds for result in results)
+    steady_seconds = max(0.0, processing_seconds - initialization_seconds)
+    print(
+        "Profile: "
+        f"workers={len(results)} "
+        f"fetch={fetch_seconds:.3f}s "
+        f"classla_wall_and_map={processing_seconds:.3f}s "
+        f"write={write_seconds:.3f}s "
+        f"steady_tokens/s={tokens / steady_seconds if steady_seconds else 0:,.0f} "
+        f"worker_tokenize={sum(profile.tokenize_seconds for profile in profiles):.3f}s "
+        f"worker_pos={sum(profile.pos_seconds for profile in profiles):.3f}s "
+        f"worker_lemma={sum(profile.lemma_seconds for profile in profiles):.3f}s "
+        f"peak_cuda_per_worker={max((profile.peak_cuda_bytes for profile in profiles), default=0) / 1024**2:,.0f}MiB "
+        f"initialization={initialization_seconds:.2f}s",
         file=sys.stderr,
     )
 

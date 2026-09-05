@@ -112,6 +112,12 @@ combined surface-plus-lemma BM25 search without changing the original text or
 snippets. Use `semora index lemma --profile` to inspect processor throughput
 and CUDA-memory usage.
 
+For read-only performance diagnosis, use `semora profile classla` to create a
+PyTorch CPU/CUDA trace and `semora benchmark classla --workers 1 2 3 4` to
+measure whether multiple CLASSLA processes improve steady-state throughput.
+When the benchmark supports it, `semora index lemma --workers N` enables the
+same architecture with a single ordered SQLite writer.
+
 ## Command-line tools
 
 The package also keeps focused commands for lower-level workflows:

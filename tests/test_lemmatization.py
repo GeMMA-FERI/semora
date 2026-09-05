@@ -6,6 +6,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
+from semora.diagnostics.classla import profile_classla
 from semora.text import ClasslaLemmatizer, download_classla_models
 
 
@@ -84,3 +87,8 @@ def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path
     language, options = calls["download"]
     assert language == "sl"
     assert options["processors"] == "tokenize,pos,lemma"
+
+
+def test_operator_profiler_rejects_dangerously_large_traces(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="limited to five articles"):
+        profile_classla(["Besedilo."] * 6, tmp_path / "trace.json")
