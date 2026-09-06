@@ -32,8 +32,9 @@ from semora.storage.repositories import (
 class Database:
     """SQLite database connection and migration helper."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
         self.path = str(path)
+        self.read_only = read_only
         self.conn = self._connect()
         self.runs = RunRepository(self)
         self.documents = DocumentRepository(self)
@@ -47,6 +48,8 @@ class Database:
 
     def initialize(self) -> None:
         """Create or migrate the database to the latest schema."""
+        if self.read_only:
+            raise RuntimeError("Cannot initialize or migrate a read-only database.")
         self._apply_migrations()
 
     def insert_run(self, run: Run) -> None:
@@ -1124,7 +1127,7 @@ class Database:
 
     def _connect(self) -> sqlite3.Connection:
         """Open a SQLite connection with project-specific settings applied."""
-        return open_connection(self.path)
+        return open_connection(self.path, read_only=self.read_only)
 
 
 def _chunk_values(chunk: Chunk) -> tuple:
@@ -1187,4 +1190,3 @@ def _embedding_values(embedding: Embedding) -> tuple:
         embedding.tensor_blob,
         embedding.chunk_id,
     )
-

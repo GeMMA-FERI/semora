@@ -27,8 +27,7 @@ class SearchEngine:
         classla_device: str = "auto",
         classla_resources_dir: str | Path | None = None,
     ) -> None:
-        self.database = Database(database_path)
-        self.database.initialize()
+        self.database = Database(database_path, read_only=True)
         self.semantic_dir = Path(semantic_dir).resolve()
         self._semantic_index: Any = None
         self._semantic_model: Any = None
