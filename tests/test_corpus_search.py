@@ -214,9 +214,12 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     assert lemma_args.tokenizer_workers is None
     assert lemma_args.profile is True
 
-    search_args = _parser().parse_args(["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5"])
+    search_args = _parser().parse_args(
+        ["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5", "--profile"]
+    )
     assert search_args.lemma_weight == 0.5
     assert search_args.max_snippet_chars == 600
+    assert search_args.profile is True
 
     model_args = _parser().parse_args(["models", "download-classla"])
     assert model_args.classla_type == "default"
@@ -248,12 +251,18 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
     assert build_bm25_index(database_path) == 2
     engine = SearchEngine(database_path, root / "indexes" / "semantic")
     try:
-        bm25 = engine.search("bm25", "Needle", limit=1)
+        bm25 = engine.search("bm25", "Needle", limit=1, profile=True)
         assert bm25[0].newspaper == "Jutro"
         assert bm25[0].date == "1934-10-10"
         assert bm25[0].document_id == "URN:NBN:SI:doc-0L8XYEOC"
         assert bm25[0].line_start == 5
         assert "Needle appears here." in bm25[0].snippet
+        assert engine.last_profile is not None
+        assert engine.last_profile["returned_hits"] == 1
+        assert engine.last_profile["timings_seconds"]["article_fts_sql"] >= 0
+        assert engine.last_profile["timings_seconds"]["hit_building"] >= 0
+        assert engine.last_profile["query_plans"]["article_fts"]
+        assert engine.last_profile["sqlite"]["database_size_bytes"] > 0
         short_bm25 = engine.search("bm25", "Needle", limit=1, max_snippet_chars=20)
         assert len(short_bm25[0].snippet) == 20
         assert "Needle" in short_bm25[0].snippet

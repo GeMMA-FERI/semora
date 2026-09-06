@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,8 @@ class SearchEngine:
         self._classla_type = classla_type
         self._classla_device = classla_device
         self._classla_resources_dir = classla_resources_dir
+        self.last_profile: dict[str, Any] | None = None
+        self._active_profile: dict[str, Any] | None = None
         if load_semantic:
             self.load_semantic()
 
@@ -86,6 +89,7 @@ class SearchEngine:
         date_to: str | None = None,
         lemma_weight: float = 1.0,
         max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS,
+        profile: bool = False,
     ) -> list[SearchHit]:
         if limit < 1 or before < 0 or after < 0 or context_lines < 0:
             raise ValueError("limit must be positive and context values must be non-negative.")
@@ -93,6 +97,25 @@ class SearchEngine:
             raise ValueError("lemma_weight must be non-negative.")
         if max_snippet_chars < 1:
             raise ValueError("max_snippet_chars must be positive.")
+        search_started = time.perf_counter()
+        self.last_profile = None
+        self._active_profile = (
+            {
+                "mode": mode,
+                "query": query,
+                "limit": limit,
+                "filters": {
+                    "newspaper": newspaper,
+                    "date_from": date_from,
+                    "date_to": date_to,
+                },
+                "timings_seconds": {},
+                "query_plans": {},
+            }
+            if profile
+            else None
+        )
+        retrieval_started = time.perf_counter()
         if mode == "bm25":
             matches = self._search_bm25(query, limit, newspaper, date_from, date_to)
         elif mode == "bm25-lemma":
@@ -119,7 +142,9 @@ class SearchEngine:
             matches = self._search_semantic(query, limit, newspaper, date_from, date_to)
         else:
             raise ValueError(f"Unknown search mode: {mode}")
-        return [
+        self._record_profile_time("retrieval", retrieval_started)
+        hit_build_started = time.perf_counter()
+        hits = [
             self._make_hit(
                 row,
                 score,
@@ -130,6 +155,16 @@ class SearchEngine:
             )
             for row, score in matches
         ]
+        self._record_profile_time("hit_building", hit_build_started)
+        if self._active_profile is not None:
+            self._active_profile["returned_hits"] = len(hits)
+            self._active_profile["sqlite"] = self._sqlite_profile()
+            self._active_profile["timings_seconds"]["total"] = (
+                time.perf_counter() - search_started
+            )
+            self.last_profile = self._active_profile
+            self._active_profile = None
+        return hits
 
     def _search_bm25(
         self,
@@ -151,7 +186,9 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
+        started = time.perf_counter()
         lemma_query = self._lemmatize_query(query)
+        self._record_profile_time("query_lemmatization", started)
         if not lemma_query:
             return []
         return self._search_fts(
@@ -198,8 +235,7 @@ class SearchEngine:
     ) -> list[tuple[Any, float]]:
         if table not in {"article_fts", "article_lemma_fts"}:
             raise ValueError(f"Unsupported FTS table: {table}")
-        rows = self.database.conn.execute(
-            f"""
+        sql = f"""
             SELECT articles.*, articles.title AS article_title,
                    newspapers.source, newspapers.title AS newspaper_title,
                    newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
@@ -216,25 +252,78 @@ class SearchEngine:
               AND (? IS NULL OR newspapers.date <= ?)
             ORDER BY rank
             LIMIT ?
-            """,
-            (
-                query,
-                newspaper,
-                newspaper,
-                newspaper,
-                date_from,
-                date_from,
-                date_to,
-                date_to,
-                limit,
-            ),
-        ).fetchall()
+            """
+        parameters = (
+            query,
+            newspaper,
+            newspaper,
+            newspaper,
+            date_from,
+            date_from,
+            date_to,
+            date_to,
+            limit,
+        )
+        if self._active_profile is not None:
+            plan_started = time.perf_counter()
+            plan = self.database.conn.execute(
+                f"EXPLAIN QUERY PLAN {sql}",
+                parameters,
+            ).fetchall()
+            self._active_profile["query_plans"][table] = [str(row["detail"]) for row in plan]
+            self._record_profile_time("query_planning", plan_started)
+        sql_started = time.perf_counter()
+        rows = self.database.conn.execute(sql, parameters).fetchall()
+        self._record_profile_time(f"{table}_sql", sql_started)
+        result_started = time.perf_counter()
         results: list[tuple[Any, float]] = []
         for row in rows:
             match = dict(row)
             match["_focus_char"] = _query_focus_char(match, focus_query)
             results.append((match, -float(row["rank"])))
+        self._record_profile_time("fts_result_processing", result_started)
         return results
+
+    def _record_profile_time(self, name: str, started: float) -> None:
+        if self._active_profile is None:
+            return
+        timings = self._active_profile["timings_seconds"]
+        timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
+
+    def _sqlite_profile(self) -> dict[str, Any]:
+        profile = self._active_profile
+        assert profile is not None
+        page_size = int(self.database.conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self.database.conn.execute("PRAGMA page_count").fetchone()[0])
+        cache_setting = int(self.database.conn.execute("PRAGMA cache_size").fetchone()[0])
+        mmap_size = int(self.database.conn.execute("PRAGMA mmap_size").fetchone()[0])
+        cache_bytes = (
+            abs(cache_setting) * 1024
+            if cache_setting < 0
+            else cache_setting * page_size
+        )
+        plans = [
+            step
+            for plan in profile["query_plans"].values()
+            for step in plan
+        ]
+        warnings = []
+        if cache_bytes < 64 * 1024**2:
+            warnings.append("SQLite page cache is below 64 MiB; random joins may repeatedly read from disk.")
+        if mmap_size == 0:
+            warnings.append("SQLite memory-mapped I/O is disabled.")
+        if any("USE TEMP B-TREE FOR ORDER BY" in step for step in plans):
+            warnings.append(
+                "SQLite sorts all FTS matches by BM25 rank before LIMIT; common terms can be expensive."
+            )
+        return {
+            "database_size_bytes": page_size * page_count,
+            "page_size_bytes": page_size,
+            "page_count": page_count,
+            "cache_size_bytes": cache_bytes,
+            "mmap_size_bytes": mmap_size,
+            "warnings": warnings,
+        }
 
     def _lemmatize_query(self, query: str) -> str:
         state = self.database.conn.execute(

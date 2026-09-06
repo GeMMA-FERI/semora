@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 
 from semora.corpus import DEFAULT_MODEL_ID, DEFAULT_TOKEN_COUNT, DEFAULT_TOKEN_OVERLAP, ingest_corpus
@@ -20,6 +22,7 @@ from semora.text import download_classla_models
 
 
 def main() -> None:
+    _configure_console_encoding()
     args = _parser().parse_args()
     root = Path(args.root).resolve()
     corpus_dir = root / "corpus"
@@ -136,6 +139,8 @@ def main() -> None:
         _print_json(results)
         return
     if args.command == "search":
+        command_started = time.perf_counter()
+        engine_started = time.perf_counter()
         engine = SearchEngine(
             database_path,
             semantic_dir,
@@ -143,6 +148,7 @@ def main() -> None:
             classla_device=args.classla_device,
             classla_resources_dir=args.classla_resources_dir,
         )
+        engine_initialization_seconds = time.perf_counter() - engine_started
         try:
             hits = engine.search(
                 args.mode,
@@ -157,7 +163,19 @@ def main() -> None:
                 date_to=args.date_to,
                 lemma_weight=args.lemma_weight,
                 max_snippet_chars=args.max_snippet_chars,
+                profile=args.profile,
             )
+            if args.profile and engine.last_profile is not None:
+                engine.last_profile["timings_seconds"]["engine_initialization"] = (
+                    engine_initialization_seconds
+                )
+                engine.last_profile["timings_seconds"]["command_total"] = (
+                    time.perf_counter() - command_started
+                )
+                print(
+                    json.dumps({"profile": engine.last_profile}, ensure_ascii=False, indent=2),
+                    file=sys.stderr,
+                )
             _print_json({"hits": [hit.as_dict() for hit in hits]})
         finally:
             engine.close()
@@ -285,6 +303,11 @@ def _parser() -> argparse.ArgumentParser:
     search = commands.add_parser("search", help="Run one search and write JSON to stdout.")
     search.add_argument("mode", choices=("bm25", "bm25-lemma", "bm25-combined", "regex", "semantic"))
     search.add_argument("query")
+    search.add_argument(
+        "--profile",
+        action="store_true",
+        help="Report search phase timings, SQLite settings, and the query plan to stderr.",
+    )
     _add_search_options(search)
     _add_classla_options(search)
 
@@ -367,6 +390,14 @@ def _resolve_output(root: Path, value: str | None, default: str) -> Path:
 
 def _print_json(value: dict) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _configure_console_encoding() -> None:
+    """Keep JSON output Unicode-safe on Windows consoles and redirected pipes."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
 
 
 if __name__ == "__main__":
