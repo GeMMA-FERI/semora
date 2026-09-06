@@ -75,6 +75,22 @@ def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path
         ["prvi", "dokument"],
         ["drugi", "eod", "dokument"],
     ]
+    staged = lemmatizer.annotate_batches(
+        [["Prvi dokument"], ["Drugi dokument", "Tretji dokument"]],
+        pipeline_depth=2,
+    )
+    assert [
+        [lemma for token in document for lemma in token.lemmas]
+        for batch in staged
+        for document in batch
+    ] == [
+        ["prvi", "dokument"],
+        ["drugi", "dokument"],
+        ["tretji", "dokument"],
+    ]
+    assert lemmatizer.last_profile is not None
+    assert lemmatizer.last_profile.documents == 3
+    assert lemmatizer.last_profile.wall_seconds is not None
     language, options = calls["pipeline"]
     assert language == "sl"
     assert options["processors"] == "tokenize,pos,lemma"

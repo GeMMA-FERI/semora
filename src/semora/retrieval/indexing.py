@@ -144,6 +144,8 @@ def build_lemma_index(
     lemma_batch_size: int | None = None,
     profile: bool = False,
     workers: int = 1,
+    pipeline_depth: int = 3,
+    tokenizer_workers: int | None = None,
     lemmatizer: Lemmatizer | None = None,
 ) -> LemmaIndexStats:
     """Lemmatize each article once and index chunks present in the surface index."""
@@ -153,10 +155,19 @@ def build_lemma_index(
         raise ValueError("batch_articles must be positive.")
     if workers <= 0:
         raise ValueError("workers must be positive.")
+    if pipeline_depth <= 0:
+        raise ValueError("pipeline_depth must be positive.")
+    if tokenizer_workers is not None and tokenizer_workers < 0:
+        raise ValueError("tokenizer_workers cannot be negative.")
+    if pipeline_depth == 1 and tokenizer_workers not in (None, 0):
+        raise ValueError("tokenizer_workers requires pipeline_depth greater than 1.")
+    if workers > 1 and tokenizer_workers not in (None, 0):
+        raise ValueError("tokenizer_workers is only used with one CLASSLA worker.")
     if workers > 1 and lemmatizer is not None:
         raise ValueError("A custom lemmatizer can only be used with one worker.")
     database = Database(database_path)
     executor: ProcessPoolExecutor | None = None
+    active_lemmatizer = lemmatizer
     try:
         database.initialize()
         if rebuild:
@@ -191,7 +202,6 @@ def build_lemma_index(
         if complete or (max_articles is not None and processed_articles >= max_articles):
             return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
 
-        active_lemmatizer = lemmatizer
         worker_config: dict[str, Any] = {
             "pipeline_type": pipeline_type,
             "device": device,
@@ -216,10 +226,13 @@ def build_lemma_index(
         ) as progress:
             progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
             while max_articles is None or processed_articles < max_articles:
+                concurrent_batches = workers if workers > 1 else pipeline_depth
+                if lemmatizer is not None:
+                    concurrent_batches = 1
                 limit = (
-                    batch_articles * workers
+                    batch_articles * concurrent_batches
                     if max_articles is None
-                    else min(batch_articles * workers, max_articles - processed_articles)
+                    else min(batch_articles * concurrent_batches, max_articles - processed_articles)
                 )
                 fetch_started = time.perf_counter()
                 articles = database.conn.execute(
@@ -261,7 +274,13 @@ def build_lemma_index(
                         resources_dir=resources_dir,
                         pos_batch_size=pos_batch_size,
                         lemma_batch_size=lemma_batch_size,
+                        tokenizer_workers=(
+                            (1 if pipeline_depth > 1 else 0)
+                            if tokenizer_workers is None
+                            else tokenizer_workers
+                        ),
                     )
+                    active_lemmatizer.start_tokenizer_workers()
                     print(
                         f"CLASSLA pipeline loaded in {time.perf_counter() - load_started:.2f}s.",
                         file=sys.stderr,
@@ -271,7 +290,22 @@ def build_lemma_index(
                 worker_profiles: list[_WorkerAnnotations] = []
                 if executor is None:
                     assert active_lemmatizer is not None
-                    annotations = active_lemmatizer.annotate_many(payloads)
+                    if isinstance(active_lemmatizer, ClasslaLemmatizer) and pipeline_depth > 1:
+                        payload_batches = [
+                            payloads[index : index + batch_articles]
+                            for index in range(0, len(payloads), batch_articles)
+                        ]
+                        annotation_batches = active_lemmatizer.annotate_batches(
+                            payload_batches,
+                            pipeline_depth=pipeline_depth,
+                        )
+                        annotations = [
+                            document
+                            for batch_annotations in annotation_batches
+                            for document in batch_annotations
+                        ]
+                    else:
+                        annotations = active_lemmatizer.annotate_many(payloads)
                 else:
                     payload_batches = [
                         payloads[index : index + batch_articles]
@@ -326,6 +360,8 @@ def build_lemma_index(
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        if isinstance(active_lemmatizer, ClasslaLemmatizer):
+            active_lemmatizer.close()
         database.close()
 
 
@@ -436,7 +472,8 @@ def _print_lemma_profile(
         f"tokenize={classla_profile.tokenize_seconds:.3f}s "
         f"pos={classla_profile.pos_seconds:.3f}s "
         f"lemma={classla_profile.lemma_seconds:.3f}s "
-        f"map={max(0.0, processing_seconds - classla_profile.total_seconds):.3f}s "
+        f"classla_wall={classla_profile.wall_seconds or classla_profile.total_seconds:.3f}s "
+        f"map={max(0.0, processing_seconds - (classla_profile.wall_seconds or classla_profile.total_seconds)):.3f}s "
         f"write={write_seconds:.3f}s "
         f"tokens/s={classla_profile.tokens_per_second:,.0f} "
         f"peak_cuda={classla_profile.peak_cuda_bytes / 1024**2:,.0f}MiB",

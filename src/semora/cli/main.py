@@ -83,6 +83,8 @@ def main() -> None:
             lemma_batch_size=args.classla_lemma_batch_size,
             profile=args.profile,
             workers=args.workers,
+            pipeline_depth=args.pipeline_depth,
+            tokenizer_workers=args.tokenizer_workers,
         )
         _print_json(
             {
@@ -112,6 +114,8 @@ def main() -> None:
             resources_dir=args.classla_resources_dir,
             pos_batch_size=args.classla_pos_batch_size,
             lemma_batch_size=args.classla_lemma_batch_size,
+            pipeline_depth=args.pipeline_depth,
+            tokenizer_workers=args.tokenizer_workers,
         )
         output_path = _resolve_output(root, args.output, "indexes/classla_benchmark.json")
         results["output"] = str(save_diagnostics(results, output_path))
@@ -215,8 +219,20 @@ def _parser() -> argparse.ArgumentParser:
         default=1,
         help="Independent CLASSLA worker processes; SQLite writes remain in the parent (default: 1).",
     )
+    lemma.add_argument(
+        "--pipeline-depth",
+        type=int,
+        default=3,
+        help="Batches kept in the single-process tokenizer/POS/lemma pipeline (default: 3).",
+    )
+    lemma.add_argument(
+        "--tokenizer-workers",
+        type=int,
+        default=None,
+        help="Obeliks subprocesses for single-process staged indexing (default: 1; use 0 for threads).",
+    )
     lemma.add_argument("--rebuild", action="store_true", help="Clear the lemma index before processing.")
-    _add_classla_batch_options(lemma)
+    _add_classla_batch_options(lemma, lemma_default=200)
     lemma.add_argument(
         "--profile",
         action="store_true",
@@ -236,6 +252,18 @@ def _parser() -> argparse.ArgumentParser:
     classla_benchmark.add_argument("--articles", type=int, default=500)
     classla_benchmark.add_argument("--batch-articles", type=int, default=50)
     classla_benchmark.add_argument("--workers", type=int, nargs="+", default=[1, 2, 3, 4])
+    classla_benchmark.add_argument(
+        "--pipeline-depth",
+        type=int,
+        default=1,
+        help="Use bounded staged execution; values above 1 require --workers 1.",
+    )
+    classla_benchmark.add_argument(
+        "--tokenizer-workers",
+        type=int,
+        default=0,
+        help="Persistent Obeliks subprocesses used by staged execution.",
+    )
     classla_benchmark.add_argument("--output", help="JSON output path relative to the repository root.")
     _add_classla_options(classla_benchmark)
     _add_classla_batch_options(classla_benchmark)
@@ -297,7 +325,11 @@ def _add_classla_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--classla-resources-dir", help="Custom CLASSLA resources directory.")
 
 
-def _add_classla_batch_options(parser: argparse.ArgumentParser) -> None:
+def _add_classla_batch_options(
+    parser: argparse.ArgumentParser,
+    *,
+    lemma_default: int | None = None,
+) -> None:
     parser.add_argument(
         "--classla-pos-batch-size",
         type=int,
@@ -306,6 +338,7 @@ def _add_classla_batch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--classla-lemma-batch-size",
         type=int,
+        default=lemma_default,
         help="Override CLASSLA's lemma inference batch size (model default: 50).",
     )
 

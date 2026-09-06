@@ -76,12 +76,22 @@ def benchmark_classla(
     resources_dir: str | Path | None = None,
     pos_batch_size: int | None = None,
     lemma_batch_size: int | None = None,
+    pipeline_depth: int = 1,
+    tokenizer_workers: int = 0,
 ) -> dict[str, Any]:
     """Compare isolated CLASSLA process counts over the same in-memory workload."""
     if not worker_counts or any(workers <= 0 for workers in worker_counts):
         raise ValueError("worker counts must be positive.")
     if batch_articles <= 0:
         raise ValueError("batch_articles must be positive.")
+    if pipeline_depth <= 0:
+        raise ValueError("pipeline_depth must be positive.")
+    if tokenizer_workers < 0:
+        raise ValueError("tokenizer_workers cannot be negative.")
+    if pipeline_depth == 1 and tokenizer_workers:
+        raise ValueError("tokenizer_workers requires pipeline_depth greater than 1.")
+    if pipeline_depth > 1 and worker_counts != [1]:
+        raise ValueError("Staged CLASSLA benchmarking requires exactly --workers 1.")
     batches = [texts[index : index + batch_articles] for index in range(0, len(texts), batch_articles)]
     config = {
         "pipeline_type": pipeline_type,
@@ -96,14 +106,45 @@ def benchmark_classla(
         sampler = _NvidiaSampler()
         sampler.start()
         wall_started = time.perf_counter()
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=get_context("spawn"),
-            initializer=_initialize_worker,
-            initargs=(config,),
-        ) as executor:
-            futures = [executor.submit(_process_worker_batch, batch) for batch in batches]
-            results = [future.result() for future in as_completed(futures)]
+        if pipeline_depth > 1:
+            initialization_started = time.perf_counter()
+            lemmatizer = ClasslaLemmatizer(
+                **config,
+                tokenizer_workers=tokenizer_workers,
+            )
+            lemmatizer.start_tokenizer_workers()
+            initialization_seconds = time.perf_counter() - initialization_started
+            steady_started = time.perf_counter()
+            try:
+                annotated_batches = lemmatizer.annotate_batches(
+                    batches,
+                    pipeline_depth=pipeline_depth,
+                )
+            finally:
+                lemmatizer.close()
+            steady_finished = time.perf_counter()
+            profile = lemmatizer.last_profile
+            results = [
+                WorkerResult(
+                    pid=os.getpid(),
+                    documents=sum(len(batch) for batch in annotated_batches),
+                    tokens=sum(len(document) for batch in annotated_batches for document in batch),
+                    started_at=steady_started,
+                    finished_at=steady_finished,
+                    initialization_seconds=initialization_seconds,
+                    peak_cuda_bytes=profile.peak_cuda_bytes if profile is not None else 0,
+                    process_rss_bytes=_process_rss_bytes(),
+                )
+            ]
+        else:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=get_context("spawn"),
+                initializer=_initialize_worker,
+                initargs=(config,),
+            ) as executor:
+                futures = [executor.submit(_process_worker_batch, batch) for batch in batches]
+                results = [future.result() for future in as_completed(futures)]
         wall_seconds = time.perf_counter() - wall_started
         samples = sampler.stop()
         steady_started = min(result.started_at for result in results)
@@ -140,6 +181,8 @@ def benchmark_classla(
         "device": device,
         "pos_batch_size": pos_batch_size,
         "lemma_batch_size": lemma_batch_size,
+        "pipeline_depth": pipeline_depth,
+        "tokenizer_workers": tokenizer_workers,
         "runs": runs,
     }
 

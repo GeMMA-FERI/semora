@@ -110,13 +110,23 @@ The optional CLASSLA index lemmatizes Slovene articles in multi-document
 batches and stores a second contentless FTS index. It supports lemma-only and
 combined surface-plus-lemma BM25 search without changing the original text or
 snippets. Use `semora index lemma --profile` to inspect processor throughput
-and CUDA-memory usage.
+and CUDA-memory usage. With one CLASSLA worker, tokenization runs in a
+lightweight persistent subprocess while the parent retains the only copy of
+the POS model, lemma model, CUDA context, and lexicon. Set both
+`--pipeline-depth 1` and `--tokenizer-workers 0` to disable this staged path.
 
 For read-only performance diagnosis, use `semora profile classla` to create a
 PyTorch CPU/CUDA trace and `semora benchmark classla --workers 1 2 3 4` to
 measure whether multiple CLASSLA processes improve steady-state throughput.
 When the benchmark supports it, `semora index lemma --workers N` enables the
 same architecture with a single ordered SQLite writer.
+
+To benchmark the shared-memory staged path separately, run:
+
+```sh
+semora benchmark classla --workers 1 --pipeline-depth 3 --tokenizer-workers 1 \
+  --classla-lemma-batch-size 200
+```
 
 ## Command-line tools
 

@@ -196,6 +196,8 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     assert lemma_args.classla_pos_batch_size == 10_000
     assert lemma_args.classla_lemma_batch_size == 200
     assert lemma_args.workers == 4
+    assert lemma_args.pipeline_depth == 3
+    assert lemma_args.tokenizer_workers is None
     assert lemma_args.profile is True
 
     search_args = _parser().parse_args(["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5"])
@@ -209,6 +211,8 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     )
     assert benchmark_args.articles == 200
     assert benchmark_args.workers == [1, 2]
+    assert benchmark_args.pipeline_depth == 1
+    assert benchmark_args.tokenizer_workers == 0
 
     profile_args = _parser().parse_args(
         ["profile", "classla", "--articles", "2", "--output", "trace.json"]
