@@ -422,7 +422,7 @@ def _print_json(value: dict) -> None:
 
 def _configure_console_encoding() -> None:
     """Keep JSON output Unicode-safe on Windows consoles and redirected pipes."""
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8")

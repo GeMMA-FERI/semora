@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from semora.cli.main import _parser
+from semora.cli.main import _configure_console_encoding, _parser
 from semora.corpus import indexer
 from semora.retrieval import SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
@@ -41,6 +41,25 @@ class FakeSloveneLemmatizer:
     def lemmatize_many(self, texts: Sequence[str]) -> list[str]:
         self.annotated_articles += len(texts) // 2
         return [self.lemmatize(text) for text in texts]
+
+
+class ReconfigurableStream:
+    def __init__(self) -> None:
+        self.encoding: str | None = None
+
+    def reconfigure(self, *, encoding: str) -> None:
+        self.encoding = encoding
+
+
+def test_cli_configures_all_protocol_streams_as_utf8(monkeypatch) -> None:
+    streams = [ReconfigurableStream() for _ in range(3)]
+    monkeypatch.setattr(sys, "stdin", streams[0])
+    monkeypatch.setattr(sys, "stdout", streams[1])
+    monkeypatch.setattr(sys, "stderr", streams[2])
+
+    _configure_console_encoding()
+
+    assert [stream.encoding for stream in streams] == ["utf-8", "utf-8", "utf-8"]
 
 
 def _index_log_events(database_path: Path, run_type: str) -> list[tuple[str, str, dict]]:
