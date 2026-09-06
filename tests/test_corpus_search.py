@@ -32,8 +32,6 @@ class FakeSloveneLemmatizer:
         self.annotated_articles = 0
 
     def annotate(self, text: str) -> list[LemmaToken]:
-        if "\n" in text:
-            self.annotated_articles += 1
         normalized = {"appears": "appear", "appeared": "appear"}
         return [
             LemmaToken(
@@ -45,6 +43,7 @@ class FakeSloveneLemmatizer:
         ]
 
     def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
+        self.annotated_articles += len(texts)
         return [self.annotate(text) for text in texts]
 
     def lemmatize(self, text: str) -> str:
@@ -172,8 +171,8 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
     assert args.articles is True
     assert args.chunks is False
 
-    index_args = _parser().parse_args(["index", "bm25", "--max-chunks", "100000"])
-    assert index_args.max_chunks == 100_000
+    index_args = _parser().parse_args(["index", "bm25", "--max-articles", "100000"])
+    assert index_args.max_articles == 100_000
 
     lemma_args = _parser().parse_args(
         [
@@ -225,19 +224,27 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
 def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
     database_path = root / "indexes" / "semora.sqlite"
-    assert build_bm25_index(database_path) == 4
+    database = Database(database_path)
+    try:
+        with database.conn:
+            database.conn.execute("DELETE FROM chunks")
+    finally:
+        database.close()
+    assert build_bm25_index(database_path) == 2
     engine = SearchEngine(database_path, root / "indexes" / "semantic")
     try:
         bm25 = engine.search("bm25", "Needle", limit=1)
         assert bm25[0].newspaper == "Jutro"
         assert bm25[0].date == "1934-10-10"
         assert bm25[0].document_id == "URN:NBN:SI:doc-0L8XYEOC"
-        assert bm25[0].line_start == 6
+        assert bm25[0].line_start == 5
         assert "Needle appears here." in bm25[0].snippet
 
         regex = engine.search("regex", r"beta\s+gamma", limit=1, context_lines=1)
         assert regex[0].line_start == 1
+        assert regex[0].line_end == 4
         assert regex[0].article_title == "First article"
+        assert "Second line here." in regex[0].snippet
 
         requests = io.StringIO(
             json.dumps({"id": "one", "op": "search", "mode": "bm25", "query": "Needle", "limit": 1})
@@ -259,40 +266,40 @@ def test_contentless_bm25_index_resumes_to_total_target(tmp_path: Path, monkeypa
     root, _ = _build_corpus(tmp_path, monkeypatch)
     database_path = root / "indexes" / "semora.sqlite"
 
-    assert build_bm25_index(database_path, max_chunks=2, batch_size=1) == 2
+    assert build_bm25_index(database_path, max_articles=1, batch_size=1) == 1
     database = Database(database_path)
     try:
         first_mapping = database.conn.execute(
-            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id"
+            "SELECT fts_id, article_id FROM article_fts_map ORDER BY fts_id"
         ).fetchall()
         schema = database.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name = 'chunk_fts'"
+            "SELECT sql FROM sqlite_master WHERE name = 'article_fts'"
         ).fetchone()["sql"]
-        stored_columns = database.conn.execute("SELECT title, text FROM chunk_fts LIMIT 1").fetchone()
+        stored_columns = database.conn.execute("SELECT title, text FROM article_fts LIMIT 1").fetchone()
         assert "content = ''" in schema
         assert tuple(stored_columns) == (None, None)
     finally:
         database.close()
 
-    assert build_bm25_index(database_path, max_chunks=3, batch_size=1) == 3
-    assert build_bm25_index(database_path, max_chunks=3, batch_size=1) == 3
+    assert build_bm25_index(database_path, max_articles=2, batch_size=1) == 2
+    assert build_bm25_index(database_path, max_articles=2, batch_size=1) == 2
     database = Database(database_path)
     try:
         resumed_mapping = database.conn.execute(
-            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id"
+            "SELECT fts_id, article_id FROM article_fts_map ORDER BY fts_id"
         ).fetchall()
-        assert [tuple(row) for row in resumed_mapping[:2]] == [tuple(row) for row in first_mapping]
+        assert tuple(resumed_mapping[0]) == tuple(first_mapping[0])
     finally:
         database.close()
 
-    assert build_bm25_index(database_path, batch_size=1) == 4
-    assert build_bm25_index(database_path, max_chunks=1, rebuild=True) == 1
+    assert build_bm25_index(database_path, batch_size=1) == 2
+    assert build_bm25_index(database_path, max_articles=1, rebuild=True) == 1
 
 
 def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: Path, monkeypatch) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
     database_path = root / "indexes" / "semora.sqlite"
-    assert build_bm25_index(database_path) == 4
+    assert build_bm25_index(database_path) == 2
     lemmatizer = FakeSloveneLemmatizer()
 
     partial = build_lemma_index(
@@ -305,22 +312,17 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
     assert partial.complete is False
     finished = build_lemma_index(database_path, batch_articles=1, lemmatizer=lemmatizer)
     assert finished.processed_articles == 2
-    assert finished.indexed_chunks == 4
+    assert finished.indexed_articles == 2
     assert finished.complete is True
     assert lemmatizer.annotated_articles == 2
 
     database = Database(database_path)
     try:
-        chunk_indexes = {
-            str(row["name"])
-            for row in database.conn.execute("PRAGMA index_list(chunks)")
-        }
-        assert "idx_chunks_article_chunk" in chunk_indexes
         schema = database.conn.execute(
-            "SELECT sql FROM sqlite_master WHERE name = 'chunk_lemma_fts'"
+            "SELECT sql FROM sqlite_master WHERE name = 'article_lemma_fts'"
         ).fetchone()["sql"]
         stored_columns = database.conn.execute(
-            "SELECT title, text FROM chunk_lemma_fts LIMIT 1"
+            "SELECT title, text FROM article_lemma_fts LIMIT 1"
         ).fetchone()
         assert "content = ''" in schema
         assert tuple(stored_columns) == (None, None)
@@ -345,7 +347,7 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
 def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monkeypatch) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
     database_path = root / "indexes" / "semora.sqlite"
-    assert build_bm25_index(database_path) == 4
+    assert build_bm25_index(database_path) == 2
 
     class FailingLemmatizer(FakeSloveneLemmatizer):
         def __init__(self) -> None:
@@ -367,11 +369,11 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
 
     database = Database(database_path)
     try:
-        state = database.conn.execute("SELECT * FROM lemma_index_state").fetchone()
+        state = database.conn.execute("SELECT * FROM article_lemma_index_state").fetchone()
         assert state["processed_articles"] == 1
-        indexed_rows = database.conn.execute("SELECT COUNT(*) FROM chunk_lemma_fts").fetchone()[0]
-        assert indexed_rows == state["indexed_chunks"]
-        assert 0 < indexed_rows < 4
+        indexed_rows = database.conn.execute("SELECT COUNT(*) FROM article_lemma_fts").fetchone()[0]
+        assert indexed_rows == state["indexed_articles"]
+        assert 0 < indexed_rows < 2
     finally:
         database.close()
 
@@ -381,7 +383,7 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
         lemmatizer=FakeSloveneLemmatizer(),
     )
     assert finished.processed_articles == 2
-    assert finished.indexed_chunks == 4
+    assert finished.indexed_articles == 2
     assert finished.complete is True
 
 
@@ -456,6 +458,8 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
     try:
         hits = engine.search("semantic", "needle", limit=1)
         assert "Needle appears here." in hits[0].snippet
+        article_hits = engine.search("semantic", "needle", limit=2)
+        assert len({hit.article_title for hit in article_hits}) == 2
         assert engine.search("semantic", "needle", limit=1, newspaper="Other") == []
     finally:
         engine.close()

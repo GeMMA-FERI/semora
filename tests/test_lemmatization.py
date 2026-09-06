@@ -10,6 +10,7 @@ import pytest
 
 from semora.diagnostics.classla import profile_classla
 from semora.text import ClasslaLemmatizer, download_classla_models
+from semora.text.lemmatization import _tokens_from_document
 
 
 def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path: Path) -> None:
@@ -108,3 +109,40 @@ def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path
 def test_operator_profiler_rejects_dangerously_large_traces(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="limited to five articles"):
         profile_classla(["Besedilo."] * 6, tmp_path / "trace.json")
+
+
+def test_classla_source_mapping_handles_normalized_token_text() -> None:
+    word = types.SimpleNamespace(lemma="-", text="-")
+    token = types.SimpleNamespace(
+        text="-",
+        start_char=0,
+        end_char=1,
+        words=[word],
+    )
+    document = types.SimpleNamespace(
+        sentences=[types.SimpleNamespace(tokens=[token])],
+    )
+
+    result = _tokens_from_document(["Pred—vojno"], "UNUSED_BOUNDARY", document)
+
+    assert result[0][0].start == 4
+    assert result[0][0].end == 5
+    assert result[0][0].lemmas == ("-",)
+
+
+def test_classla_source_mapping_handles_synthetic_line_break_token() -> None:
+    def token(text: str):
+        return types.SimpleNamespace(
+            text=text,
+            start_char=None,
+            end_char=None,
+            words=[types.SimpleNamespace(lemma=text, text=text)],
+        )
+
+    document = types.SimpleNamespace(
+        sentences=[types.SimpleNamespace(tokens=[token("nesram"), token("-"), token("nost")])],
+    )
+
+    result = _tokens_from_document(["nesramnost"], "UNUSED_BOUNDARY", document)[0]
+
+    assert [(item.start, item.end) for item in result] == [(0, 6), (6, 6), (6, 10)]

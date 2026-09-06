@@ -47,12 +47,10 @@ def load_classla_workload(database_path: str | Path, articles: int) -> list[str]
             SELECT articles.title, articles.content
             FROM articles
             WHERE articles.is_valid = 1
-              AND articles.char_end IS NOT NULL
               AND EXISTS (
                   SELECT 1
-                  FROM chunks
-                  JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
-                  WHERE chunks.article_id = articles.article_id
+                  FROM article_fts_map
+                  WHERE article_fts_map.article_id = articles.article_id
               )
             ORDER BY articles.article_id
             LIMIT ?

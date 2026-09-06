@@ -54,11 +54,11 @@ def main() -> None:
     if args.command == "index" and args.index_type == "bm25":
         indexed = build_bm25_index(
             database_path,
-            max_chunks=args.max_chunks,
+            max_articles=args.max_articles,
             batch_size=args.batch_size,
             rebuild=args.rebuild,
         )
-        _print_json({"indexed_chunks": indexed, "index": "bm25"})
+        _print_json({"indexed_articles": indexed, "index": "bm25"})
         return
     if args.command == "index" and args.index_type == "semantic":
         count = build_semantic_index(
@@ -89,9 +89,9 @@ def main() -> None:
         _print_json(
             {
                 "index": "lemma",
-                "surface_chunks": lemma_stats.surface_chunks,
+                "surface_articles": lemma_stats.surface_articles,
                 "processed_articles": lemma_stats.processed_articles,
-                "indexed_chunks": lemma_stats.indexed_chunks,
+                "indexed_articles": lemma_stats.indexed_articles,
                 "complete": lemma_stats.complete,
             }
         )
@@ -203,9 +203,9 @@ def _parser() -> argparse.ArgumentParser:
     index = commands.add_parser("index", help="Build a retrieval index from indexes/semora.sqlite.")
     index_types = index.add_subparsers(dest="index_type", required=True)
     bm25 = index_types.add_parser("bm25", help="Build or resume the SQLite FTS5 BM25 index.")
-    bm25.add_argument("--max-chunks", type=int, help="Stop when the index reaches this total size.")
+    bm25.add_argument("--max-articles", type=int, help="Stop when the index reaches this total size.")
     bm25.add_argument("--batch-size", type=int, default=10_000)
-    bm25.add_argument("--rebuild", action="store_true", help="Clear the BM25 index before adding chunks.")
+    bm25.add_argument("--rebuild", action="store_true", help="Clear both lexical indexes before adding articles.")
     semantic = index_types.add_parser("semantic", help="Build the persistent FAISS semantic index.")
     semantic.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     semantic.add_argument("--batch-size", type=int, default=64)
@@ -299,8 +299,18 @@ def _parser() -> argparse.ArgumentParser:
 
 def _add_search_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--before", type=int, default=0, help="Include this many preceding chunks.")
-    parser.add_argument("--after", type=int, default=0, help="Include this many following chunks.")
+    parser.add_argument(
+        "--before",
+        type=int,
+        default=0,
+        help="Include preceding chunks in semantic-search snippets.",
+    )
+    parser.add_argument(
+        "--after",
+        type=int,
+        default=0,
+        help="Include following chunks in semantic-search snippets.",
+    )
     parser.add_argument("--context-lines", type=int, default=0, help="Add source lines around the chunk span.")
     parser.add_argument("--ignore-case", action="store_true", help="Use case-insensitive regex matching.")
     parser.add_argument("--newspaper", help="Restrict matches to a normalized source or newspaper title.")

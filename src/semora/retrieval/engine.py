@@ -127,7 +127,7 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
-        return self._search_fts("chunk_fts", query, limit, newspaper, date_from, date_to)
+        return self._search_fts("article_fts", query, limit, newspaper, date_from, date_to)
 
     def _search_lemma_bm25(
         self,
@@ -140,7 +140,7 @@ class SearchEngine:
         lemma_query = self._lemmatize_query(query)
         if not lemma_query:
             return []
-        return self._search_fts("chunk_lemma_fts", lemma_query, limit, newspaper, date_from, date_to)
+        return self._search_fts("article_lemma_fts", lemma_query, limit, newspaper, date_from, date_to)
 
     def _search_combined_bm25(
         self,
@@ -156,11 +156,11 @@ class SearchEngine:
         lemma = self._search_lemma_bm25(query, candidate_limit, newspaper, date_from, date_to)
         combined: dict[str, tuple[Any, float]] = {}
         for row, score in surface:
-            combined[str(row["chunk_id"])] = (row, score)
+            combined[str(row["article_id"])] = (row, score)
         for row, score in lemma:
-            chunk_id = str(row["chunk_id"])
-            previous = combined.get(chunk_id)
-            combined[chunk_id] = (row, lemma_weight * score + (previous[1] if previous else 0.0))
+            article_id = str(row["article_id"])
+            previous = combined.get(article_id)
+            combined[article_id] = (row, lemma_weight * score + (previous[1] if previous else 0.0))
         return sorted(combined.values(), key=lambda item: item[1], reverse=True)[:limit]
 
     def _search_fts(
@@ -172,21 +172,21 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
-        if table not in {"chunk_fts", "chunk_lemma_fts"}:
+        if table not in {"article_fts", "article_lemma_fts"}:
             raise ValueError(f"Unsupported FTS table: {table}")
         rows = self.database.conn.execute(
             f"""
-            SELECT chunks.*, articles.title AS article_title,
+            SELECT articles.*, articles.title AS article_title,
                    newspapers.source, newspapers.title AS newspaper_title,
                    newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
-                   newspapers.relative_path,
+                   newspapers.relative_path, newspapers.content AS newspaper_content,
                    bm25({table}, 2.0, 1.0) AS rank
             FROM {table}
-            JOIN chunk_fts_map ON chunk_fts_map.fts_id = {table}.rowid
-            JOIN chunks ON chunks.chunk_id = chunk_fts_map.chunk_id
-            JOIN articles ON articles.article_id = chunks.article_id
+            JOIN article_fts_map ON article_fts_map.fts_id = {table}.rowid
+            JOIN articles ON articles.article_id = article_fts_map.article_id
             JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
             WHERE {table} MATCH ?
+              AND articles.is_valid = 1
               AND (? IS NULL OR newspapers.source = ? OR newspapers.title = ?)
               AND (? IS NULL OR newspapers.date >= ?)
               AND (? IS NULL OR newspapers.date <= ?)
@@ -209,9 +209,9 @@ class SearchEngine:
 
     def _lemmatize_query(self, query: str) -> str:
         state = self.database.conn.execute(
-            "SELECT indexed_chunks FROM lemma_index_state WHERE state_id = 1"
+            "SELECT indexed_articles FROM article_lemma_index_state WHERE state_id = 1"
         ).fetchone()
-        if state is None or int(state["indexed_chunks"]) == 0:
+        if state is None or int(state["indexed_articles"]) == 0:
             raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
         if self._lemmatizer is None:
             self._lemmatizer = ClasslaLemmatizer(
@@ -241,7 +241,10 @@ class SearchEngine:
         results: list[tuple[Any, float]] = []
         articles = self.database.conn.execute(
             """
-            SELECT articles.*, newspapers.content AS newspaper_content
+            SELECT articles.*, articles.title AS article_title,
+                   newspapers.source, newspapers.title AS newspaper_title,
+                   newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
+                   newspapers.relative_path, newspapers.content AS newspaper_content
             FROM articles
             JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
             WHERE articles.is_valid = 1
@@ -256,27 +259,7 @@ class SearchEngine:
             match = expression.search(str(article["content"]))
             if match is None:
                 continue
-            content_start = int(article["char_end"]) - len(str(article["content"]))
-            match_start = content_start + match.start()
-            row = self.database.conn.execute(
-                """
-                SELECT chunks.*, articles.title AS article_title,
-                       newspapers.source, newspapers.title AS newspaper_title,
-                       newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
-                       newspapers.relative_path
-                FROM chunks
-                JOIN articles ON articles.article_id = chunks.article_id
-                JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
-                WHERE chunks.article_id = ?
-                  AND chunks.char_start <= ?
-                  AND chunks.char_end > ?
-                ORDER BY chunks.chunk_index
-                LIMIT 1
-                """,
-                (article["article_id"], match_start, match_start),
-            ).fetchone()
-            if row is not None:
-                results.append((row, 1.0))
+            results.append((article, 1.0))
             if len(results) >= limit:
                 break
         return results
@@ -303,11 +286,17 @@ class SearchEngine:
         while True:
             scores, indices = self._semantic_index.search(np.asarray(vector, dtype="float32"), candidate_limit)
             results: list[tuple[Any, float]] = []
+            seen_articles: set[str] = set()
             for score, index in zip(scores[0], indices[0], strict=True):
                 if index < 0:
                     continue
                 row = self._chunk_row(self._semantic_chunk_ids[int(index)])
-                if row is not None and _matches_filters(row, newspaper, date_from, date_to):
+                if (
+                    row is not None
+                    and str(row["article_id"]) not in seen_articles
+                    and _matches_filters(row, newspaper, date_from, date_to)
+                ):
+                    seen_articles.add(str(row["article_id"]))
                     results.append((row, float(score)))
                     if len(results) >= limit:
                         return results
@@ -326,6 +315,7 @@ class SearchEngine:
             JOIN articles ON articles.article_id = chunks.article_id
             JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
             WHERE chunks.chunk_id = ?
+              AND articles.is_valid = 1
             """,
             (chunk_id,),
         ).fetchone()
@@ -339,29 +329,38 @@ class SearchEngine:
         after: int,
         context_lines: int,
     ) -> SearchHit:
-        span = self.database.conn.execute(
-            """
-            SELECT MIN(line_start) AS line_start, MAX(line_end) AS line_end
-            FROM chunks
-            WHERE article_id = ?
-              AND chunk_index BETWEEN ? AND ?
-            """,
-            (
-                row["article_id"],
-                max(0, int(row["chunk_index"]) - before),
-                int(row["chunk_index"]) + after,
-            ),
-        ).fetchone()
-        line_start = max(1, int(span["line_start"] or row["line_start"]) - context_lines)
-        line_end = int(span["line_end"] or row["line_end"]) + context_lines
-        newspaper_content = self.database.conn.execute(
-            """
-            SELECT newspapers.content AS content FROM newspapers
-            JOIN articles ON articles.newspaper_id = newspapers.newspaper_id
-            WHERE articles.article_id = ?
-            """,
-            (row["article_id"],),
-        ).fetchone()["content"]
+        if "chunk_index" in row.keys():
+            span = self.database.conn.execute(
+                """
+                SELECT MIN(line_start) AS line_start, MAX(line_end) AS line_end
+                FROM chunks
+                WHERE article_id = ?
+                  AND chunk_index BETWEEN ? AND ?
+                """,
+                (
+                    row["article_id"],
+                    max(0, int(row["chunk_index"]) - before),
+                    int(row["chunk_index"]) + after,
+                ),
+            ).fetchone()
+            base_start = int(span["line_start"] or row["line_start"])
+            base_end = int(span["line_end"] or row["line_end"])
+        else:
+            base_start = int(row["line_start"])
+            base_end = int(row["line_end"])
+        line_start = max(1, base_start - context_lines)
+        line_end = base_end + context_lines
+        if "newspaper_content" in row.keys():
+            newspaper_content = row["newspaper_content"]
+        else:
+            newspaper_content = self.database.conn.execute(
+                """
+                SELECT newspapers.content AS content FROM newspapers
+                JOIN articles ON articles.newspaper_id = newspapers.newspaper_id
+                WHERE articles.article_id = ?
+                """,
+                (row["article_id"],),
+            ).fetchone()["content"]
         lines = str(newspaper_content).splitlines()
         line_end = min(line_end, len(lines))
         snippet = "\n".join(lines[line_start - 1 : line_end])

@@ -15,6 +15,12 @@ from typing import Any, Protocol
 # Obeliks keeps this alphanumeric sentinel as one token. Punctuation-based
 # markers such as @@EOD@@ are split into several tokens.
 DOCUMENT_BOUNDARY = "SEMORAEODBOUNDARYZXQ"
+_NORMALIZED_TOKEN_SOURCES = {
+    "-": ("‐", "‑", "‒", "–", "—", "―", "−", "﹘", "﹣", "－"),
+    "'": ("‘", "’", "‚", "‛", "`", "´"),
+    '"': ("“", "”", "„", "‟", "«", "»"),
+    "...": ("…",),
+}
 
 
 @dataclass(frozen=True)
@@ -312,13 +318,18 @@ def _tokens_from_document(
                 continue
             if document_index >= len(texts):
                 raise ValueError("CLASSLA returned tokens after the final EOD document boundary.")
-            token_start = texts[document_index].find(token_text, search_start)
+            token_start, token_end = _find_source_token(
+                texts[document_index],
+                token_text,
+                search_start,
+            )
             if token_start < 0:
                 raise ValueError(
                     "Could not map a CLASSLA token back to its source document after the EOD boundary. "
-                    f"Token: {token_text!r}."
+                    f"Document index: {document_index}; token: {token_text!r}; "
+                    f"source offset: {search_start}; "
+                    f"source context: {texts[document_index][search_start:search_start + 120]!r}."
                 )
-            token_end = token_start + len(token_text)
             search_start = token_end
             lemmas = tuple(
                 str(word.lemma or word.text).strip()
@@ -341,6 +352,22 @@ def _tokens_from_document(
             f"CLASSLA returned {boundaries_seen} EOD boundaries; expected {expected_boundaries}."
         )
     return results
+
+
+def _find_source_token(text: str, token_text: str, search_start: int) -> tuple[int, int]:
+    matches = [
+        (candidate_start, candidate_start + len(candidate))
+        for candidate in (token_text, *_NORMALIZED_TOKEN_SOURCES.get(token_text, ()))
+        if (candidate_start := text.find(candidate, search_start)) >= 0
+    ]
+    match = min(matches, default=(-1, -1))
+    punctuation_only = bool(token_text) and not any(character.isalnum() for character in token_text)
+    if punctuation_only and (match[0] < 0 or match[0] - search_start > 64):
+        # Obeliks can insert punctuation while resolving OCR line breaks, for
+        # example nesramnost -> nesram, -, nost. Such a token has no source
+        # characters and must not move alignment to unrelated punctuation.
+        return search_start, search_start
+    return match
 
 
 def _profile_batches(

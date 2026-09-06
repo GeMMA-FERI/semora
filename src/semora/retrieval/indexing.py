@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sys
 import time
-from bisect import bisect_left, bisect_right
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,9 +26,9 @@ from semora.text.lemmatization import (
 
 @dataclass(frozen=True)
 class LemmaIndexStats:
-    surface_chunks: int
+    surface_articles: int
     processed_articles: int
-    indexed_chunks: int
+    indexed_articles: int
     complete: bool
 
 
@@ -44,23 +43,14 @@ class _WorkerAnnotations:
 @dataclass(frozen=True)
 class _LemmaArticle:
     article_id: str
+    fts_id: int
     title: str
     content: str
-    char_end: int
-
-
-@dataclass(frozen=True)
-class _LemmaChunk:
-    fts_id: int
-    text: str
-    char_start: int
-    char_end: int
 
 
 @dataclass(frozen=True)
 class _LemmaBatch:
     articles: list[_LemmaArticle]
-    chunks_by_article: dict[str, list[_LemmaChunk]]
     fetch_seconds: float
     processed_articles: int
 
@@ -78,9 +68,8 @@ class _AnnotationJob:
 @dataclass(frozen=True)
 class _LemmaWriteResult:
     processed_articles: int
-    indexed_chunks: int
+    indexed_articles: int
     added_articles: int
-    added_chunks: int
     mapping_seconds: float
     write_seconds: float
 
@@ -101,13 +90,13 @@ _LEMMA_WRITER_DATABASE: Database | None = None
 def build_bm25_index(
     database_path: str | Path = "indexes/semora.sqlite",
     *,
-    max_chunks: int | None = None,
+    max_articles: int | None = None,
     batch_size: int = 10_000,
     rebuild: bool = False,
 ) -> int:
-    """Build or resume the contentless BM25 index up to a total chunk target."""
-    if max_chunks is not None and max_chunks < 0:
-        raise ValueError("max_chunks must be non-negative.")
+    """Build or resume the contentless BM25 index up to a total article target."""
+    if max_articles is not None and max_articles < 0:
+        raise ValueError("max_articles must be non-negative.")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     database = Database(database_path)
@@ -115,50 +104,69 @@ def build_bm25_index(
         database.initialize()
         if rebuild:
             with database.conn:
-                database.conn.execute("INSERT INTO chunk_fts(chunk_fts) VALUES('delete-all')")
-                database.conn.execute("DELETE FROM chunk_fts_map")
-        indexed = int(database.conn.execute("SELECT COUNT(*) FROM chunk_fts_map").fetchone()[0])
-        last_row = database.conn.execute(
-            "SELECT fts_id, chunk_id FROM chunk_fts_map ORDER BY fts_id DESC LIMIT 1"
+                database.conn.execute("INSERT INTO article_fts(article_fts) VALUES('delete-all')")
+                database.conn.execute("DELETE FROM article_fts_map")
+                database.conn.execute("DELETE FROM article_fts_state")
+                database.conn.execute(
+                    "INSERT INTO article_lemma_fts(article_lemma_fts) VALUES('delete-all')"
+                )
+                database.conn.execute("DELETE FROM article_lemma_index_state")
+        state = database.conn.execute(
+            "SELECT * FROM article_fts_state WHERE state_id = 1"
         ).fetchone()
-        next_fts_id = int(last_row["fts_id"]) + 1 if last_row is not None else 1
-        last_chunk_id = str(last_row["chunk_id"]) if last_row is not None else ""
+        if state is None:
+            with database.conn:
+                database.conn.execute("INSERT INTO article_fts_state (state_id) VALUES (1)")
+            indexed = 0
+            last_article_id = ""
+            complete = False
+        else:
+            indexed = int(state["indexed_articles"])
+            last_article_id = str(state["last_article_id"])
+            complete = bool(state["complete"])
+        next_fts_id = indexed + 1
         available = int(
             database.conn.execute(
                 """
                 SELECT COUNT(*)
-                FROM chunks
-                JOIN articles ON articles.article_id = chunks.article_id
+                FROM articles
                 WHERE articles.is_valid = 1
                 """
             ).fetchone()[0]
         )
-        target = available if max_chunks is None else min(max_chunks, available)
+        target = available if max_articles is None else min(max_articles, available)
+        if complete or indexed >= target:
+            return indexed
         with tqdm(
             total=max(indexed, target),
             initial=indexed,
             desc="Indexing surface BM25",
-            unit="chunk",
+            unit="article",
             dynamic_ncols=True,
         ) as progress:
-            while max_chunks is None or indexed < max_chunks:
-                limit = batch_size if max_chunks is None else min(batch_size, max_chunks - indexed)
+            while max_articles is None or indexed < max_articles:
+                limit = batch_size if max_articles is None else min(batch_size, max_articles - indexed)
                 rows = database.conn.execute(
                     """
-                    SELECT chunks.chunk_id, COALESCE(articles.title, '') AS title, chunks.text
-                    FROM chunks
-                    JOIN articles ON articles.article_id = chunks.article_id
+                    SELECT
+                        articles.article_id,
+                        COALESCE(articles.title, '') AS title,
+                        articles.content AS text
+                    FROM articles
                     WHERE articles.is_valid = 1
-                      AND chunks.chunk_id > ?
-                    ORDER BY chunks.chunk_id
+                      AND articles.article_id > ?
+                    ORDER BY articles.article_id
                     LIMIT ?
                     """,
-                    (last_chunk_id, limit),
+                    (last_article_id, limit),
                 ).fetchall()
                 if not rows:
                     break
                 mapping = [
-                    (next_fts_id + offset, str(row["chunk_id"]))
+                    (
+                        next_fts_id + offset,
+                        str(row["article_id"]),
+                    )
                     for offset, row in enumerate(rows)
                 ]
                 documents = [
@@ -167,18 +175,35 @@ def build_bm25_index(
                 ]
                 with database.conn:
                     database.conn.executemany(
-                        "INSERT INTO chunk_fts_map (fts_id, chunk_id) VALUES (?, ?)",
+                        """
+                        INSERT INTO article_fts_map (fts_id, article_id)
+                        VALUES (?, ?)
+                        """,
                         mapping,
                     )
                     database.conn.executemany(
-                        "INSERT INTO chunk_fts (rowid, title, text) VALUES (?, ?, ?)",
+                        "INSERT INTO article_fts (rowid, title, text) VALUES (?, ?, ?)",
                         documents,
+                    )
+                    database.conn.execute(
+                        """
+                        UPDATE article_fts_state
+                        SET last_article_id = ?, indexed_articles = ?, complete = 0,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE state_id = 1
+                        """,
+                        (str(rows[-1]["article_id"]), indexed + len(rows)),
                     )
                 added = len(rows)
                 indexed += added
                 next_fts_id += added
-                last_chunk_id = str(rows[-1]["chunk_id"])
+                last_article_id = str(rows[-1]["article_id"])
                 progress.update(added)
+            if indexed == available:
+                with database.conn:
+                    database.conn.execute(
+                        "UPDATE article_fts_state SET complete = 1, updated_at = CURRENT_TIMESTAMP WHERE state_id = 1"
+                    )
         return indexed
     finally:
         database.close()
@@ -201,7 +226,7 @@ def build_lemma_index(
     tokenizer_workers: int | None = None,
     lemmatizer: Lemmatizer | None = None,
 ) -> LemmaIndexStats:
-    """Lemmatize each article once and index chunks present in the surface index."""
+    """Lemmatize and index each article present in the surface BM25 index."""
     if max_articles is not None and max_articles < 0:
         raise ValueError("max_articles must be non-negative.")
     if batch_articles <= 0:
@@ -229,35 +254,42 @@ def build_lemma_index(
             database.conn.execute("PRAGMA journal_mode = WAL")
         if rebuild:
             with database.conn:
-                database.conn.execute("INSERT INTO chunk_lemma_fts(chunk_lemma_fts) VALUES('delete-all')")
-                database.conn.execute("DELETE FROM lemma_index_state")
-        surface_chunks = int(database.conn.execute("SELECT COUNT(*) FROM chunk_fts_map").fetchone()[0])
-        if surface_chunks == 0:
+                database.conn.execute(
+                    "INSERT INTO article_lemma_fts(article_lemma_fts) VALUES('delete-all')"
+                )
+                database.conn.execute("DELETE FROM article_lemma_index_state")
+        surface_articles = int(
+            database.conn.execute("SELECT COUNT(*) FROM article_fts_map").fetchone()[0]
+        )
+        if surface_articles == 0:
             raise ValueError("Build the surface BM25 index before building the lemma index.")
-        state = database.conn.execute("SELECT * FROM lemma_index_state WHERE state_id = 1").fetchone()
+        state = database.conn.execute(
+            "SELECT * FROM article_lemma_index_state WHERE state_id = 1"
+        ).fetchone()
         if state is None:
             with database.conn:
                 database.conn.execute(
                     """
-                    INSERT INTO lemma_index_state (state_id, surface_chunks, pipeline_type)
+                    INSERT INTO article_lemma_index_state
+                        (state_id, surface_articles, pipeline_type)
                     VALUES (1, ?, ?)
                     """,
-                    (surface_chunks, pipeline_type),
+                    (surface_articles, pipeline_type),
                 )
             last_article_id = ""
-            processed_articles = indexed_chunks = 0
+            processed_articles = indexed_articles = 0
             complete = False
         else:
-            if int(state["surface_chunks"]) != surface_chunks:
+            if int(state["surface_articles"]) != surface_articles:
                 raise ValueError("The surface BM25 sample changed; rebuild the lemma index with --rebuild.")
             if str(state["pipeline_type"]) != pipeline_type:
                 raise ValueError("The CLASSLA pipeline type changed; rebuild the lemma index with --rebuild.")
             last_article_id = str(state["last_article_id"])
             processed_articles = int(state["processed_articles"])
-            indexed_chunks = int(state["indexed_chunks"])
+            indexed_articles = int(state["indexed_articles"])
             complete = bool(state["complete"])
         if complete or (max_articles is not None and processed_articles >= max_articles):
-            return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
+            return LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
 
         worker_config: dict[str, Any] = {
             "pipeline_type": pipeline_type,
@@ -288,7 +320,7 @@ def build_lemma_index(
             unit="article",
             dynamic_ncols=True,
         ) as progress:
-            progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+            progress.set_postfix(indexed_articles=f"{indexed_articles:,}")
             first_limit = _lemma_fetch_limit(
                 batch_articles,
                 concurrent_batches,
@@ -371,12 +403,25 @@ def build_lemma_index(
                         scheduled_articles = next_batch.processed_articles
                         scheduled_article_id = next_batch.last_article_id
 
+                # Queue the next CLASSLA group before collecting the current
+                # one. ProcessPool workers can then move straight into their
+                # next CPU-tokenization phase instead of waiting at a group
+                # barrier for the slowest worker.
+                next_job = _submit_annotation_job(
+                    next_batch,
+                    batch_articles=batch_articles,
+                    pipeline_depth=pipeline_depth,
+                    process_executor=process_executor,
+                    local_executor=local_executor,
+                    lemmatizer=active_lemmatizer,
+                )
+
                 if pending_write is not None:
                     write_result = pending_write.future.result()
                     processed_articles = write_result.processed_articles
-                    indexed_chunks = write_result.indexed_chunks
+                    indexed_articles = write_result.indexed_articles
                     progress.update(write_result.added_articles)
-                    progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+                    progress.set_postfix(indexed_articles=f"{indexed_articles:,}")
                     if profile:
                         _print_pipelined_profile(pending_write, write_result)
 
@@ -387,27 +432,20 @@ def build_lemma_index(
                         _write_lemma_batch,
                         current_job.batch,
                         annotations,
-                        indexed_chunks,
+                        indexed_articles,
                     ),
                     fetch_seconds=current_job.batch.fetch_seconds,
                     worker_profiles=worker_profiles,
                 )
-                current_job = _submit_annotation_job(
-                    next_batch,
-                    batch_articles=batch_articles,
-                    pipeline_depth=pipeline_depth,
-                    process_executor=process_executor,
-                    local_executor=local_executor,
-                    lemmatizer=active_lemmatizer,
-                )
+                current_job = next_job
 
             if pending_write is not None:
                 write_result = pending_write.future.result()
                 processed_articles = write_result.processed_articles
-                indexed_chunks = write_result.indexed_chunks
+                indexed_articles = write_result.indexed_articles
                 last_article_id = scheduled_article_id
                 progress.update(write_result.added_articles)
-                progress.set_postfix(indexed_chunks=f"{indexed_chunks:,}")
+                progress.set_postfix(indexed_articles=f"{indexed_articles:,}")
                 if profile:
                     _print_pipelined_profile(pending_write, write_result)
 
@@ -416,12 +454,12 @@ def build_lemma_index(
                 with database.conn:
                     database.conn.execute(
                         """
-                        UPDATE lemma_index_state
+                        UPDATE article_lemma_index_state
                         SET complete = 1, updated_at = CURRENT_TIMESTAMP
                         WHERE state_id = 1
                         """
                     )
-        return LemmaIndexStats(surface_chunks, processed_articles, indexed_chunks, complete)
+        return LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
     finally:
         if process_executor is not None:
             process_executor.shutdown(wait=True, cancel_futures=True)
@@ -458,18 +496,16 @@ def _fetch_lemma_batch(
     started = time.perf_counter()
     rows = database.conn.execute(
         """
-        SELECT articles.article_id, articles.title, articles.content, articles.char_end
-        FROM articles
-        WHERE articles.is_valid = 1
-          AND articles.char_end IS NOT NULL
-          AND articles.article_id > ?
-          AND EXISTS (
-              SELECT 1
-              FROM chunks
-              JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
-              WHERE chunks.article_id = articles.article_id
-          )
-        ORDER BY articles.article_id
+        SELECT
+            articles.article_id,
+            article_fts_map.fts_id,
+            articles.title,
+            articles.content
+        FROM article_fts_map
+        JOIN articles ON articles.article_id = article_fts_map.article_id
+        WHERE article_fts_map.article_id > ?
+          AND articles.is_valid = 1
+        ORDER BY article_fts_map.article_id
         LIMIT ?
         """,
         (last_article_id, limit),
@@ -479,54 +515,24 @@ def _fetch_lemma_batch(
     articles = [
         _LemmaArticle(
             article_id=str(row["article_id"]),
+            fts_id=int(row["fts_id"]),
             title=str(row["title"] or ""),
             content=str(row["content"]),
-            char_end=int(row["char_end"]),
         )
         for row in rows
     ]
-    article_ids = [article.article_id for article in articles]
-    placeholders = ",".join("?" for _ in article_ids)
-    chunk_rows = database.conn.execute(
-        f"""
-        SELECT
-            chunks.article_id,
-            chunk_fts_map.fts_id,
-            chunks.text,
-            chunks.char_start,
-            chunks.char_end
-        FROM chunks
-        JOIN chunk_fts_map ON chunk_fts_map.chunk_id = chunks.chunk_id
-        WHERE chunks.article_id IN ({placeholders})
-        ORDER BY chunks.article_id, chunks.chunk_index
-        """,
-        article_ids,
-    ).fetchall()
-    chunks_by_article: dict[str, list[_LemmaChunk]] = {
-        article_id: [] for article_id in article_ids
-    }
-    for row in chunk_rows:
-        chunks_by_article[str(row["article_id"])].append(
-            _LemmaChunk(
-                fts_id=int(row["fts_id"]),
-                text=str(row["text"]),
-                char_start=int(row["char_start"]),
-                char_end=int(row["char_end"]),
-            )
-        )
     return _LemmaBatch(
         articles=articles,
-        chunks_by_article=chunks_by_article,
         fetch_seconds=time.perf_counter() - started,
         processed_articles=processed_articles + len(articles),
     )
 
 
 def _article_payloads(articles: list[_LemmaArticle]) -> list[str]:
-    payloads = []
-    for article in articles:
-        payloads.append(f"{article.title}\n{article.content}" if article.title else article.content)
-    return payloads
+    return [
+        f"{article.title}\n{article.content}" if article.title else article.content
+        for article in articles
+    ]
 
 
 def _submit_annotation_job(
@@ -620,7 +626,7 @@ def _close_lemma_writer() -> None:
 def _write_lemma_batch(
     batch: _LemmaBatch,
     annotations: list[list[LemmaToken]],
-    indexed_chunks: int,
+    indexed_articles: int,
 ) -> _LemmaWriteResult:
     if _LEMMA_WRITER_DATABASE is None:
         raise RuntimeError("The lemma-index writer was not initialized.")
@@ -628,26 +634,25 @@ def _write_lemma_batch(
     documents = _lemma_documents_from_annotations(batch, annotations)
     mapping_seconds = time.perf_counter() - mapping_started
     write_started = time.perf_counter()
-    new_indexed_chunks = indexed_chunks + len(documents)
+    new_indexed_articles = indexed_articles + len(documents)
     with _LEMMA_WRITER_DATABASE.conn:
         _LEMMA_WRITER_DATABASE.conn.executemany(
-            "INSERT INTO chunk_lemma_fts (rowid, title, text) VALUES (?, ?, ?)",
+            "INSERT INTO article_lemma_fts (rowid, title, text) VALUES (?, ?, ?)",
             documents,
         )
         _LEMMA_WRITER_DATABASE.conn.execute(
             """
-            UPDATE lemma_index_state
-            SET last_article_id = ?, processed_articles = ?, indexed_chunks = ?,
+            UPDATE article_lemma_index_state
+            SET last_article_id = ?, processed_articles = ?, indexed_articles = ?,
                 complete = 0, updated_at = CURRENT_TIMESTAMP
             WHERE state_id = 1
             """,
-            (batch.last_article_id, batch.processed_articles, new_indexed_chunks),
+            (batch.last_article_id, batch.processed_articles, new_indexed_articles),
         )
     return _LemmaWriteResult(
         processed_articles=batch.processed_articles,
-        indexed_chunks=new_indexed_chunks,
+        indexed_articles=new_indexed_articles,
         added_articles=len(batch.articles),
-        added_chunks=len(documents),
         mapping_seconds=mapping_seconds,
         write_seconds=time.perf_counter() - write_started,
     )
@@ -661,8 +666,22 @@ def _lemma_documents_from_annotations(
         raise ValueError("The lemmatizer returned a different number of documents than it received.")
     documents: list[tuple[int, str, str]] = []
     for article, tokens in zip(batch.articles, annotations, strict=True):
-        documents.extend(
-            _lemma_documents(article, tokens, batch.chunks_by_article[article.article_id])
+        title_end = len(article.title)
+        content_start = title_end + 1 if article.title else 0
+        lemma_title = " ".join(
+            lemma
+            for token in tokens
+            if token.end <= title_end
+            for lemma in token.lemmas
+        ) or article.title
+        lemma_text = " ".join(
+            lemma
+            for token in tokens
+            if token.start >= content_start
+            for lemma in token.lemmas
+        ) or article.content
+        documents.append(
+            (article.fts_id, lemma_title, lemma_text)
         )
     return documents
 
@@ -692,38 +711,6 @@ def _annotate_index_worker(texts: list[str]) -> _WorkerAnnotations:
         initialization_seconds=initialization_seconds,
         processing_seconds=processing_seconds,
     )
-
-
-def _lemma_documents(
-    article: _LemmaArticle,
-    tokens: list[LemmaToken],
-    chunks: list[_LemmaChunk],
-) -> list[tuple[int, str, str]]:
-    title = article.title
-    content = article.content
-    prefix = f"{title}\n" if title else ""
-    title_end = len(title)
-    token_starts = [token.start for token in tokens]
-    token_ends = [token.end for token in tokens]
-    lemma_title = " ".join(
-        lemma
-        for token in tokens[:bisect_left(token_starts, title_end)]
-        for lemma in token.lemmas
-    ) or title
-    content_char_start = article.char_end - len(content)
-    documents: list[tuple[int, str, str]] = []
-    for chunk in chunks:
-        local_start = chunk.char_start - content_char_start + len(prefix)
-        local_end = chunk.char_end - content_char_start + len(prefix)
-        first_token = bisect_right(token_ends, local_start)
-        last_token = bisect_left(token_starts, local_end, lo=first_token)
-        lemma_text = " ".join(
-            lemma
-            for token in tokens[first_token:last_token]
-            for lemma in token.lemmas
-        ) or chunk.text
-        documents.append((chunk.fts_id, lemma_title, lemma_text))
-    return documents
 
 
 def _print_pipelined_profile(

@@ -83,7 +83,7 @@ SQLite corpus, BM25 index, and EmbeddingGemma FAISS index under `indexes/`:
 semora ingest --newspapers --replace
 semora ingest --articles
 semora ingest --chunks
-semora index bm25 --max-chunks 100000
+semora index bm25 --max-articles 100000
 semora index bm25
 semora models download-classla
 semora index lemma
@@ -102,9 +102,10 @@ persistent NDJSON interface intended for agent integrations.
 Running `semora ingest --replace` without stage flags performs all three
 ingestion stages in the same order.
 
-BM25 indexing is contentless and resumable. `--max-chunks` specifies the total
+BM25 indexing is contentless, article-oriented, and resumable. `--max-articles` specifies the total
 desired index size, so increasing it continues from the last committed batch;
-omitting it indexes all remaining valid chunks.
+omitting it indexes all remaining valid articles. Chunks are used only by the
+semantic index and semantic-search context expansion.
 
 The optional CLASSLA index lemmatizes Slovene articles in multi-document
 batches and stores a second contentless FTS index. It supports lemma-only and

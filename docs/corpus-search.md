@@ -23,7 +23,7 @@ Run these commands from the repository containing `corpus/`:
 semora ingest --newspapers --replace
 semora ingest --articles
 semora ingest --chunks
-semora index bm25 --max-chunks 100000
+semora index bm25 --max-articles 100000
 semora index bm25
 semora models download-classla
 semora index lemma
@@ -39,22 +39,21 @@ process. Stage flags may also be combined, and omitting all stage flags runs all
 three in order. `--replace` is only valid when `--newspapers` is selected and
 removes the previous database before rebuilding it.
 
-`index bm25` builds a contentless SQLite FTS5 index, so indexed title and chunk
-text are not stored for a second time. A small mapping table connects FTS row
-IDs to canonical chunk IDs. Writes commit in batches and resume after the last
-committed chunk. `--max-chunks N` is a total target: rerunning the same target
-is a no-op, increasing it adds more chunks, and omitting it indexes everything
-remaining. Use `--batch-size` to control transaction size or `--rebuild` to
-clear the lexical index first. A target below the current indexed count does
-not remove rows.
+`index bm25` builds a contentless SQLite FTS5 index, so indexed article titles
+and text are not stored for a second time. A small mapping table connects FTS
+row IDs to canonical article IDs. Writes commit in batches and resume after the
+last committed article. `--max-articles N` is a total target: rerunning the same
+target is a no-op, increasing it adds more articles, and omitting it indexes
+everything remaining. Use `--batch-size` to control transaction size or
+`--rebuild` to clear both lexical indexes first. A target below the current
+indexed count does not remove rows.
 
 `index lemma` uses CLASSLA's Slovene tokenizer, POS tagger, and lemmatizer. It
-combines each `--batch-articles` group into one CLASSLA call, separates source
-documents with an explicit EOD sentinel, and validates token positions while
-mapping the lemmas back onto the original articles and chunks. The same group
-is then committed in one SQLite transaction. `--max-articles N` is a resumable
-total target. If the surface BM25 sample or CLASSLA pipeline type changes,
-rebuild the lemma index with `--rebuild`.
+processes complete articles in multi-document batches and stores one
+normalized FTS row per surface-indexed article. Each completed group is
+committed in one SQLite transaction. `--max-articles N` is a resumable total
+target. If the surface BM25 sample or CLASSLA pipeline type changes, rebuild the
+lemma index with `--rebuild`.
 
 Install the `classla` extra and download its language resources before the
 first lemma-indexing run:
@@ -127,10 +126,12 @@ semora search semantic "reports about theatre in Ljubljana" --before 1 --after 1
 
 All modes return the same JSON shape. A hit contains the normalized newspaper
 name and date, source document identifier, relative Markdown path, score,
-original source lines, article title, and snippet. `--before` and `--after`
-include adjacent chunks from the same article. `--context-lines` expands the
-snippet using lines from the original newspaper issue. Searches may be filtered
-with `--newspaper`, `--date-from`, and `--date-to`.
+original source lines, article title, and snippet. Lexical and regex searches
+return the complete article, including its heading. For semantic search,
+`--before` and `--after` include adjacent chunks from the same article.
+`--context-lines` expands either source span using lines from the original
+newspaper issue. Searches may be filtered with `--newspaper`, `--date-from`,
+and `--date-to`.
 
 `bm25-lemma` lemmatizes the query and searches only normalized terms.
 `bm25-combined` merges surface and lemma BM25 scores; `--lemma-weight` controls
