@@ -15,7 +15,11 @@ from semora.diagnostics.classla import (
     profile_classla,
     save_diagnostics,
 )
-from semora.retrieval.engine import DEFAULT_MAX_SNIPPET_CHARS, SearchEngine
+from semora.retrieval.engine import (
+    DEFAULT_MAX_READ_BYTES,
+    DEFAULT_MAX_SNIPPET_CHARS,
+    SearchEngine,
+)
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
 from semora.text import download_classla_models
@@ -194,6 +198,22 @@ def main() -> None:
         finally:
             engine.close()
         return
+    if args.command in {"read", "status"}:
+        engine = SearchEngine(database_path, semantic_dir)
+        try:
+            if args.command == "read":
+                source = engine.read_source(
+                    args.document_id,
+                    args.line_start,
+                    args.line_end,
+                    max_bytes=args.max_bytes,
+                )
+                _print_json({"source": source.as_dict()})
+            else:
+                _print_json({"indexes": engine.index_status()})
+        finally:
+            engine.close()
+        return
     raise AssertionError("Unhandled command")
 
 
@@ -318,6 +338,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Do not preload FAISS and EmbeddingGemma; semantic requests will load them lazily.",
     )
     _add_classla_options(stdio)
+
+    read = commands.add_parser("read", help="Read a bounded line range from a newspaper source.")
+    read.add_argument("document_id", help="Short URN component returned by search.")
+    read.add_argument("--line-start", type=int, required=True)
+    read.add_argument("--line-end", type=int, required=True)
+    read.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_READ_BYTES)
+
+    commands.add_parser("status", help="Report retrieval-index readiness as JSON.")
     return parser
 
 

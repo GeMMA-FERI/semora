@@ -295,6 +295,18 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         requests = io.StringIO(
             json.dumps({"id": "one", "op": "search", "mode": "bm25", "query": "Needle", "limit": 1})
             + "\n"
+            + json.dumps(
+                {
+                    "id": "read",
+                    "op": "read",
+                    "document_id": "0L8XYEOC",
+                    "line_start": 5,
+                    "line_end": 6,
+                }
+            )
+            + "\n"
+            + json.dumps({"id": "health", "op": "health"})
+            + "\n"
             + json.dumps({"id": "stop", "op": "shutdown"})
             + "\n"
         )
@@ -303,7 +315,13 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         values = [json.loads(line) for line in responses.getvalue().splitlines()]
         assert values[0]["id"] == "one"
         assert values[0]["hits"][0]["relative_path"].startswith("Jutro_Ljubljana/")
-        assert values[1] == {"id": "stop", "ok": True}
+        assert values[1]["id"] == "read"
+        assert values[1]["source"]["document_id"] == "0L8XYEOC"
+        assert "Needle appears here." in values[1]["source"]["text"]
+        assert values[2]["id"] == "health"
+        assert values[2]["indexes"]["bm25"]["complete"] is True
+        assert values[2]["indexes"]["semantic"]["available"] is False
+        assert values[3] == {"id": "stop", "ok": True}
     finally:
         engine.close()
 

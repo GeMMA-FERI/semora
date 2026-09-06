@@ -6,7 +6,11 @@ import json
 import sys
 from typing import TextIO
 
-from semora.retrieval.engine import DEFAULT_MAX_SNIPPET_CHARS, SearchEngine
+from semora.retrieval.engine import (
+    DEFAULT_MAX_READ_BYTES,
+    DEFAULT_MAX_SNIPPET_CHARS,
+    SearchEngine,
+)
 
 
 def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) -> None:
@@ -29,8 +33,18 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                         "ok": True,
                         "semantic_loaded": engine.semantic_loaded,
                         "lemma_loaded": engine.lemma_loaded,
+                        "indexes": engine.index_status(),
                     },
                 )
+                continue
+            if operation == "read":
+                source = engine.read_source(
+                    str(request["document_id"]),
+                    int(request["line_start"]),
+                    int(request["line_end"]),
+                    max_bytes=int(request.get("max_bytes", DEFAULT_MAX_READ_BYTES)),
+                )
+                _write(output_stream, {"id": request_id, "source": source.as_dict()})
                 continue
             if operation != "search":
                 raise ValueError(f"Unknown operation: {operation}")

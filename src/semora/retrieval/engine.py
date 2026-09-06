@@ -55,6 +55,57 @@ class SearchEngine:
     def lemma_loaded(self) -> bool:
         return self._lemmatizer is not None
 
+    def index_status(self) -> dict[str, dict[str, Any]]:
+        """Return inexpensive readiness information from index state records."""
+        bm25 = self.database.conn.execute(
+            "SELECT indexed_articles, complete, updated_at FROM article_fts_state WHERE state_id = 1"
+        ).fetchone()
+        lemma = self.database.conn.execute(
+            """
+            SELECT surface_articles, processed_articles, indexed_articles,
+                   pipeline_type, complete, updated_at
+            FROM article_lemma_index_state
+            WHERE state_id = 1
+            """
+        ).fetchone()
+        semantic_files = {
+            "manifest": self.semantic_dir / "manifest.json",
+            "index": self.semantic_dir / "index.faiss",
+            "chunk_ids": self.semantic_dir / "chunk_ids.json",
+        }
+        semantic_available = all(path.is_file() for path in semantic_files.values())
+        semantic: dict[str, Any] = {
+            "available": semantic_available,
+            "complete": semantic_available,
+            "loaded": self.semantic_loaded,
+        }
+        if semantic_available:
+            manifest = json.loads(semantic_files["manifest"].read_text(encoding="utf-8"))
+            semantic.update(
+                model_id=manifest.get("model_id"),
+                chunks=manifest.get("chunks"),
+                dimensions=manifest.get("dimensions"),
+                created_at=manifest.get("created_at"),
+            )
+        return {
+            "bm25": {
+                "available": bm25 is not None and int(bm25["indexed_articles"]) > 0,
+                "complete": bool(bm25["complete"]) if bm25 else False,
+                "indexed_articles": int(bm25["indexed_articles"]) if bm25 else 0,
+                "updated_at": bm25["updated_at"] if bm25 else None,
+            },
+            "lemma": {
+                "available": lemma is not None and int(lemma["indexed_articles"]) > 0,
+                "complete": bool(lemma["complete"]) if lemma else False,
+                "surface_articles": int(lemma["surface_articles"]) if lemma else 0,
+                "processed_articles": int(lemma["processed_articles"]) if lemma else 0,
+                "indexed_articles": int(lemma["indexed_articles"]) if lemma else 0,
+                "pipeline_type": lemma["pipeline_type"] if lemma else None,
+                "updated_at": lemma["updated_at"] if lemma else None,
+            },
+            "semantic": semantic,
+        }
+
     def load_semantic(self) -> None:
         if self._semantic_index is not None:
             return
