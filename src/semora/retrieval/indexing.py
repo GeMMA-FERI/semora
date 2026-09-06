@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+import uuid
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
-from semora.storage import Database
+from semora.storage import Database, Run
 from semora.text.lemmatization import (
     ClasslaLemmatizer,
     LemmatizationProfile,
@@ -80,6 +81,42 @@ class _PendingLemmaWrite:
     worker_profiles: list[_WorkerAnnotations]
 
 
+@dataclass
+class _IndexingLog:
+    database: Database
+    run_id: str
+    index_type: str
+    started_at: float
+    finished: bool = False
+
+    def complete(self, **details: Any) -> None:
+        self._write("index_completed", "INFO", details)
+        self.finished = True
+
+    def fail(self, error: BaseException) -> None:
+        self._write(
+            "index_failed",
+            "ERROR",
+            {
+                "error_type": type(error).__name__,
+                "error": str(error)[:2_000],
+            },
+        )
+        self.finished = True
+
+    def _write(self, event: str, level: str, details: dict[str, Any]) -> None:
+        self.database.log(
+            self.run_id,
+            level,
+            _index_log_message(
+                event,
+                self.index_type,
+                duration_seconds=time.perf_counter() - self.started_at,
+                **details,
+            ),
+        )
+
+
 _INDEX_WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
 _INDEX_WORKER_INITIALIZATION_SECONDS = 0.0
 _INDEX_WORKER_REPORT_INITIALIZATION = False
@@ -99,8 +136,16 @@ def build_bm25_index(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     database = Database(database_path)
+    indexing_log: _IndexingLog | None = None
     try:
         database.initialize()
+        indexing_log = _start_indexing_log(
+            database,
+            "bm25",
+            max_articles=max_articles,
+            batch_size=batch_size,
+            rebuild=rebuild,
+        )
         if rebuild:
             with database.conn:
                 database.conn.execute("INSERT INTO article_fts(article_fts) VALUES('delete-all')")
@@ -135,7 +180,15 @@ def build_bm25_index(
             ).fetchone()[0]
         )
         target = available if max_articles is None else min(max_articles, available)
+        starting_indexed = indexed
         if complete or indexed >= target:
+            indexing_log.complete(
+                indexed_articles=indexed,
+                added_articles=0,
+                available_articles=available,
+                target_articles=target,
+                index_complete=complete,
+            )
             return indexed
         with tqdm(
             total=max(indexed, target),
@@ -204,7 +257,18 @@ def build_bm25_index(
                     database.conn.execute(
                         "UPDATE article_fts_state SET complete = 1, updated_at = CURRENT_TIMESTAMP WHERE state_id = 1"
                     )
+                complete = True
+        indexing_log.complete(
+            indexed_articles=indexed,
+            added_articles=indexed - starting_indexed,
+            available_articles=available,
+            target_articles=target,
+            index_complete=complete,
+        )
         return indexed
+    except BaseException as error:
+        _log_indexing_failure(indexing_log, error)
+        raise
     finally:
         database.close()
 
@@ -248,8 +312,23 @@ def build_lemma_index(
     local_executor: ThreadPoolExecutor | None = None
     writer_executor: ThreadPoolExecutor | None = None
     active_lemmatizer = lemmatizer
+    indexing_log: _IndexingLog | None = None
     try:
         database.initialize()
+        indexing_log = _start_indexing_log(
+            database,
+            "lemma",
+            max_articles=max_articles,
+            batch_articles=batch_articles,
+            rebuild=rebuild,
+            pipeline_type=pipeline_type,
+            device=device,
+            pos_batch_size=pos_batch_size,
+            lemma_batch_size=lemma_batch_size,
+            workers=workers,
+            pipeline_depth=pipeline_depth,
+            tokenizer_workers=tokenizer_workers,
+        )
         if str(database_path) != ":memory:":
             database.conn.execute("PRAGMA journal_mode = WAL")
         if rebuild:
@@ -289,8 +368,19 @@ def build_lemma_index(
             processed_articles = int(state["processed_articles"])
             indexed_articles = int(state["indexed_articles"])
             complete = bool(state["complete"])
+        starting_processed_articles = processed_articles
+        starting_indexed_articles = indexed_articles
         if complete or (max_articles is not None and processed_articles >= max_articles):
-            return LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
+            stats = LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
+            indexing_log.complete(
+                surface_articles=stats.surface_articles,
+                processed_articles=stats.processed_articles,
+                indexed_articles=stats.indexed_articles,
+                added_processed_articles=0,
+                added_indexed_articles=0,
+                index_complete=stats.complete,
+            )
+            return stats
 
         worker_config: dict[str, Any] = {
             "pipeline_type": pipeline_type,
@@ -461,7 +551,19 @@ def build_lemma_index(
                         WHERE state_id = 1
                         """
                     )
-        return LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
+        stats = LemmaIndexStats(surface_articles, processed_articles, indexed_articles, complete)
+        indexing_log.complete(
+            surface_articles=stats.surface_articles,
+            processed_articles=stats.processed_articles,
+            indexed_articles=stats.indexed_articles,
+            added_processed_articles=processed_articles - starting_processed_articles,
+            added_indexed_articles=indexed_articles - starting_indexed_articles,
+            index_complete=stats.complete,
+        )
+        return stats
+    except BaseException as error:
+        _log_indexing_failure(indexing_log, error)
+        raise
     finally:
         if process_executor is not None:
             process_executor.shutdown(wait=True, cancel_futures=True)
@@ -767,13 +869,23 @@ def build_semantic_index(
     except ImportError as exc:
         raise RuntimeError("Semantic indexing requires the 'retrieval' extra.") from exc
 
-    target = Path(output_dir).resolve()
-    target.mkdir(parents=True, exist_ok=True)
-    model = SentenceTransformer(model_id, device=device)
     database = Database(database_path)
+    indexing_log: _IndexingLog | None = None
     index = None
     chunk_ids: list[str] = []
     try:
+        database.initialize()
+        indexing_log = _start_indexing_log(
+            database,
+            "semantic",
+            model_id=model_id,
+            batch_size=batch_size,
+            device=device,
+            output_dir=str(output_dir),
+        )
+        target = Path(output_dir).resolve()
+        target.mkdir(parents=True, exist_ok=True)
+        model = SentenceTransformer(model_id, device=device)
         chunking_rows = database.conn.execute(
             """
             SELECT DISTINCT chunking_runs.config_json
@@ -855,6 +967,44 @@ def build_semantic_index(
         index_temp.replace(target / "index.faiss")
         ids_temp.replace(target / "chunk_ids.json")
         manifest_temp.replace(target / "manifest.json")
+        indexing_log.complete(
+            indexed_chunks=len(chunk_ids),
+            dimensions=int(index.d),
+            output_dir=str(target),
+        )
         return len(chunk_ids)
+    except BaseException as error:
+        _log_indexing_failure(indexing_log, error)
+        raise
     finally:
         database.close()
+
+
+def _start_indexing_log(database: Database, index_type: str, **details: Any) -> _IndexingLog:
+    run_id = f"index-{index_type}-{uuid.uuid4().hex}"
+    database.insert_run(Run(run_id=run_id, run_type=f"index_{index_type}"))
+    started_at = time.perf_counter()
+    database.log(
+        run_id,
+        "INFO",
+        _index_log_message("index_started", index_type, **details),
+    )
+    return _IndexingLog(database, run_id, index_type, started_at)
+
+
+def _log_indexing_failure(indexing_log: _IndexingLog | None, error: BaseException) -> None:
+    if indexing_log is None or indexing_log.finished:
+        return
+    try:
+        indexing_log.fail(error)
+    except Exception:
+        # Preserve the indexing exception if logging itself is unavailable.
+        pass
+
+
+def _index_log_message(event: str, index_type: str, **details: Any) -> str:
+    return json.dumps(
+        {"event": event, "index_type": index_type, **details},
+        ensure_ascii=False,
+        sort_keys=True,
+    )

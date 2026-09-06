@@ -43,6 +43,27 @@ class FakeSloveneLemmatizer:
         return [self.lemmatize(text) for text in texts]
 
 
+def _index_log_events(database_path: Path, run_type: str) -> list[tuple[str, str, dict]]:
+    database = Database(database_path)
+    try:
+        rows = database.conn.execute(
+            """
+            SELECT logs.run_id, logs.level, logs.message
+            FROM logs
+            JOIN runs ON runs.run_id = logs.run_id
+            WHERE runs.run_type = ?
+            ORDER BY logs.log_id
+            """,
+            (run_type,),
+        ).fetchall()
+        return [
+            (str(row["run_id"]), str(row["level"]), json.loads(row["message"]))
+            for row in rows
+        ]
+    finally:
+        database.close()
+
+
 def _build_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
     root = tmp_path / "workspace"
     issue_dir = root / "corpus" / "Jutro_Ljubljana"
@@ -264,6 +285,11 @@ def test_contentless_bm25_index_resumes_to_total_target(tmp_path: Path, monkeypa
     database_path = root / "indexes" / "semora.sqlite"
 
     assert build_bm25_index(database_path, max_articles=1, batch_size=1) == 1
+    events = _index_log_events(database_path, "index_bm25")
+    assert [event[2]["event"] for event in events] == ["index_started", "index_completed"]
+    assert events[0][0] == events[1][0]
+    assert events[1][2]["indexed_articles"] == 1
+    assert events[1][2]["added_articles"] == 1
     database = Database(database_path)
     try:
         first_mapping = database.conn.execute(
@@ -370,6 +396,11 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
             lemmatizer=FailingLemmatizer(),
         )
 
+    failed_events = _index_log_events(database_path, "index_lemma")
+    assert failed_events[-1][1] == "ERROR"
+    assert failed_events[-1][2]["event"] == "index_failed"
+    assert failed_events[-1][2]["error_type"] == "RuntimeError"
+
     database = Database(database_path)
     try:
         state = database.conn.execute("SELECT * FROM article_lemma_index_state").fetchone()
@@ -454,6 +485,13 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
     semantic_dir = root / "indexes" / "semantic"
     count = build_semantic_index(root / "indexes" / "semora.sqlite", semantic_dir, batch_size=2)
     assert count == 4
+    semantic_events = _index_log_events(root / "indexes" / "semora.sqlite", "index_semantic")
+    assert [event[2]["event"] for event in semantic_events] == [
+        "index_started",
+        "index_completed",
+    ]
+    assert semantic_events[-1][2]["indexed_chunks"] == 4
+    assert semantic_events[-1][2]["dimensions"] == 2
     manifest = json.loads((semantic_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["model_id"] == "google/embeddinggemma-300m"
     assert manifest["chunking"]["token_count"] == 3
