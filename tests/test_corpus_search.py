@@ -254,7 +254,8 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         bm25 = engine.search("bm25", "Needle", limit=1, profile=True)
         assert bm25[0].newspaper == "Jutro"
         assert bm25[0].date == "1934-10-10"
-        assert bm25[0].document_id == "URN:NBN:SI:doc-0L8XYEOC"
+        assert bm25[0].document_id == "0L8XYEOC"
+        assert bm25[0].urn == "URN:NBN:SI:doc-0L8XYEOC"
         assert bm25[0].line_start == 5
         assert "Needle appears here." in bm25[0].snippet
         assert engine.last_profile is not None
@@ -263,6 +264,24 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert engine.last_profile["timings_seconds"]["hit_building"] >= 0
         assert engine.last_profile["query_plans"]["article_fts"]
         assert engine.last_profile["sqlite"]["database_size_bytes"] > 0
+
+        excerpt = engine.read_source("0L8XYEOC", 2, 4)
+        assert excerpt.document_id == "0L8XYEOC"
+        assert excerpt.urn == "URN:NBN:SI:doc-0L8XYEOC"
+        assert excerpt.line_start == 2
+        assert excerpt.line_end == 4
+        assert excerpt.text == "Alpha beta gamma delta.\nSecond line here.\n\n"
+        assert excerpt.truncated is False
+
+        truncated = engine.read_source("URN:NBN:SI:doc-0L8XYEOC", 2, 4, max_bytes=5)
+        assert truncated.text == "Alpha"
+        assert truncated.line_end == 2
+        assert truncated.truncated is True
+        with pytest.raises(KeyError, match="Unknown document_id"):
+            engine.read_source("unknown", 1, 1)
+        with pytest.raises(ValueError, match="line_start"):
+            engine.read_source("0L8XYEOC", 0, 1)
+
         short_bm25 = engine.search("bm25", "Needle", limit=1, max_snippet_chars=20)
         assert len(short_bm25[0].snippet) == 20
         assert "Needle" in short_bm25[0].snippet

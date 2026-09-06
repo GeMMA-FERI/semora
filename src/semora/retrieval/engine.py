@@ -8,11 +8,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-from semora.retrieval.models import SearchHit
+from semora.retrieval.models import SearchHit, SourceExcerpt
 from semora.storage import Database
 from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
+DEFAULT_MAX_READ_BYTES = 65_536
+URN_PREFIX = "URN:NBN:SI:doc-"
 
 
 class SearchEngine:
@@ -72,6 +74,71 @@ class SearchEngine:
         if self._semantic_index.ntotal != len(self._semantic_chunk_ids):
             raise ValueError("FAISS index and chunk ID mapping contain different numbers of entries.")
         self._semantic_model = SentenceTransformer(self._semantic_manifest["model_id"])
+
+    def read_source(
+        self,
+        document_id: str,
+        line_start: int,
+        line_end: int,
+        *,
+        max_bytes: int = DEFAULT_MAX_READ_BYTES,
+    ) -> SourceExcerpt:
+        """Read a bounded line range from one newspaper stored in SQLite."""
+        if not document_id.strip():
+            raise ValueError("document_id must not be empty.")
+        if line_start < 1:
+            raise ValueError("line_start must be at least 1.")
+        if line_end < line_start:
+            raise ValueError("line_end must be greater than or equal to line_start.")
+        if not 1 <= max_bytes <= DEFAULT_MAX_READ_BYTES:
+            raise ValueError(f"max_bytes must be between 1 and {DEFAULT_MAX_READ_BYTES}.")
+
+        full_urn = document_id if document_id.startswith(URN_PREFIX) else URN_PREFIX + document_id
+        rows = self.database.conn.execute(
+            """
+            SELECT newspaper_id, content, source, title, date, urn, relative_path
+            FROM newspapers
+            WHERE urn = ?
+            LIMIT 2
+            """,
+            (full_urn,),
+        ).fetchall()
+        if not rows:
+            rows = self.database.conn.execute(
+                """
+                SELECT newspaper_id, content, source, title, date, urn, relative_path
+                FROM newspapers
+                WHERE newspaper_id = ?
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchall()
+        if not rows:
+            raise KeyError(f"Unknown document_id: {document_id}")
+        if len(rows) > 1:
+            raise ValueError(f"document_id is not unique: {document_id}")
+
+        row = rows[0]
+        lines = str(row["content"]).splitlines(keepends=True)
+        if line_start > len(lines):
+            raise ValueError(f"line_start exceeds the document's {len(lines)} lines.")
+        bounded_end = min(line_end, len(lines))
+        text, returned_lines, truncated = _bounded_source_lines(
+            lines[line_start - 1 : bounded_end],
+            max_bytes,
+        )
+        urn = str(row["urn"]) if row["urn"] else None
+        return SourceExcerpt(
+            newspaper=row["source"] or row["title"],
+            date=row["date"],
+            document_id=_document_id(urn, str(row["newspaper_id"])),
+            urn=urn,
+            relative_path=str(row["relative_path"] or ""),
+            line_start=line_start,
+            line_end=line_start + returned_lines - 1,
+            text=text,
+            truncated=truncated or bounded_end < line_end,
+        )
 
     def search(
         self,
@@ -496,14 +563,38 @@ class SearchEngine:
         return SearchHit(
             newspaper=row["source"] or row["newspaper_title"],
             date=row["date"],
-            document_id=row["urn"] or row["document_id"],
+            document_id=_document_id(row["urn"], str(row["document_id"])),
             relative_path=row["relative_path"] or "",
             score=score,
             line_start=line_start,
             line_end=line_end,
             snippet=snippet,
             article_title=row["article_title"],
+            urn=row["urn"],
         )
+
+
+def _document_id(urn: str | None, fallback: str) -> str:
+    if urn and urn.startswith(URN_PREFIX):
+        return urn[len(URN_PREFIX) :]
+    return urn or fallback
+
+
+def _bounded_source_lines(lines: list[str], max_bytes: int) -> tuple[str, int, bool]:
+    parts: list[str] = []
+    used_bytes = 0
+    for line in lines:
+        encoded = line.encode("utf-8")
+        remaining = max_bytes - used_bytes
+        if remaining == 0:
+            return "".join(parts), len(parts), True
+        if len(encoded) <= remaining:
+            parts.append(line)
+            used_bytes += len(encoded)
+            continue
+        parts.append(encoded[:remaining].decode("utf-8", errors="ignore"))
+        return "".join(parts), len(parts), True
+    return "".join(parts), len(parts), False
 
 
 def _query_focus_char(row: dict[str, Any], query: str) -> int:
