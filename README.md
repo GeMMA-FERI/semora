@@ -94,6 +94,9 @@ semora search regex "regular expression" --context-lines 3
 semora search semantic "natural-language query" --before 1 --after 1
 ```
 
+Search results use relevance-centered snippets limited to 600 characters by
+default; use `--max-snippet-chars` to choose another limit.
+
 By default, paths are relative to the current directory. Use `--root PATH`
 before the subcommand to select a different repository root. See the
 [corpus-search guide](docs/corpus-search.md) for filters, result fields, and the

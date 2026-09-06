@@ -13,7 +13,7 @@ from semora.diagnostics.classla import (
     profile_classla,
     save_diagnostics,
 )
-from semora.retrieval.engine import SearchEngine
+from semora.retrieval.engine import DEFAULT_MAX_SNIPPET_CHARS, SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
 from semora.text import download_classla_models
@@ -156,6 +156,7 @@ def main() -> None:
                 date_from=args.date_from,
                 date_to=args.date_to,
                 lemma_weight=args.lemma_weight,
+                max_snippet_chars=args.max_snippet_chars,
             )
             _print_json({"hits": [hit.as_dict() for hit in hits]})
         finally:
@@ -311,7 +312,13 @@ def _add_search_options(parser: argparse.ArgumentParser) -> None:
         default=0,
         help="Include following chunks in semantic-search snippets.",
     )
-    parser.add_argument("--context-lines", type=int, default=0, help="Add source lines around the chunk span.")
+    parser.add_argument("--context-lines", type=int, default=0, help="Add source lines around the result span.")
+    parser.add_argument(
+        "--max-snippet-chars",
+        type=int,
+        default=DEFAULT_MAX_SNIPPET_CHARS,
+        help=f"Maximum characters returned in each snippet (default: {DEFAULT_MAX_SNIPPET_CHARS}).",
+    )
     parser.add_argument("--ignore-case", action="store_true", help="Use case-insensitive regex matching.")
     parser.add_argument("--newspaper", help="Restrict matches to a normalized source or newspaper title.")
     parser.add_argument("--date-from", help="Restrict matches to this ISO date or later.")

@@ -11,6 +11,8 @@ from semora.retrieval.models import SearchHit
 from semora.storage import Database
 from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
+DEFAULT_MAX_SNIPPET_CHARS = 600
+
 
 class SearchEngine:
     def __init__(
@@ -83,11 +85,14 @@ class SearchEngine:
         date_from: str | None = None,
         date_to: str | None = None,
         lemma_weight: float = 1.0,
+        max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS,
     ) -> list[SearchHit]:
         if limit < 1 or before < 0 or after < 0 or context_lines < 0:
             raise ValueError("limit must be positive and context values must be non-negative.")
         if lemma_weight < 0:
             raise ValueError("lemma_weight must be non-negative.")
+        if max_snippet_chars < 1:
+            raise ValueError("max_snippet_chars must be positive.")
         if mode == "bm25":
             matches = self._search_bm25(query, limit, newspaper, date_from, date_to)
         elif mode == "bm25-lemma":
@@ -115,7 +120,14 @@ class SearchEngine:
         else:
             raise ValueError(f"Unknown search mode: {mode}")
         return [
-            self._make_hit(row, score, before=before, after=after, context_lines=context_lines)
+            self._make_hit(
+                row,
+                score,
+                before=before,
+                after=after,
+                context_lines=context_lines,
+                max_snippet_chars=max_snippet_chars,
+            )
             for row, score in matches
         ]
 
@@ -127,7 +139,9 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
-        return self._search_fts("article_fts", query, limit, newspaper, date_from, date_to)
+        return self._search_fts(
+            "article_fts", query, limit, newspaper, date_from, date_to, focus_query=query
+        )
 
     def _search_lemma_bm25(
         self,
@@ -140,7 +154,15 @@ class SearchEngine:
         lemma_query = self._lemmatize_query(query)
         if not lemma_query:
             return []
-        return self._search_fts("article_lemma_fts", lemma_query, limit, newspaper, date_from, date_to)
+        return self._search_fts(
+            "article_lemma_fts",
+            lemma_query,
+            limit,
+            newspaper,
+            date_from,
+            date_to,
+            focus_query=query,
+        )
 
     def _search_combined_bm25(
         self,
@@ -171,6 +193,8 @@ class SearchEngine:
         newspaper: str | None,
         date_from: str | None,
         date_to: str | None,
+        *,
+        focus_query: str,
     ) -> list[tuple[Any, float]]:
         if table not in {"article_fts", "article_lemma_fts"}:
             raise ValueError(f"Unsupported FTS table: {table}")
@@ -205,7 +229,12 @@ class SearchEngine:
                 limit,
             ),
         ).fetchall()
-        return [(row, -float(row["rank"])) for row in rows]
+        results: list[tuple[Any, float]] = []
+        for row in rows:
+            match = dict(row)
+            match["_focus_char"] = _query_focus_char(match, focus_query)
+            results.append((match, -float(row["rank"])))
+        return results
 
     def _lemmatize_query(self, query: str) -> str:
         state = self.database.conn.execute(
@@ -259,7 +288,10 @@ class SearchEngine:
             match = expression.search(str(article["content"]))
             if match is None:
                 continue
-            results.append((article, 1.0))
+            row = dict(article)
+            content_start = int(row["char_end"]) - len(str(row["content"]))
+            row["_focus_char"] = content_start + match.start()
+            results.append((row, 1.0))
             if len(results) >= limit:
                 break
         return results
@@ -328,6 +360,7 @@ class SearchEngine:
         before: int,
         after: int,
         context_lines: int,
+        max_snippet_chars: int,
     ) -> SearchHit:
         if "chunk_index" in row.keys():
             span = self.database.conn.execute(
@@ -348,6 +381,11 @@ class SearchEngine:
         else:
             base_start = int(row["line_start"])
             base_end = int(row["line_end"])
+        focus_char = int(
+            row.get("_focus_char", (int(row["char_start"]) + int(row["char_end"])) // 2)
+            if isinstance(row, dict)
+            else (int(row["char_start"]) + int(row["char_end"])) // 2
+        )
         line_start = max(1, base_start - context_lines)
         line_end = base_end + context_lines
         if "newspaper_content" in row.keys():
@@ -361,9 +399,13 @@ class SearchEngine:
                 """,
                 (row["article_id"],),
             ).fetchone()["content"]
-        lines = str(newspaper_content).splitlines()
-        line_end = min(line_end, len(lines))
-        snippet = "\n".join(lines[line_start - 1 : line_end])
+        snippet, line_start, line_end = _trim_source_span(
+            str(newspaper_content),
+            line_start,
+            line_end,
+            focus_char,
+            max_snippet_chars,
+        )
         return SearchHit(
             newspaper=row["source"] or row["newspaper_title"],
             date=row["date"],
@@ -375,6 +417,58 @@ class SearchEngine:
             snippet=snippet,
             article_title=row["article_title"],
         )
+
+
+def _query_focus_char(row: dict[str, Any], query: str) -> int:
+    title = str(row.get("article_title") or "")
+    content = str(row.get("content") or "")
+    terms = [
+        term
+        for term in re.findall(r"[^\W_]+", query, re.UNICODE)
+        if term.casefold() not in {"and", "or", "not", "near"}
+    ]
+    for text, start in (
+        (title, int(row["char_start"])),
+        (content, int(row["char_end"]) - len(content)),
+    ):
+        folded = text.casefold()
+        positions = [folded.find(term.casefold()) for term in terms]
+        positions = [position for position in positions if position >= 0]
+        if positions:
+            return start + min(positions)
+    return int(row["char_start"])
+
+
+def _trim_source_span(
+    source: str,
+    line_start: int,
+    line_end: int,
+    focus_char: int,
+    max_chars: int,
+) -> tuple[str, int, int]:
+    line_starts = [0, *(match.end() for match in re.finditer("\n", source))]
+    line_count = len(line_starts)
+    line_start = min(max(1, line_start), line_count)
+    line_end = min(max(line_start, line_end), line_count)
+    span_start = line_starts[line_start - 1]
+    span_end = line_starts[line_end] if line_end < line_count else len(source)
+    if span_end - span_start <= max_chars:
+        return source[span_start:span_end].rstrip("\r\n"), line_start, line_end
+
+    focus_char = min(max(focus_char, span_start), max(span_start, span_end - 1))
+    excerpt_start = min(
+        max(span_start, focus_char - max_chars // 3),
+        span_end - max_chars,
+    )
+    excerpt_end = excerpt_start + max_chars
+    excerpt = source[excerpt_start:excerpt_end]
+    if excerpt_start > span_start:
+        excerpt = "…" + excerpt[1:]
+    if excerpt_end < span_end:
+        excerpt = excerpt[:-1] + "…"
+    actual_line_start = source.count("\n", 0, excerpt_start) + 1
+    actual_line_end = source.count("\n", 0, max(excerpt_start, excerpt_end - 1)) + 1
+    return excerpt, actual_line_start, actual_line_end
 
 
 def _matches_filters(

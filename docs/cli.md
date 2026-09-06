@@ -43,6 +43,9 @@ semora search bm25-lemma "gledališča"
 semora search bm25-combined "ljubljanska gledališča" --lemma-weight 1.0
 ```
 
+Search snippets are limited to 600 characters by default. Override this per
+request with `--max-snippet-chars N`.
+
 The article limit is a total target, so lemma indexing resumes after its last
 committed article. Each article batch is processed in one CLASSLA call and one
 SQLite transaction. `--classla-pos-batch-size` and

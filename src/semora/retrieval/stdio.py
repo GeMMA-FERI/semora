@@ -6,7 +6,7 @@ import json
 import sys
 from typing import TextIO
 
-from semora.retrieval.engine import SearchEngine
+from semora.retrieval.engine import DEFAULT_MAX_SNIPPET_CHARS, SearchEngine
 
 
 def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) -> None:
@@ -46,6 +46,9 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                 date_from=request.get("date_from"),
                 date_to=request.get("date_to"),
                 lemma_weight=float(request.get("lemma_weight", 1.0)),
+                max_snippet_chars=int(
+                    request.get("max_snippet_chars", DEFAULT_MAX_SNIPPET_CHARS)
+                ),
             )
             _write(output_stream, {"id": request_id, "hits": [hit.as_dict() for hit in hits]})
         except Exception as exc:

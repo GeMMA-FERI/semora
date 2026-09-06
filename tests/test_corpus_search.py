@@ -202,6 +202,7 @@ def test_ingest_cli_accepts_combinable_stage_flags() -> None:
 
     search_args = _parser().parse_args(["search", "bm25-combined", "gledališča", "--lemma-weight", "0.5"])
     assert search_args.lemma_weight == 0.5
+    assert search_args.max_snippet_chars == 600
 
     model_args = _parser().parse_args(["models", "download-classla"])
     assert model_args.classla_type == "default"
@@ -239,6 +240,9 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert bm25[0].document_id == "URN:NBN:SI:doc-0L8XYEOC"
         assert bm25[0].line_start == 5
         assert "Needle appears here." in bm25[0].snippet
+        short_bm25 = engine.search("bm25", "Needle", limit=1, max_snippet_chars=20)
+        assert len(short_bm25[0].snippet) == 20
+        assert "Needle" in short_bm25[0].snippet
 
         regex = engine.search("regex", r"beta\s+gamma", limit=1, context_lines=1)
         assert regex[0].line_start == 1

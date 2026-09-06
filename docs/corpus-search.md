@@ -126,8 +126,8 @@ semora search semantic "reports about theatre in Ljubljana" --before 1 --after 1
 
 All modes return the same JSON shape. A hit contains the normalized newspaper
 name and date, source document identifier, relative Markdown path, score,
-original source lines, article title, and snippet. Lexical and regex searches
-return the complete article, including its heading. For semantic search,
+original source lines, article title, and a relevance-centered snippet of at
+most 600 characters. Use `--max-snippet-chars` to change that limit. For semantic search,
 `--before` and `--after` include adjacent chunks from the same article.
 `--context-lines` expands either source span using lines from the original
 newspaper issue. Searches may be filtered with `--newspaper`, `--date-from`,
@@ -146,7 +146,7 @@ Diagnostics go to stderr, leaving stdout machine-readable.
 
 ```json
 {"id":"q1","op":"search","mode":"semantic","query":"reports about theatre","limit":5,"before":1,"after":1}
-{"id":"q2","op":"search","mode":"bm25","query":"Ljubljana","date_from":"1934-01-01"}
+{"id":"q2","op":"search","mode":"bm25","query":"Ljubljana","date_from":"1934-01-01","max_snippet_chars":400}
 {"id":"q3","op":"search","mode":"bm25-combined","query":"ljubljanska gledališča","lemma_weight":1.0}
 {"id":"health","op":"health"}
 {"id":"done","op":"shutdown"}
