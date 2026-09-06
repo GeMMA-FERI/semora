@@ -17,7 +17,6 @@ from semora.retrieval import SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.stdio import run_stdio
 from semora.storage import Database
-from semora.text import LemmaToken
 
 
 class WordTokenizer:
@@ -31,23 +30,17 @@ class FakeSloveneLemmatizer:
     def __init__(self) -> None:
         self.annotated_articles = 0
 
-    def annotate(self, text: str) -> list[LemmaToken]:
+    @staticmethod
+    def lemmatize(text: str) -> str:
         normalized = {"appears": "appear", "appeared": "appear"}
-        return [
-            LemmaToken(
-                match.start(),
-                match.end(),
-                (normalized.get(match.group().casefold(), match.group().casefold()),),
-            )
+        return " ".join(
+            normalized.get(match.group().casefold(), match.group().casefold())
             for match in re.finditer(r"[^\W\d_]+", text, re.UNICODE)
-        ]
+        )
 
-    def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
-        self.annotated_articles += len(texts)
-        return [self.annotate(text) for text in texts]
-
-    def lemmatize(self, text: str) -> str:
-        return " ".join(lemma for token in self.annotate(text) for lemma in token.lemmas)
+    def lemmatize_many(self, texts: Sequence[str]) -> list[str]:
+        self.annotated_articles += len(texts) // 2
+        return [self.lemmatize(text) for text in texts]
 
 
 def _build_corpus(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
@@ -364,11 +357,11 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
             super().__init__()
             self.calls = 0
 
-        def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
+        def lemmatize_many(self, texts: Sequence[str]) -> list[str]:
             self.calls += 1
             if self.calls == 2:
                 raise RuntimeError("simulated CLASSLA failure")
-            return super().annotate_many(texts)
+            return super().lemmatize_many(texts)
 
     with pytest.raises(RuntimeError, match="simulated CLASSLA failure"):
         build_lemma_index(

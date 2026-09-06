@@ -114,7 +114,7 @@ def benchmark_classla(
             initialization_seconds = time.perf_counter() - initialization_started
             steady_started = time.perf_counter()
             try:
-                annotated_batches = lemmatizer.annotate_batches(
+                annotated_batches = lemmatizer.lemmatize_batches(
                     batches,
                     pipeline_depth=pipeline_depth,
                 )
@@ -126,7 +126,7 @@ def benchmark_classla(
                 WorkerResult(
                     pid=os.getpid(),
                     documents=sum(len(batch) for batch in annotated_batches),
-                    tokens=sum(len(document) for batch in annotated_batches for document in batch),
+                    tokens=profile.tokens if profile is not None else 0,
                     started_at=steady_started,
                     finished_at=steady_finished,
                     initialization_seconds=initialization_seconds,
@@ -212,7 +212,7 @@ def profile_classla(
         pos_batch_size=pos_batch_size,
         lemma_batch_size=lemma_batch_size,
     )
-    lemmatizer.annotate("Kratek preizkus za ogrevanje.")
+    lemmatizer.lemmatize("Kratek preizkus za ogrevanje.")
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device != "cpu" and torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
@@ -222,7 +222,7 @@ def profile_classla(
         record_shapes=False,
         with_stack=False,
     ) as profiler:
-        annotated = lemmatizer.annotate_many(texts)
+        annotated = lemmatizer.lemmatize_many(texts)
     target = Path(output_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     profiler.export_chrome_trace(str(target))
@@ -238,7 +238,7 @@ def profile_classla(
         "trace": str(target),
         "operator_table": str(table_path),
         "documents": len(annotated),
-        "tokens": sum(len(document) for document in annotated),
+        "tokens": profile.tokens if profile is not None else 0,
         "classla_stages": asdict(profile) if profile is not None else None,
     }
 
@@ -261,13 +261,13 @@ def _process_worker_batch(texts: list[str]) -> WorkerResult:
     if _WORKER_LEMMATIZER is None:
         raise RuntimeError("CLASSLA benchmark worker was not initialized.")
     started = time.perf_counter()
-    annotated = _WORKER_LEMMATIZER.annotate_many(texts)
+    annotated = _WORKER_LEMMATIZER.lemmatize_many(texts)
     finished = time.perf_counter()
     profile = _WORKER_LEMMATIZER.last_profile
     return WorkerResult(
         pid=os.getpid(),
         documents=len(annotated),
-        tokens=sum(len(document) for document in annotated),
+        tokens=profile.tokens if profile is not None else 0,
         started_at=started,
         finished_at=finished,
         initialization_seconds=_WORKER_INITIALIZATION_SECONDS,

@@ -20,7 +20,6 @@ from semora.text.lemmatization import (
     ClasslaLemmatizer,
     LemmatizationProfile,
     Lemmatizer,
-    LemmaToken,
 )
 
 
@@ -34,7 +33,7 @@ class LemmaIndexStats:
 
 @dataclass(frozen=True)
 class _WorkerAnnotations:
-    documents: list[list[LemmaToken]]
+    documents: list[str]
     profile: LemmatizationProfile | None
     initialization_seconds: float
     processing_seconds: float
@@ -532,10 +531,7 @@ def _fetch_lemma_batch(
 
 
 def _article_payloads(articles: list[_LemmaArticle]) -> list[str]:
-    return [
-        f"{article.title}\n{article.content}" if article.title else article.content
-        for article in articles
-    ]
+    return [text for article in articles for text in (article.title, article.content)]
 
 
 def _submit_annotation_job(
@@ -550,10 +546,14 @@ def _submit_annotation_job(
     if batch is None:
         return None
     payloads = _article_payloads(batch.articles)
+    payload_batch_size = batch_articles * 2
     if process_executor is not None:
         futures = tuple(
-            process_executor.submit(_annotate_index_worker, payloads[index : index + batch_articles])
-            for index in range(0, len(payloads), batch_articles)
+            process_executor.submit(
+                _annotate_index_worker,
+                payloads[index : index + payload_batch_size],
+            )
+            for index in range(0, len(payloads), payload_batch_size)
         )
     else:
         assert local_executor is not None and lemmatizer is not None
@@ -562,7 +562,7 @@ def _submit_annotation_job(
                 _annotate_local_batch,
                 lemmatizer,
                 payloads,
-                batch_articles,
+                payload_batch_size,
                 pipeline_depth,
             ),
         )
@@ -571,7 +571,7 @@ def _submit_annotation_job(
 
 def _finish_annotation_job(
     job: _AnnotationJob,
-) -> tuple[list[list[LemmaToken]], list[_WorkerAnnotations]]:
+) -> tuple[list[str], list[_WorkerAnnotations]]:
     worker_profiles = [future.result() for future in job.futures]
     annotations = [
         document
@@ -593,7 +593,7 @@ def _annotate_local_batch(
             payloads[index : index + batch_articles]
             for index in range(0, len(payloads), batch_articles)
         ]
-        annotation_batches = lemmatizer.annotate_batches(
+        annotation_batches = lemmatizer.lemmatize_batches(
             payload_batches,
             pipeline_depth=pipeline_depth,
         )
@@ -603,7 +603,7 @@ def _annotate_local_batch(
             for document in batch_annotations
         ]
     else:
-        annotations = lemmatizer.annotate_many(payloads)
+        annotations = lemmatizer.lemmatize_many(payloads)
     return _WorkerAnnotations(
         documents=annotations,
         profile=getattr(lemmatizer, "last_profile", None),
@@ -628,7 +628,7 @@ def _close_lemma_writer() -> None:
 
 def _write_lemma_batch(
     batch: _LemmaBatch,
-    annotations: list[list[LemmaToken]],
+    annotations: list[str],
     indexed_articles: int,
     pipeline_type: str,
 ) -> _LemmaWriteResult:
@@ -674,26 +674,14 @@ def _write_lemma_batch(
 
 def _lemma_documents_from_annotations(
     batch: _LemmaBatch,
-    annotations: list[list[LemmaToken]],
+    annotations: list[str],
 ) -> list[tuple[int, str, str, str]]:
-    if len(annotations) != len(batch.articles):
+    if len(annotations) != len(batch.articles) * 2:
         raise ValueError("The lemmatizer returned a different number of documents than it received.")
     documents: list[tuple[int, str, str, str]] = []
-    for article, tokens in zip(batch.articles, annotations, strict=True):
-        title_end = len(article.title)
-        content_start = title_end + 1 if article.title else 0
-        lemma_title = " ".join(
-            lemma
-            for token in tokens
-            if token.end <= title_end
-            for lemma in token.lemmas
-        ) or article.title
-        lemma_text = " ".join(
-            lemma
-            for token in tokens
-            if token.start >= content_start
-            for lemma in token.lemmas
-        ) or article.content
+    for index, article in enumerate(batch.articles):
+        lemma_title = annotations[index * 2] or article.title
+        lemma_text = annotations[index * 2 + 1] or article.content
         documents.append(
             (article.fts_id, article.article_id, lemma_title, lemma_text)
         )
@@ -713,7 +701,7 @@ def _annotate_index_worker(texts: list[str]) -> _WorkerAnnotations:
     if _INDEX_WORKER_LEMMATIZER is None:
         raise RuntimeError("CLASSLA index worker was not initialized.")
     started = time.perf_counter()
-    documents = _INDEX_WORKER_LEMMATIZER.annotate_many(texts)
+    documents = _INDEX_WORKER_LEMMATIZER.lemmatize_many(texts)
     processing_seconds = time.perf_counter() - started
     initialization_seconds = (
         _INDEX_WORKER_INITIALIZATION_SECONDS if _INDEX_WORKER_REPORT_INITIALIZATION else 0.0

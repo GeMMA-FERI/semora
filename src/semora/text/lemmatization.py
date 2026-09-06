@@ -15,21 +15,6 @@ from typing import Any, Protocol
 # Obeliks keeps this alphanumeric sentinel as one token. Punctuation-based
 # markers such as @@EOD@@ are split into several tokens.
 DOCUMENT_BOUNDARY = "SEMORAEODBOUNDARYZXQ"
-_NORMALIZED_TOKEN_SOURCES = {
-    "-": ("‐", "‑", "‒", "–", "—", "―", "−", "﹘", "﹣", "－"),
-    "'": ("‘", "’", "‚", "‛", "`", "´"),
-    '"': ("“", "”", "„", "‟", "«", "»"),
-    "...": ("…",),
-}
-
-
-@dataclass(frozen=True)
-class LemmaToken:
-    start: int
-    end: int
-    lemmas: tuple[str, ...]
-
-
 @dataclass(frozen=True)
 class LemmatizationProfile:
     documents: int
@@ -62,12 +47,16 @@ class _PipelineBatch:
     lemma_seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class _LemmaCollection:
+    documents: list[str]
+    tokens: int
+
+
 class Lemmatizer(Protocol):
-    def annotate(self, text: str) -> list[LemmaToken]: ...
-
-    def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]: ...
-
     def lemmatize(self, text: str) -> str: ...
+
+    def lemmatize_many(self, texts: Sequence[str]) -> list[str]: ...
 
 
 class ClasslaLemmatizer:
@@ -120,10 +109,7 @@ class ClasslaLemmatizer:
         self.last_profile: LemmatizationProfile | None = None
         self.pipeline = classla.Pipeline("sl", **options)
 
-    def annotate(self, text: str) -> list[LemmaToken]:
-        return self.annotate_many([text])[0]
-
-    def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
+    def lemmatize_many(self, texts: Sequence[str]) -> list[str]:
         if not texts:
             self.last_profile = LemmatizationProfile(0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0)
             return []
@@ -132,19 +118,21 @@ class ClasslaLemmatizer:
         batch = self._tokenize_batch(tuple(texts))
         batch = self._pos_batch(batch)
         batch = self._lemma_batch(batch)
-        results = self._collect_batch(batch)
+        collection = self._collect_batch(batch)
         wall_seconds = time.perf_counter() - wall_started
         peak_cuda_bytes = self._end_profile()
-        self.last_profile = _profile_batches([batch], results, peak_cuda_bytes, wall_seconds)
-        return results
+        self.last_profile = _profile_batches(
+            [batch], collection.tokens, peak_cuda_bytes, wall_seconds
+        )
+        return collection.documents
 
-    def annotate_batches(
+    def lemmatize_batches(
         self,
         text_batches: Sequence[Sequence[str]],
         *,
         pipeline_depth: int = 3,
-    ) -> list[list[list[LemmaToken]]]:
-        """Annotate bounded batches through independent tokenizer, POS, and lemma stages."""
+    ) -> list[list[str]]:
+        """Lemmatize bounded batches through independent tokenizer, POS, and lemma stages."""
         if pipeline_depth <= 0:
             raise ValueError("pipeline_depth must be positive.")
         batches = [tuple(texts) for texts in text_batches]
@@ -154,7 +142,7 @@ class ClasslaLemmatizer:
 
         self._begin_profile()
         wall_started = time.perf_counter()
-        completed: list[tuple[_PipelineBatch, list[list[LemmaToken]]]] = []
+        completed: list[tuple[_PipelineBatch, _LemmaCollection]] = []
         pending: deque[Future[_PipelineBatch]] = deque()
         with ExitStack() as stack:
             if self._tokenizer_workers:
@@ -184,9 +172,11 @@ class ClasslaLemmatizer:
         wall_seconds = time.perf_counter() - wall_started
         peak_cuda_bytes = self._end_profile()
         stage_batches = [batch for batch, _ in completed]
-        results = [documents for _, documents in completed]
-        flattened = [document for batch_results in results for document in batch_results]
-        self.last_profile = _profile_batches(stage_batches, flattened, peak_cuda_bytes, wall_seconds)
+        results = [collection.documents for _, collection in completed]
+        token_count = sum(collection.tokens for _, collection in completed)
+        self.last_profile = _profile_batches(
+            stage_batches, token_count, peak_cuda_bytes, wall_seconds
+        )
         return results
 
     def close(self) -> None:
@@ -265,10 +255,10 @@ class ClasslaLemmatizer:
             stream.synchronize()
             return result
 
-    def _collect_batch(self, batch: _PipelineBatch) -> list[list[LemmaToken]]:
+    def _collect_batch(self, batch: _PipelineBatch) -> _LemmaCollection:
         if batch.document is None:
-            return [[] for _ in batch.texts]
-        return _tokens_from_document(batch.texts, batch.boundary, batch.document)
+            return _LemmaCollection(["" for _ in batch.texts], 0)
+        return _lemmas_from_document(batch.texts, batch.boundary, batch.document)
 
     def _begin_profile(self) -> None:
         if self._use_gpu:
@@ -296,90 +286,55 @@ class ClasslaLemmatizer:
         return document, stage_seconds, self._end_profile()
 
     def lemmatize(self, text: str) -> str:
-        return " ".join(lemma for token in self.annotate(text) for lemma in token.lemmas)
+        return self.lemmatize_many([text])[0]
 
 
-def _tokens_from_document(
+def _lemmas_from_document(
     texts: Sequence[str],
     boundary: str,
     document: Any,
-) -> list[list[LemmaToken]]:
-    results: list[list[LemmaToken]] = [[] for _ in texts]
+) -> _LemmaCollection:
+    results: list[list[str]] = [[] for _ in texts]
     document_index = 0
-    search_start = 0
     boundaries_seen = 0
+    token_count = 0
     for sentence in document.sentences:
         for token in sentence.tokens:
             token_text = str(token.text)
             if token_text == boundary:
                 boundaries_seen += 1
                 document_index += 1
-                search_start = 0
                 continue
             if document_index >= len(texts):
                 raise ValueError("CLASSLA returned tokens after the final EOD document boundary.")
-            token_start, token_end = _find_source_token(
-                texts[document_index],
-                token_text,
-                search_start,
-            )
-            if token_start < 0:
-                raise ValueError(
-                    "Could not map a CLASSLA token back to its source document after the EOD boundary. "
-                    f"Document index: {document_index}; token: {token_text!r}; "
-                    f"source offset: {search_start}; "
-                    f"source context: {texts[document_index][search_start:search_start + 120]!r}."
-                )
-            search_start = token_end
-            lemmas = tuple(
+            lemmas = [
                 str(word.lemma or word.text).strip()
                 for word in token.words
                 if str(word.lemma or word.text).strip() not in {"", "_"}
-            )
+            ]
             if not lemmas and token_text.strip():
-                lemmas = (token_text.strip(),)
+                lemmas = [token_text.strip()]
             if lemmas:
-                results[document_index].append(
-                    LemmaToken(
-                        start=token_start,
-                        end=token_end,
-                        lemmas=lemmas,
-                    )
-                )
+                results[document_index].extend(lemmas)
+                token_count += 1
     expected_boundaries = len(texts) - 1
     if boundaries_seen != expected_boundaries:
         raise ValueError(
             f"CLASSLA returned {boundaries_seen} EOD boundaries; expected {expected_boundaries}."
         )
-    return results
-
-
-def _find_source_token(text: str, token_text: str, search_start: int) -> tuple[int, int]:
-    matches = [
-        (candidate_start, candidate_start + len(candidate))
-        for candidate in (token_text, *_NORMALIZED_TOKEN_SOURCES.get(token_text, ()))
-        if (candidate_start := text.find(candidate, search_start)) >= 0
-    ]
-    match = min(matches, default=(-1, -1))
-    punctuation_only = bool(token_text) and not any(character.isalnum() for character in token_text)
-    if punctuation_only and (match[0] < 0 or match[0] - search_start > 64):
-        # Obeliks can insert punctuation while resolving OCR line breaks, for
-        # example nesramnost -> nesram, -, nost. Such a token has no source
-        # characters and must not move alignment to unrelated punctuation.
-        return search_start, search_start
-    return match
+    return _LemmaCollection([" ".join(lemmas) for lemmas in results], token_count)
 
 
 def _profile_batches(
     batches: Sequence[_PipelineBatch],
-    documents: Sequence[Sequence[LemmaToken]],
+    token_count: int,
     peak_cuda_bytes: int,
     wall_seconds: float,
 ) -> LemmatizationProfile:
     return LemmatizationProfile(
         documents=sum(len(batch.texts) for batch in batches),
         characters=sum(len(text) for batch in batches for text in batch.texts),
-        tokens=sum(len(tokens) for tokens in documents),
+        tokens=token_count,
         tokenize_seconds=sum(batch.tokenize_seconds for batch in batches),
         pos_seconds=sum(batch.pos_seconds for batch in batches),
         lemma_seconds=sum(batch.lemma_seconds for batch in batches),

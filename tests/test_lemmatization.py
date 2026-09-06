@@ -10,10 +10,10 @@ import pytest
 
 from semora.diagnostics.classla import profile_classla
 from semora.text import ClasslaLemmatizer, download_classla_models
-from semora.text.lemmatization import _tokens_from_document
+from semora.text.lemmatization import _lemmas_from_document
 
 
-def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path: Path) -> None:
+def test_classla_adapter_uses_minimal_pipeline_without_offsets(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
     class FakeTokenizer:
@@ -70,24 +70,19 @@ def test_classla_adapter_uses_minimal_pipeline_and_offsets(monkeypatch, tmp_path
         lemma_batch_size=200,
     )
     assert lemmatizer.lemmatize("gledališča") == "gledališče"
-    assert lemmatizer.annotate("gledališča")[0].start == 0
-    documents = lemmatizer.annotate_many(["Prvi dokument", "Drugi @@EOD@@ dokument"])
-    assert [[lemma for token in document for lemma in token.lemmas] for document in documents] == [
-        ["prvi", "dokument"],
-        ["drugi", "eod", "dokument"],
+    documents = lemmatizer.lemmatize_many(["Prvi dokument", "Drugi @@EOD@@ dokument"])
+    assert documents == [
+        "prvi dokument",
+        "drugi eod dokument",
     ]
-    staged = lemmatizer.annotate_batches(
+    staged = lemmatizer.lemmatize_batches(
         [["Prvi dokument"], ["Drugi dokument", "Tretji dokument"]],
         pipeline_depth=2,
     )
-    assert [
-        [lemma for token in document for lemma in token.lemmas]
-        for batch in staged
-        for document in batch
-    ] == [
-        ["prvi", "dokument"],
-        ["drugi", "dokument"],
-        ["tretji", "dokument"],
+    assert [document for batch in staged for document in batch] == [
+        "prvi dokument",
+        "drugi dokument",
+        "tretji dokument",
     ]
     assert lemmatizer.last_profile is not None
     assert lemmatizer.last_profile.documents == 3
@@ -111,7 +106,7 @@ def test_operator_profiler_rejects_dangerously_large_traces(tmp_path: Path) -> N
         profile_classla(["Besedilo."] * 6, tmp_path / "trace.json")
 
 
-def test_classla_source_mapping_handles_normalized_token_text() -> None:
+def test_classla_lemma_collection_does_not_require_source_positions() -> None:
     word = types.SimpleNamespace(lemma="-", text="-")
     token = types.SimpleNamespace(
         text="-",
@@ -123,26 +118,7 @@ def test_classla_source_mapping_handles_normalized_token_text() -> None:
         sentences=[types.SimpleNamespace(tokens=[token])],
     )
 
-    result = _tokens_from_document(["Pred—vojno"], "UNUSED_BOUNDARY", document)
+    result = _lemmas_from_document(["Pred—vojno"], "UNUSED_BOUNDARY", document)
 
-    assert result[0][0].start == 4
-    assert result[0][0].end == 5
-    assert result[0][0].lemmas == ("-",)
-
-
-def test_classla_source_mapping_handles_synthetic_line_break_token() -> None:
-    def token(text: str):
-        return types.SimpleNamespace(
-            text=text,
-            start_char=None,
-            end_char=None,
-            words=[types.SimpleNamespace(lemma=text, text=text)],
-        )
-
-    document = types.SimpleNamespace(
-        sentences=[types.SimpleNamespace(tokens=[token("nesram"), token("-"), token("nost")])],
-    )
-
-    result = _tokens_from_document(["nesramnost"], "UNUSED_BOUNDARY", document)[0]
-
-    assert [(item.start, item.end) for item in result] == [(0, 6), (6, 6), (6, 10)]
+    assert result.documents == ["-"]
+    assert result.tokens == 1

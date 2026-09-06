@@ -250,8 +250,7 @@ class SearchEngine:
             )
         lemmas = (
             lemma
-            for token in self._lemmatizer.annotate(query)
-            for lemma in token.lemmas
+            for lemma in self._lemmatizer.lemmatize(query).split()
             if any(character.isalnum() for character in lemma)
         )
         return " ".join(f'"{lemma.replace(chr(34), chr(34) * 2)}"' for lemma in lemmas)
