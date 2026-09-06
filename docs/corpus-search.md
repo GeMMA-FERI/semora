@@ -50,10 +50,12 @@ indexed count does not remove rows.
 
 `index lemma` uses CLASSLA's Slovene tokenizer, POS tagger, and lemmatizer. It
 processes complete articles in multi-document batches and stores one
-normalized FTS row per surface-indexed article. Each completed group is
-committed in one SQLite transaction. `--max-articles N` is a resumable total
-target. If the surface BM25 sample or CLASSLA pipeline type changes, rebuild the
-lemma index with `--rebuild`.
+normalized FTS row per surface-indexed article. The readable lemmatized title
+and body are also materialized in `article_lemmas`, so they can be queried,
+exported, or deleted independently later. Each completed group updates both
+tables in one SQLite transaction. `--max-articles N` is a resumable total target.
+If the surface BM25 sample or CLASSLA pipeline type changes, rebuild the lemma
+index with `--rebuild`.
 
 Install the `classla` extra and download its language resources before the
 first lemma-indexing run:

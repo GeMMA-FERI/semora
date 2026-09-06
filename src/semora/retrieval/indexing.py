@@ -110,6 +110,7 @@ def build_bm25_index(
                 database.conn.execute(
                     "INSERT INTO article_lemma_fts(article_lemma_fts) VALUES('delete-all')"
                 )
+                database.conn.execute("DELETE FROM article_lemmas")
                 database.conn.execute("DELETE FROM article_lemma_index_state")
         state = database.conn.execute(
             "SELECT * FROM article_fts_state WHERE state_id = 1"
@@ -257,6 +258,7 @@ def build_lemma_index(
                 database.conn.execute(
                     "INSERT INTO article_lemma_fts(article_lemma_fts) VALUES('delete-all')"
                 )
+                database.conn.execute("DELETE FROM article_lemmas")
                 database.conn.execute("DELETE FROM article_lemma_index_state")
         surface_articles = int(
             database.conn.execute("SELECT COUNT(*) FROM article_fts_map").fetchone()[0]
@@ -433,6 +435,7 @@ def build_lemma_index(
                         current_job.batch,
                         annotations,
                         indexed_articles,
+                        pipeline_type,
                     ),
                     fetch_seconds=current_job.batch.fetch_seconds,
                     worker_profiles=worker_profiles,
@@ -627,6 +630,7 @@ def _write_lemma_batch(
     batch: _LemmaBatch,
     annotations: list[list[LemmaToken]],
     indexed_articles: int,
+    pipeline_type: str,
 ) -> _LemmaWriteResult:
     if _LEMMA_WRITER_DATABASE is None:
         raise RuntimeError("The lemma-index writer was not initialized.")
@@ -638,7 +642,17 @@ def _write_lemma_batch(
     with _LEMMA_WRITER_DATABASE.conn:
         _LEMMA_WRITER_DATABASE.conn.executemany(
             "INSERT INTO article_lemma_fts (rowid, title, text) VALUES (?, ?, ?)",
-            documents,
+            [(fts_id, title, content) for fts_id, _, title, content in documents],
+        )
+        _LEMMA_WRITER_DATABASE.conn.executemany(
+            """
+            INSERT INTO article_lemmas (article_id, title, content, pipeline_type)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (article_id, title, content, pipeline_type)
+                for _, article_id, title, content in documents
+            ],
         )
         _LEMMA_WRITER_DATABASE.conn.execute(
             """
@@ -661,10 +675,10 @@ def _write_lemma_batch(
 def _lemma_documents_from_annotations(
     batch: _LemmaBatch,
     annotations: list[list[LemmaToken]],
-) -> list[tuple[int, str, str]]:
+) -> list[tuple[int, str, str, str]]:
     if len(annotations) != len(batch.articles):
         raise ValueError("The lemmatizer returned a different number of documents than it received.")
-    documents: list[tuple[int, str, str]] = []
+    documents: list[tuple[int, str, str, str]] = []
     for article, tokens in zip(batch.articles, annotations, strict=True):
         title_end = len(article.title)
         content_start = title_end + 1 if article.title else 0
@@ -681,7 +695,7 @@ def _lemma_documents_from_annotations(
             for lemma in token.lemmas
         ) or article.content
         documents.append(
-            (article.fts_id, lemma_title, lemma_text)
+            (article.fts_id, article.article_id, lemma_title, lemma_text)
         )
     return documents
 

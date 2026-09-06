@@ -328,8 +328,14 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
         stored_columns = database.conn.execute(
             "SELECT title, text FROM article_lemma_fts LIMIT 1"
         ).fetchone()
+        materialized = database.conn.execute(
+            "SELECT title, content, pipeline_type FROM article_lemmas ORDER BY article_id"
+        ).fetchall()
         assert "content = ''" in schema
         assert tuple(stored_columns) == (None, None)
+        assert len(materialized) == 2
+        assert materialized[0]["pipeline_type"] == "default"
+        assert any("needle appear here" in row["content"] for row in materialized)
     finally:
         database.close()
 
@@ -376,7 +382,9 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
         state = database.conn.execute("SELECT * FROM article_lemma_index_state").fetchone()
         assert state["processed_articles"] == 1
         indexed_rows = database.conn.execute("SELECT COUNT(*) FROM article_lemma_fts").fetchone()[0]
+        materialized_rows = database.conn.execute("SELECT COUNT(*) FROM article_lemmas").fetchone()[0]
         assert indexed_rows == state["indexed_articles"]
+        assert materialized_rows == indexed_rows
         assert 0 < indexed_rows < 2
     finally:
         database.close()
