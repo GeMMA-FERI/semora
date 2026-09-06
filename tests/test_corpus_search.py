@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from semora.cli.main import _parser
 from semora.corpus import indexer
@@ -310,6 +311,11 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
 
     database = Database(database_path)
     try:
+        chunk_indexes = {
+            str(row["name"])
+            for row in database.conn.execute("PRAGMA index_list(chunks)")
+        }
+        assert "idx_chunks_article_chunk" in chunk_indexes
         schema = database.conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'chunk_lemma_fts'"
         ).fetchone()["sql"]
@@ -334,6 +340,49 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
         assert "Needle appears here." in combined_hits[0].snippet
     finally:
         engine.close()
+
+
+def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monkeypatch) -> None:
+    root, _ = _build_corpus(tmp_path, monkeypatch)
+    database_path = root / "indexes" / "semora.sqlite"
+    assert build_bm25_index(database_path) == 4
+
+    class FailingLemmatizer(FakeSloveneLemmatizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def annotate_many(self, texts: Sequence[str]) -> list[list[LemmaToken]]:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("simulated CLASSLA failure")
+            return super().annotate_many(texts)
+
+    with pytest.raises(RuntimeError, match="simulated CLASSLA failure"):
+        build_lemma_index(
+            database_path,
+            batch_articles=1,
+            lemmatizer=FailingLemmatizer(),
+        )
+
+    database = Database(database_path)
+    try:
+        state = database.conn.execute("SELECT * FROM lemma_index_state").fetchone()
+        assert state["processed_articles"] == 1
+        indexed_rows = database.conn.execute("SELECT COUNT(*) FROM chunk_lemma_fts").fetchone()[0]
+        assert indexed_rows == state["indexed_chunks"]
+        assert 0 < indexed_rows < 4
+    finally:
+        database.close()
+
+    finished = build_lemma_index(
+        database_path,
+        batch_articles=1,
+        lemmatizer=FakeSloveneLemmatizer(),
+    )
+    assert finished.processed_articles == 2
+    assert finished.indexed_chunks == 4
+    assert finished.complete is True
 
 
 def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, monkeypatch) -> None:

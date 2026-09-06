@@ -115,6 +115,11 @@ lightweight persistent subprocess while the parent retains the only copy of
 the POS model, lemma model, CUDA context, and lexicon. Set both
 `--pipeline-depth 1` and `--tokenizer-workers 0` to disable this staged path.
 
+Lemma indexing also pipelines SQLite work with CLASSLA inference. Semora fetches
+all chunk mappings for an article group in one query, prefetches the next group
+while CLASSLA is running, and commits completed groups through one ordered writer.
+Each FTS insert and resume checkpoint remains in the same transaction.
+
 For read-only performance diagnosis, use `semora profile classla` to create a
 PyTorch CPU/CUDA trace and `semora benchmark classla --workers 1 2 3 4` to
 measure whether multiple CLASSLA processes improve steady-state throughput.
