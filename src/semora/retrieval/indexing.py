@@ -690,22 +690,26 @@ def _annotate_local_batch(
     pipeline_depth: int,
 ) -> _WorkerAnnotations:
     started = time.perf_counter()
-    if isinstance(lemmatizer, ClasslaLemmatizer) and pipeline_depth > 1:
-        payload_batches = [
-            payloads[index : index + batch_articles]
-            for index in range(0, len(payloads), batch_articles)
-        ]
-        annotation_batches = lemmatizer.lemmatize_batches(
-            payload_batches,
-            pipeline_depth=pipeline_depth,
-        )
-        annotations = [
-            document
-            for batch_annotations in annotation_batches
-            for document in batch_annotations
-        ]
-    else:
-        annotations = lemmatizer.lemmatize_many(payloads)
+    try:
+        if isinstance(lemmatizer, ClasslaLemmatizer) and pipeline_depth > 1:
+            payload_batches = [
+                payloads[index : index + batch_articles]
+                for index in range(0, len(payloads), batch_articles)
+            ]
+            annotation_batches = lemmatizer.lemmatize_batches(
+                payload_batches,
+                pipeline_depth=pipeline_depth,
+            )
+            annotations = [
+                document
+                for batch_annotations in annotation_batches
+                for document in batch_annotations
+            ]
+        else:
+            annotations = lemmatizer.lemmatize_many(payloads)
+    finally:
+        if isinstance(lemmatizer, ClasslaLemmatizer):
+            lemmatizer.release_cuda_cache()
     return _WorkerAnnotations(
         documents=annotations,
         profile=getattr(lemmatizer, "last_profile", None),
@@ -803,7 +807,11 @@ def _annotate_index_worker(texts: list[str]) -> _WorkerAnnotations:
     if _INDEX_WORKER_LEMMATIZER is None:
         raise RuntimeError("CLASSLA index worker was not initialized.")
     started = time.perf_counter()
-    documents = _INDEX_WORKER_LEMMATIZER.lemmatize_many(texts)
+    try:
+        documents = _INDEX_WORKER_LEMMATIZER.lemmatize_many(texts)
+        profile = _INDEX_WORKER_LEMMATIZER.last_profile
+    finally:
+        _INDEX_WORKER_LEMMATIZER.release_cuda_cache()
     processing_seconds = time.perf_counter() - started
     initialization_seconds = (
         _INDEX_WORKER_INITIALIZATION_SECONDS if _INDEX_WORKER_REPORT_INITIALIZATION else 0.0
@@ -811,7 +819,7 @@ def _annotate_index_worker(texts: list[str]) -> _WorkerAnnotations:
     _INDEX_WORKER_REPORT_INITIALIZATION = False
     return _WorkerAnnotations(
         documents=documents,
-        profile=_INDEX_WORKER_LEMMATIZER.last_profile,
+        profile=profile,
         initialization_seconds=initialization_seconds,
         processing_seconds=processing_seconds,
     )

@@ -122,3 +122,16 @@ def test_classla_lemma_collection_does_not_require_source_positions() -> None:
 
     assert result.documents == ["-"]
     assert result.tokens == 1
+
+
+def test_classla_adapter_releases_only_unused_cuda_cache() -> None:
+    calls = []
+    lemmatizer = object.__new__(ClasslaLemmatizer)
+    lemmatizer._use_gpu = True
+    lemmatizer._torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(empty_cache=lambda: calls.append("empty_cache"))
+    )
+
+    lemmatizer.release_cuda_cache()
+
+    assert calls == ["empty_cache"]

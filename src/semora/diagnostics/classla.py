@@ -261,9 +261,12 @@ def _process_worker_batch(texts: list[str]) -> WorkerResult:
     if _WORKER_LEMMATIZER is None:
         raise RuntimeError("CLASSLA benchmark worker was not initialized.")
     started = time.perf_counter()
-    annotated = _WORKER_LEMMATIZER.lemmatize_many(texts)
+    try:
+        annotated = _WORKER_LEMMATIZER.lemmatize_many(texts)
+        profile = _WORKER_LEMMATIZER.last_profile
+    finally:
+        _WORKER_LEMMATIZER.release_cuda_cache()
     finished = time.perf_counter()
-    profile = _WORKER_LEMMATIZER.last_profile
     return WorkerResult(
         pid=os.getpid(),
         documents=len(annotated),

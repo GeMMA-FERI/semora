@@ -184,6 +184,11 @@ class ClasslaLemmatizer:
             self._tokenizer_pool.shutdown(wait=True, cancel_futures=True)
             self._tokenizer_pool = None
 
+    def release_cuda_cache(self) -> None:
+        """Return unused cached CUDA blocks without unloading the pipeline models."""
+        if self._use_gpu:
+            self._torch.cuda.empty_cache()
+
     def start_tokenizer_workers(self) -> None:
         """Start optional tokenizer processes before timed batch processing."""
         if self._tokenizer_workers:
