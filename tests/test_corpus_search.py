@@ -319,6 +319,11 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert len(short_bm25[0].snippet) == 20
         assert "Needle" in short_bm25[0].snippet
 
+        first_page = engine.search("bm25", "article", limit=1)
+        second_page = engine.search("bm25", "article", limit=1, offset=1)
+        assert len(first_page) == len(second_page) == 1
+        assert first_page[0].article_title != second_page[0].article_title
+
         regex = engine.search("regex", r"beta\s+gamma", limit=1, context_lines=1)
         assert regex[0].line_start == 1
         assert regex[0].line_end == 4

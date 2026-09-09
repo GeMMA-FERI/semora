@@ -220,12 +220,13 @@ class SearchEngine:
         date_from: str | None = None,
         date_to: str | None = None,
         lemma_weight: float = 1.0,
+        offset: int = 0,
         max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS,
         source_wrap_chars: int = DEFAULT_SOURCE_WRAP_CHARS,
         profile: bool = False,
     ) -> list[SearchHit]:
-        if limit < 1 or before < 0 or after < 0 or context_lines < 0:
-            raise ValueError("limit must be positive and context values must be non-negative.")
+        if limit < 1 or offset < 0 or before < 0 or after < 0 or context_lines < 0:
+            raise ValueError("limit must be positive; offset and context values must be non-negative.")
         if lemma_weight < 0:
             raise ValueError("lemma_weight must be non-negative.")
         if max_snippet_chars < 1:
@@ -239,6 +240,7 @@ class SearchEngine:
                 "mode": mode,
                 "query": query,
                 "limit": limit,
+                "offset": offset,
                 "filters": {
                     "newspaper": newspaper,
                     "date_from": date_from,
@@ -252,9 +254,9 @@ class SearchEngine:
         )
         retrieval_started = time.perf_counter()
         if mode == "bm25":
-            matches = self._search_bm25(query, limit, newspaper, date_from, date_to)
+            matches = self._search_bm25(query, limit, newspaper, date_from, date_to, offset)
         elif mode == "bm25-lemma":
-            matches = self._search_lemma_bm25(query, limit, newspaper, date_from, date_to)
+            matches = self._search_lemma_bm25(query, limit, newspaper, date_from, date_to, offset)
         elif mode == "bm25-combined":
             matches = self._search_combined_bm25(
                 query,
@@ -263,6 +265,7 @@ class SearchEngine:
                 date_from,
                 date_to,
                 lemma_weight,
+                offset,
             )
         elif mode == "regex":
             matches = self._search_regex(
@@ -309,9 +312,17 @@ class SearchEngine:
         newspaper: str | None,
         date_from: str | None,
         date_to: str | None,
+        offset: int = 0,
     ) -> list[tuple[Any, float]]:
         return self._search_fts(
-            "article_fts", query, limit, newspaper, date_from, date_to, focus_query=query
+            "article_fts",
+            query,
+            limit,
+            newspaper,
+            date_from,
+            date_to,
+            offset,
+            focus_query=query,
         )
 
     def _search_lemma_bm25(
@@ -321,6 +332,7 @@ class SearchEngine:
         newspaper: str | None,
         date_from: str | None,
         date_to: str | None,
+        offset: int = 0,
     ) -> list[tuple[Any, float]]:
         self._require_lemma_index()
         return self._search_fts(
@@ -330,6 +342,7 @@ class SearchEngine:
             newspaper,
             date_from,
             date_to,
+            offset,
             focus_query=query,
         )
 
@@ -341,8 +354,10 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
         lemma_weight: float,
+        offset: int = 0,
     ) -> list[tuple[Any, float]]:
-        candidate_limit = max(50, limit * 5)
+        requested = offset + limit
+        candidate_limit = max(50, requested * 5)
         surface = self._search_bm25(query, candidate_limit, newspaper, date_from, date_to)
         lemma = self._search_lemma_bm25(query, candidate_limit, newspaper, date_from, date_to)
         combined: dict[str, tuple[Any, float]] = {}
@@ -352,7 +367,11 @@ class SearchEngine:
             article_id = str(row["article_id"])
             previous = combined.get(article_id)
             combined[article_id] = (row, lemma_weight * score + (previous[1] if previous else 0.0))
-        return sorted(combined.values(), key=lambda item: item[1], reverse=True)[:limit]
+        ranked = sorted(
+            combined.values(),
+            key=lambda item: (-item[1], str(item[0]["article_id"])),
+        )
+        return ranked[offset:requested]
 
     def _search_fts(
         self,
@@ -362,6 +381,7 @@ class SearchEngine:
         newspaper: str | None,
         date_from: str | None,
         date_to: str | None,
+        offset: int,
         *,
         focus_query: str,
     ) -> list[tuple[Any, float]]:
@@ -382,8 +402,8 @@ class SearchEngine:
               AND (? IS NULL OR newspapers.source = ? OR newspapers.title = ?)
               AND (? IS NULL OR newspapers.date >= ?)
               AND (? IS NULL OR newspapers.date <= ?)
-            ORDER BY rank
-            LIMIT ?
+            ORDER BY rank, articles.article_id
+            LIMIT ? OFFSET ?
             """
         parameters = (
             query,
@@ -395,6 +415,7 @@ class SearchEngine:
             date_to,
             date_to,
             limit,
+            offset,
         )
         if self._active_profile is not None:
             plan_started = time.perf_counter()
