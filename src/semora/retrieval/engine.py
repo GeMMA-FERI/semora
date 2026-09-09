@@ -713,17 +713,32 @@ def _read_wrapped_source(
     used_bytes = len(_format_wrapped_section(anchor).encode("utf-8"))
     if used_bytes > max_bytes:
         raise ValueError("max_bytes is too small for one wrapped source line.")
+    before_open = True
+    after_open = True
+    truncated = False
     for distance in range(1, max(before, after) + 1):
-        candidates = []
-        if distance <= len(preceding):
-            candidates.append(preceding[-distance])
-        if distance <= len(following):
-            candidates.append(following[distance - 1])
-        for candidate in candidates:
+        candidates = (
+            ("before", preceding[-distance])
+            if before_open and distance <= len(preceding)
+            else None,
+            ("after", following[distance - 1])
+            if after_open and distance <= len(following)
+            else None,
+        )
+        for candidate_entry in candidates:
+            if candidate_entry is None:
+                continue
+            direction, candidate = candidate_entry
             size = len(_format_wrapped_section(candidate).encode("utf-8"))
             if used_bytes + size <= max_bytes:
                 selected.append(candidate)
                 used_bytes += size
+            else:
+                truncated = True
+                if direction == "before":
+                    before_open = False
+                else:
+                    after_open = False
     selected.sort(key=lambda item: (item[0], item[1]))
     text = "".join(_format_wrapped_section(item) for item in selected)
     first_line, first_section, _ = selected[0]
@@ -743,7 +758,7 @@ def _read_wrapped_source(
         position_start=f"{first_line}.{first_section}",
         position_end=f"{last_line}.{last_section}",
         text=text,
-        truncated=has_before or has_after,
+        truncated=truncated,
         has_before=has_before,
         has_after=has_after,
     )
