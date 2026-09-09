@@ -149,9 +149,6 @@ def main() -> None:
         engine = SearchEngine(
             database_path,
             semantic_dir,
-            classla_type=args.classla_type,
-            classla_device=args.classla_device,
-            classla_resources_dir=args.classla_resources_dir,
         )
         engine_initialization_seconds = time.perf_counter() - engine_started
         try:
@@ -190,9 +187,6 @@ def main() -> None:
             database_path,
             semantic_dir,
             load_semantic=not args.no_semantic,
-            classla_type=args.classla_type,
-            classla_device=args.classla_device,
-            classla_resources_dir=args.classla_resources_dir,
         )
         try:
             run_stdio(engine)
@@ -334,7 +328,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Report search phase timings, SQLite settings, and the query plan to stderr.",
     )
     _add_search_options(search)
-    _add_classla_options(search)
 
     stdio = commands.add_parser("stdio", help="Serve newline-delimited JSON requests on stdin/stdout.")
     stdio.add_argument(
@@ -342,7 +335,6 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not preload FAISS and EmbeddingGemma; semantic requests will load them lazily.",
     )
-    _add_classla_options(stdio)
 
     read = commands.add_parser(
         "read", help="Read physical lines or a wrapped position from a newspaper source."

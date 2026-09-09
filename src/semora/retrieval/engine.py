@@ -10,7 +10,6 @@ from typing import Any
 
 from semora.retrieval.models import SearchHit, SourceExcerpt
 from semora.storage import Database
-from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
 DEFAULT_MAX_READ_BYTES = 65_536
@@ -26,10 +25,6 @@ class SearchEngine:
         semantic_dir: str | Path = "indexes/semantic",
         *,
         load_semantic: bool = False,
-        lemmatizer: Lemmatizer | None = None,
-        classla_type: str = "default",
-        classla_device: str = "auto",
-        classla_resources_dir: str | Path | None = None,
     ) -> None:
         self.database = Database(database_path, read_only=True)
         self.semantic_dir = Path(semantic_dir).resolve()
@@ -37,10 +32,6 @@ class SearchEngine:
         self._semantic_model: Any = None
         self._semantic_chunk_ids: list[str] = []
         self._semantic_manifest: dict[str, Any] | None = None
-        self._lemmatizer = lemmatizer
-        self._classla_type = classla_type
-        self._classla_device = classla_device
-        self._classla_resources_dir = classla_resources_dir
         self.last_profile: dict[str, Any] | None = None
         self._active_profile: dict[str, Any] | None = None
         if load_semantic:
@@ -52,10 +43,6 @@ class SearchEngine:
     @property
     def semantic_loaded(self) -> bool:
         return self._semantic_index is not None
-
-    @property
-    def lemma_loaded(self) -> bool:
-        return self._lemmatizer is not None
 
     def index_status(self) -> dict[str, dict[str, Any]]:
         """Return inexpensive readiness information from index state records."""
@@ -335,14 +322,10 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
-        started = time.perf_counter()
-        lemma_query = self._lemmatize_query(query)
-        self._record_profile_time("query_lemmatization", started)
-        if not lemma_query:
-            return []
+        self._require_lemma_index()
         return self._search_fts(
             "article_lemma_fts",
-            lemma_query,
+            query,
             limit,
             newspaper,
             date_from,
@@ -474,24 +457,12 @@ class SearchEngine:
             "warnings": warnings,
         }
 
-    def _lemmatize_query(self, query: str) -> str:
+    def _require_lemma_index(self) -> None:
         state = self.database.conn.execute(
             "SELECT indexed_articles FROM article_lemma_index_state WHERE state_id = 1"
         ).fetchone()
         if state is None or int(state["indexed_articles"]) == 0:
             raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
-        if self._lemmatizer is None:
-            self._lemmatizer = ClasslaLemmatizer(
-                pipeline_type=self._classla_type,
-                device=self._classla_device,
-                resources_dir=self._classla_resources_dir,
-            )
-        lemmas = (
-            lemma
-            for lemma in self._lemmatizer.lemmatize(query).split()
-            if any(character.isalnum() for character in lemma)
-        )
-        return " ".join(f'"{lemma.replace(chr(34), chr(34) * 2)}"' for lemma in lemmas)
 
     def _search_regex(
         self,

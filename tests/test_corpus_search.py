@@ -437,16 +437,13 @@ def test_contentless_lemma_index_resumes_and_supports_combined_search(tmp_path: 
     finally:
         database.close()
 
-    engine = SearchEngine(
-        database_path,
-        root / "indexes" / "semantic",
-        lemmatizer=lemmatizer,
-    )
+    engine = SearchEngine(database_path, root / "indexes" / "semantic")
     try:
         assert engine.search("bm25", "appeared") == []
-        lemma_hits = engine.search("bm25-lemma", "appeared", limit=1)
+        assert engine.search("bm25-lemma", "appeared", limit=1) == []
+        lemma_hits = engine.search("bm25-lemma", "appear", limit=1)
         assert "Needle appears here." in lemma_hits[0].snippet
-        combined_hits = engine.search("bm25-combined", "Needle appeared", limit=1)
+        combined_hits = engine.search("bm25-combined", "Needle appear", limit=1)
         assert "Needle appears here." in combined_hits[0].snippet
     finally:
         engine.close()

@@ -33,7 +33,6 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                         "id": request_id,
                         "ok": True,
                         "semantic_loaded": engine.semantic_loaded,
-                        "lemma_loaded": engine.lemma_loaded,
                         "indexes": engine.index_status(),
                     },
                 )
