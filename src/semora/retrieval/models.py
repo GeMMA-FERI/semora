@@ -14,6 +14,7 @@ class SearchHit:
     score: float
     line_start: int
     line_end: int
+    position: str
     snippet: str
     article_title: str | None = None
     urn: str | None = None
@@ -31,8 +32,12 @@ class SourceExcerpt:
     relative_path: str
     line_start: int
     line_end: int
+    position_start: str | None
+    position_end: str | None
     text: str
     truncated: bool
+    has_before: bool = False
+    has_after: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)

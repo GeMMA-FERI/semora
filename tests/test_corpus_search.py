@@ -276,6 +276,7 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert bm25[0].document_id == "0L8XYEOC"
         assert bm25[0].urn == "URN:NBN:SI:doc-0L8XYEOC"
         assert bm25[0].line_start == 5
+        assert bm25[0].position == "6.1"
         assert "Needle appears here." in bm25[0].snippet
         assert engine.last_profile is not None
         assert engine.last_profile["returned_hits"] == 1
@@ -296,6 +297,19 @@ def test_bm25_regex_and_stdio_share_json_contract(tmp_path: Path, monkeypatch) -
         assert truncated.text == "Alpha"
         assert truncated.line_end == 2
         assert truncated.truncated is True
+        wrapped = engine.read_source(
+            "0L8XYEOC",
+            position="2.1",
+            before=1,
+            after=2,
+            wrap_chars=40,
+            max_bytes=200,
+        )
+        assert wrapped.position_start == "1.1"
+        assert wrapped.position_end == "4.1"
+        assert wrapped.line_start == 1
+        assert wrapped.line_end == 4
+        assert "2.1  Alpha beta gamma delta." in wrapped.text
         with pytest.raises(KeyError, match="Unknown document_id"):
             engine.read_source("unknown", 1, 1)
         with pytest.raises(ValueError, match="line_start"):

@@ -9,6 +9,7 @@ from typing import TextIO
 from semora.retrieval.engine import (
     DEFAULT_MAX_READ_BYTES,
     DEFAULT_MAX_SNIPPET_CHARS,
+    DEFAULT_SOURCE_WRAP_CHARS,
     SearchEngine,
 )
 
@@ -40,8 +41,12 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
             if operation == "read":
                 source = engine.read_source(
                     str(request["document_id"]),
-                    int(request["line_start"]),
-                    int(request["line_end"]),
+                    int(request["line_start"]) if "line_start" in request else None,
+                    int(request["line_end"]) if "line_end" in request else None,
+                    position=request.get("position"),
+                    before=int(request.get("before", 2)),
+                    after=int(request.get("after", 8)),
+                    wrap_chars=int(request.get("wrap_chars", DEFAULT_SOURCE_WRAP_CHARS)),
                     max_bytes=int(request.get("max_bytes", DEFAULT_MAX_READ_BYTES)),
                 )
                 _write(output_stream, {"id": request_id, "source": source.as_dict()})

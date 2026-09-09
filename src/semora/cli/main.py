@@ -18,6 +18,7 @@ from semora.diagnostics.classla import (
 from semora.retrieval.engine import (
     DEFAULT_MAX_READ_BYTES,
     DEFAULT_MAX_SNIPPET_CHARS,
+    DEFAULT_SOURCE_WRAP_CHARS,
     SearchEngine,
 )
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
@@ -206,6 +207,10 @@ def main() -> None:
                     args.document_id,
                     args.line_start,
                     args.line_end,
+                    position=args.position,
+                    before=args.before,
+                    after=args.after,
+                    wrap_chars=args.wrap_chars,
                     max_bytes=args.max_bytes,
                 )
                 _print_json({"source": source.as_dict()})
@@ -339,10 +344,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_classla_options(stdio)
 
-    read = commands.add_parser("read", help="Read a bounded line range from a newspaper source.")
+    read = commands.add_parser(
+        "read", help="Read physical lines or a wrapped position from a newspaper source."
+    )
     read.add_argument("document_id", help="Short URN component returned by search.")
-    read.add_argument("--line-start", type=int, required=True)
-    read.add_argument("--line-end", type=int, required=True)
+    read.add_argument("--line-start", type=int)
+    read.add_argument("--line-end", type=int)
+    read.add_argument("--position", help="Wrapped source position such as 334.7.")
+    read.add_argument("--before", type=int, default=2, help="Wrapped lines before position.")
+    read.add_argument("--after", type=int, default=8, help="Wrapped lines after position.")
+    read.add_argument("--wrap-chars", type=int, default=DEFAULT_SOURCE_WRAP_CHARS)
     read.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_READ_BYTES)
 
     commands.add_parser("status", help="Report retrieval-index readiness as JSON.")

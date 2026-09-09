@@ -14,7 +14,9 @@ from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
 DEFAULT_MAX_READ_BYTES = 65_536
+DEFAULT_SOURCE_WRAP_CHARS = 240
 URN_PREFIX = "URN:NBN:SI:doc-"
+SOURCE_POSITION_PATTERN = re.compile(r"^(?P<line>[1-9][0-9]*)(?:\.(?P<section>[1-9][0-9]*))?$")
 
 
 class SearchEngine:
@@ -129,20 +131,33 @@ class SearchEngine:
     def read_source(
         self,
         document_id: str,
-        line_start: int,
-        line_end: int,
+        line_start: int | None = None,
+        line_end: int | None = None,
         *,
+        position: str | None = None,
+        before: int = 2,
+        after: int = 8,
+        wrap_chars: int = DEFAULT_SOURCE_WRAP_CHARS,
         max_bytes: int = DEFAULT_MAX_READ_BYTES,
     ) -> SourceExcerpt:
-        """Read a bounded line range from one newspaper stored in SQLite."""
+        """Read bounded physical lines or a deterministic wrapped source position."""
         if not document_id.strip():
             raise ValueError("document_id must not be empty.")
-        if line_start < 1:
-            raise ValueError("line_start must be at least 1.")
-        if line_end < line_start:
-            raise ValueError("line_end must be greater than or equal to line_start.")
         if not 1 <= max_bytes <= DEFAULT_MAX_READ_BYTES:
             raise ValueError(f"max_bytes must be between 1 and {DEFAULT_MAX_READ_BYTES}.")
+        if before < 0 or after < 0:
+            raise ValueError("before and after must be non-negative.")
+        if wrap_chars < 40:
+            raise ValueError("wrap_chars must be at least 40.")
+        if position is None:
+            if line_start is None or line_end is None:
+                raise ValueError("line_start and line_end are required without position.")
+            if line_start < 1:
+                raise ValueError("line_start must be at least 1.")
+            if line_end < line_start:
+                raise ValueError("line_end must be greater than or equal to line_start.")
+        elif line_start is not None or line_end is not None:
+            raise ValueError("position cannot be combined with line_start or line_end.")
 
         full_urn = document_id if document_id.startswith(URN_PREFIX) else URN_PREFIX + document_id
         rows = self.database.conn.execute(
@@ -171,6 +186,17 @@ class SearchEngine:
 
         row = rows[0]
         lines = str(row["content"]).splitlines(keepends=True)
+        if position is not None:
+            return _read_wrapped_source(
+                row,
+                lines,
+                position,
+                before=before,
+                after=after,
+                wrap_chars=wrap_chars,
+                max_bytes=max_bytes,
+            )
+        assert line_start is not None and line_end is not None
         if line_start > len(lines):
             raise ValueError(f"line_start exceeds the document's {len(lines)} lines.")
         bounded_end = min(line_end, len(lines))
@@ -187,6 +213,8 @@ class SearchEngine:
             relative_path=str(row["relative_path"] or ""),
             line_start=line_start,
             line_end=line_start + returned_lines - 1,
+            position_start=None,
+            position_end=None,
             text=text,
             truncated=truncated or bounded_end < line_end,
         )
@@ -206,6 +234,7 @@ class SearchEngine:
         date_to: str | None = None,
         lemma_weight: float = 1.0,
         max_snippet_chars: int = DEFAULT_MAX_SNIPPET_CHARS,
+        source_wrap_chars: int = DEFAULT_SOURCE_WRAP_CHARS,
         profile: bool = False,
     ) -> list[SearchHit]:
         if limit < 1 or before < 0 or after < 0 or context_lines < 0:
@@ -214,6 +243,8 @@ class SearchEngine:
             raise ValueError("lemma_weight must be non-negative.")
         if max_snippet_chars < 1:
             raise ValueError("max_snippet_chars must be positive.")
+        if source_wrap_chars < 40:
+            raise ValueError("source_wrap_chars must be at least 40.")
         search_started = time.perf_counter()
         self.last_profile = None
         self._active_profile = (
@@ -269,6 +300,7 @@ class SearchEngine:
                 after=after,
                 context_lines=context_lines,
                 max_snippet_chars=max_snippet_chars,
+                source_wrap_chars=source_wrap_chars,
             )
             for row, score in matches
         ]
@@ -566,6 +598,7 @@ class SearchEngine:
         after: int,
         context_lines: int,
         max_snippet_chars: int,
+        source_wrap_chars: int,
     ) -> SearchHit:
         if "chunk_index" in row.keys():
             span = self.database.conn.execute(
@@ -619,6 +652,7 @@ class SearchEngine:
             score=score,
             line_start=line_start,
             line_end=line_end,
+            position=_source_position(str(newspaper_content), focus_char, source_wrap_chars),
             snippet=snippet,
             article_title=row["article_title"],
             urn=row["urn"],
@@ -646,6 +680,146 @@ def _bounded_source_lines(lines: list[str], max_bytes: int) -> tuple[str, int, b
         parts.append(encoded[:remaining].decode("utf-8", errors="ignore"))
         return "".join(parts), len(parts), True
     return "".join(parts), len(parts), False
+
+
+def _read_wrapped_source(
+    row: Any,
+    lines: list[str],
+    position: str,
+    *,
+    before: int,
+    after: int,
+    wrap_chars: int,
+    max_bytes: int,
+) -> SourceExcerpt:
+    physical_line, section = _parse_source_position(position)
+    if physical_line > len(lines):
+        raise ValueError(f"position exceeds the document's {len(lines)} physical lines.")
+    target_sections = _wrap_source_line(lines[physical_line - 1], wrap_chars)
+    if section > len(target_sections):
+        raise ValueError(
+            f"position {position} exceeds physical line {physical_line}'s "
+            f"{len(target_sections)} wrapped sections."
+        )
+
+    anchor = (physical_line, section, target_sections[section - 1])
+    preceding = _adjacent_wrapped_sections(
+        lines, physical_line, section, wrap_chars, count=before, direction=-1
+    )
+    following = _adjacent_wrapped_sections(
+        lines, physical_line, section, wrap_chars, count=after, direction=1
+    )
+    selected = [anchor]
+    used_bytes = len(_format_wrapped_section(anchor).encode("utf-8"))
+    if used_bytes > max_bytes:
+        raise ValueError("max_bytes is too small for one wrapped source line.")
+    for distance in range(1, max(before, after) + 1):
+        candidates = []
+        if distance <= len(preceding):
+            candidates.append(preceding[-distance])
+        if distance <= len(following):
+            candidates.append(following[distance - 1])
+        for candidate in candidates:
+            size = len(_format_wrapped_section(candidate).encode("utf-8"))
+            if used_bytes + size <= max_bytes:
+                selected.append(candidate)
+                used_bytes += size
+    selected.sort(key=lambda item: (item[0], item[1]))
+    text = "".join(_format_wrapped_section(item) for item in selected)
+    first_line, first_section, _ = selected[0]
+    last_line, last_section, _ = selected[-1]
+    has_before = first_line > 1 or first_section > 1
+    last_sections = _wrap_source_line(lines[last_line - 1], wrap_chars)
+    has_after = last_line < len(lines) or last_section < len(last_sections)
+    urn = str(row["urn"]) if row["urn"] else None
+    return SourceExcerpt(
+        newspaper=row["source"] or row["title"],
+        date=row["date"],
+        document_id=_document_id(urn, str(row["newspaper_id"])),
+        urn=urn,
+        relative_path=str(row["relative_path"] or ""),
+        line_start=first_line,
+        line_end=last_line,
+        position_start=f"{first_line}.{first_section}",
+        position_end=f"{last_line}.{last_section}",
+        text=text,
+        truncated=has_before or has_after,
+        has_before=has_before,
+        has_after=has_after,
+    )
+
+
+def _parse_source_position(position: str) -> tuple[int, int]:
+    match = SOURCE_POSITION_PATTERN.fullmatch(position.strip())
+    if match is None:
+        raise ValueError("position must use physical-line.wrapped-section format, such as 334.7.")
+    return int(match.group("line")), int(match.group("section") or 1)
+
+
+def _wrap_source_line(line: str, width: int) -> list[str]:
+    body = line.rstrip("\r\n")
+    if not body:
+        return [""]
+    sections: list[str] = []
+    start = 0
+    while start < len(body):
+        end = min(start + width, len(body))
+        if end < len(body):
+            whitespace = max(body.rfind(" ", start, end), body.rfind("\t", start, end))
+            if whitespace > start:
+                end = whitespace + 1
+        sections.append(body[start:end])
+        start = end
+    return sections
+
+
+def _source_position(source: str, focus_char: int, wrap_chars: int) -> str:
+    focus_char = min(max(0, focus_char), max(0, len(source) - 1))
+    physical_line = source.count("\n", 0, focus_char) + 1
+    line_start = source.rfind("\n", 0, focus_char) + 1
+    offset = focus_char - line_start
+    sections = _wrap_source_line(source[line_start:].split("\n", 1)[0], wrap_chars)
+    consumed = 0
+    section = 1
+    for index, value in enumerate(sections, start=1):
+        consumed += len(value)
+        section = index
+        if offset < consumed:
+            break
+    return f"{physical_line}.{section}"
+
+
+def _adjacent_wrapped_sections(
+    lines: list[str],
+    physical_line: int,
+    section: int,
+    wrap_chars: int,
+    *,
+    count: int,
+    direction: int,
+) -> list[tuple[int, int, str]]:
+    result: list[tuple[int, int, str]] = []
+    line_number = physical_line
+    section_number = section + direction
+    while len(result) < count:
+        sections = _wrap_source_line(lines[line_number - 1], wrap_chars)
+        if 1 <= section_number <= len(sections):
+            result.append((line_number, section_number, sections[section_number - 1]))
+            section_number += direction
+            continue
+        line_number += direction
+        if not 1 <= line_number <= len(lines):
+            break
+        adjacent = _wrap_source_line(lines[line_number - 1], wrap_chars)
+        section_number = len(adjacent) if direction < 0 else 1
+    if direction < 0:
+        result.reverse()
+    return result
+
+
+def _format_wrapped_section(section: tuple[int, int, str]) -> str:
+    line, index, text = section
+    return f"{line}.{index}  {text}\n"
 
 
 def _query_focus_char(row: dict[str, Any], query: str) -> int:
