@@ -87,7 +87,8 @@ semora index bm25 --max-articles 100000
 semora index bm25
 semora models download-classla
 semora index lemma
-semora index semantic
+semora index semantic --stage vectors --device cuda
+semora index semantic --stage faiss
 semora search bm25 "search terms"
 semora search bm25-combined "iskanje po pregibnih oblikah"
 semora search regex "regular expression" --context-lines 3
@@ -109,6 +110,13 @@ BM25 indexing is contentless, article-oriented, and resumable. `--max-articles` 
 desired index size, so increasing it continues from the last committed batch;
 omitting it indexes all remaining valid articles. Chunks are used only by the
 semantic index and semantic-search context expansion.
+
+Semantic indexing is split into durable vector and FAISS stages. The vector
+stage stores normalized 256-dimensional float16 shards and resumes after its
+last committed shard. The default FAISS stage builds an IVF-PQ index; it can be
+rebuilt with different search parameters without recomputing embeddings. See
+the [corpus-search guide](docs/corpus-search.md#semantic-indexing) for pilot and
+full-corpus commands and storage estimates.
 
 The optional CLASSLA index lemmatizes Slovene articles in multi-document
 batches and stores a second contentless FTS index. It supports lemma-only and

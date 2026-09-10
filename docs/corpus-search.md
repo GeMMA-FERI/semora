@@ -27,7 +27,8 @@ semora index bm25 --max-articles 100000
 semora index bm25
 semora models download-classla
 semora index lemma
-semora index semantic
+semora index semantic --stage vectors --device cuda
+semora index semantic --stage faiss
 ```
 
 The three ingestion stages operate on `indexes/semora.sqlite`. The newspaper
@@ -108,8 +109,59 @@ models require approximately 35 GB of host RAM. The parent commits only after
 the whole ordered group returns, so interruption cannot advance the resume
 position past an unfinished batch.
 
-`index semantic` encodes valid chunks and creates a normalized inner-product FAISS index in
-`indexes/semantic/`; its manifest records the model and chunk configuration.
+## Semantic indexing
+
+Semantic indexing has two independent stages below `indexes/semantic/`:
+
+1. `vectors` encodes valid chunks, normalizes them after Matryoshka truncation,
+   and writes atomic 256-dimensional float16 shards. `mapping.sqlite` records
+   each numeric vector ID, canonical chunk ID, completed shard, and resume
+   checkpoint.
+2. `faiss` consumes those shards and publishes `index.faiss` plus
+   `manifest.json`. It does not run the embedding model or read chunk text from
+   the corpus database.
+
+Start with an exact 100,000-chunk pilot:
+
+```sh
+semora index semantic --stage vectors --device cuda --dimensions 256 \
+  --batch-size 64 --shard-size 100000 --max-chunks 100000
+semora index semantic --stage faiss --faiss-type flat --allow-partial-index
+semora search semantic "reports about theatre in Ljubljana" --limit 20
+```
+
+`--max-chunks` is the desired total, not the number added by one invocation.
+Increasing it or omitting it resumes after the last transactionally recorded
+shard. An interrupted shard file is overwritten on the next run; completed
+shards are not embedded again.
+
+After validating retrieval quality, complete the vectors and replace only the
+pilot FAISS files with the production IVF-PQ index:
+
+```sh
+semora index semantic --stage vectors --device cuda --dimensions 256 \
+  --batch-size 64 --shard-size 100000
+semora index semantic --stage faiss --faiss-type ivfpq --rebuild-faiss \
+  --nlist 16384 --pq-m 32 --pq-bits 8 --train-samples 1000000 --nprobe 32
+```
+
+The defaults shown above are starting values, not corpus-independent optima.
+Keep the flat pilot as ground truth while comparing IVF-PQ recall and latency,
+then tune `nprobe`; changing `nprobe` does not require retraining. Changing the
+index type, IVF partition count, PQ layout, or training sample does require
+`--rebuild-faiss`. That flag removes only FAISS artifacts and retains vector
+shards and their mapping.
+
+For 16 million chunks, the float16 vectors occupy about 8.2 GB (7.6 GiB).
+The 32-byte PQ codes and 64-bit vector IDs occupy roughly 640 MB before FAISS
+overhead. Allow additional space for `mapping.sqlite`, temporary/final FAISS
+checkpoints, and about 1 GB of float32 training samples. An exact flat index is
+much larger and is intended for pilots, not the full archive.
+
+Stop other GPU-heavy services, including llama.cpp, while generating vectors.
+FAISS construction uses the stored shards and does not need the embedding model
+or GPU. Search attempts to memory-map the published index where FAISS supports
+it and resolves numeric IDs from `mapping.sqlite` in bounded batches.
 
 The default model is gated. Accept the
 [EmbeddingGemma model terms](https://huggingface.co/google/embeddinggemma-300m)

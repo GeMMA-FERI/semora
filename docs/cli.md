@@ -33,6 +33,19 @@ semora index bm25
 The limit is the desired total number of indexed articles, not the number added
 by that one command. Use `--rebuild` when a fresh lexical index is required.
 
+Semantic indexing has independent, resumable vector and FAISS stages:
+
+```sh
+semora index semantic --stage vectors --device cuda --dimensions 256
+semora index semantic --stage faiss --faiss-type ivfpq
+```
+
+Use `--max-chunks` for a bounded vector pilot and `--allow-partial-index` to
+publish a searchable index over that pilot. `--rebuild-faiss` deletes only
+FAISS outputs and checkpoints; it keeps the expensive float16 vector shards.
+See the [semantic indexing guide](./corpus-search.md#semantic-indexing) before
+starting a full-corpus build.
+
 Slovene lemma search is an optional second lexical index:
 
 ```sh
