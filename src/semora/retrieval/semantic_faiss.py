@@ -157,9 +157,13 @@ def _load_or_create_index(
         if checkpoint_state.get("build_fingerprint") != build_fingerprint:
             raise ValueError("FAISS configuration changed; explicitly rebuild the FAISS stage.")
         index = faiss.read_index(str(checkpoint_path))
-        if int(index.ntotal) != int(checkpoint_state.get("indexed_chunks", -1)):
+        indexed_chunks = int(index.ntotal)
+        recorded_chunks = int(checkpoint_state.get("indexed_chunks", -1))
+        if indexed_chunks < recorded_chunks:
             raise ValueError("FAISS checkpoint and build state disagree.")
-        _pending_shards(shards, int(index.ntotal))
+        _pending_shards(shards, indexed_chunks)
+        if indexed_chunks != recorded_chunks:
+            _write_build_state(checkpoint_state_path, build_fingerprint, indexed_chunks)
         return index
     if config.index_type == "flat":
         return faiss.IndexIDMap2(faiss.IndexFlatIP(spec.dimensions))

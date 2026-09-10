@@ -102,6 +102,18 @@ def test_flat_faiss_build_is_published_and_resumable(tmp_path: Path) -> None:
     assert resumed.indexed_chunks == 4
     assert resumed.added_chunks == 0
 
+    checkpoint = json.loads((target / ".index.build.json").read_text(encoding="utf-8"))
+    checkpoint["indexed_chunks"] = 2
+    (target / ".index.build.json").write_text(json.dumps(checkpoint), encoding="utf-8")
+    repaired = build_faiss_index(
+        target,
+        config=FaissBuildConfig(index_type="flat"),
+        faiss_module=faiss,
+    )
+    assert repaired.added_chunks == 0
+    checkpoint = json.loads((target / ".index.build.json").read_text(encoding="utf-8"))
+    assert checkpoint["indexed_chunks"] == 4
+
 
 def test_faiss_requires_complete_vectors_by_default(tmp_path: Path) -> None:
     target = tmp_path / "semantic"
