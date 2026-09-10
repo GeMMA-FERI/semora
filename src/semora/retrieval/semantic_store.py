@@ -48,6 +48,18 @@ class SemanticBuildState:
     vectors_complete: bool
 
 
+@dataclass(frozen=True)
+class SemanticShard:
+    shard_index: int
+    file_name: str
+    first_vector_id: int
+    vector_count: int
+    dimensions: int
+    dtype: str
+    byte_size: int
+    sha256: str
+
+
 class SemanticVectorStore:
     """Transactional semantic build state stored beside vector shard files."""
 
@@ -171,6 +183,29 @@ class SemanticVectorStore:
         ).fetchall()
         mapping = {int(row["vector_id"]): str(row["chunk_id"]) for row in rows}
         return [mapping.get(vector_id) for vector_id in vector_ids]
+
+    def shards(self) -> list[SemanticShard]:
+        rows = self.conn.execute(
+            """
+            SELECT shard_index, file_name, first_vector_id, vector_count,
+                   dimensions, dtype, byte_size, sha256
+            FROM semantic_shards
+            ORDER BY shard_index
+            """
+        ).fetchall()
+        return [
+            SemanticShard(
+                shard_index=int(row["shard_index"]),
+                file_name=str(row["file_name"]),
+                first_vector_id=int(row["first_vector_id"]),
+                vector_count=int(row["vector_count"]),
+                dimensions=int(row["dimensions"]),
+                dtype=str(row["dtype"]),
+                byte_size=int(row["byte_size"]),
+                sha256=str(row["sha256"]),
+            )
+            for row in rows
+        ]
 
     def _initialize(self, spec: SemanticBuildSpec) -> None:
         self.conn.executescript(
