@@ -8,7 +8,6 @@ import time
 import uuid
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,12 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
+from semora.retrieval.semantic_faiss import FaissBuildConfig, build_faiss_index
+from semora.retrieval.semantic_vectors import (
+    DEFAULT_DIMENSIONS,
+    DEFAULT_SHARD_SIZE,
+    build_semantic_vectors,
+)
 from semora.storage import Database, Run
 from semora.text.lemmatization import (
     ClasslaLemmatizer,
@@ -867,120 +872,71 @@ def build_semantic_index(
     output_dir: str | Path = "indexes/semantic",
     *,
     model_id: str = DEFAULT_MODEL_ID,
+    model_revision: str | None = None,
+    dimensions: int = DEFAULT_DIMENSIONS,
     batch_size: int = 64,
+    shard_size: int = DEFAULT_SHARD_SIZE,
+    max_chunks: int | None = None,
     device: str | None = None,
+    stage: str = "all",
+    index_config: FaissBuildConfig | None = None,
+    allow_partial_index: bool = False,
+    checkpoint_shards: int = 1,
 ) -> int:
-    try:
-        import faiss
-        import numpy as np
-        from sentence_transformers import SentenceTransformer
-    except ImportError as exc:
-        raise RuntimeError("Semantic indexing requires the 'retrieval' extra.") from exc
-
+    """Build resumable vector shards, a FAISS index, or both stages."""
+    if stage not in {"vectors", "faiss", "all"}:
+        raise ValueError("stage must be 'vectors', 'faiss', or 'all'.")
     database = Database(database_path)
     indexing_log: _IndexingLog | None = None
-    index = None
-    chunk_ids: list[str] = []
     try:
         database.initialize()
         indexing_log = _start_indexing_log(
             database,
             "semantic",
             model_id=model_id,
+            model_revision=model_revision,
+            dimensions=dimensions,
             batch_size=batch_size,
+            shard_size=shard_size,
+            max_chunks=max_chunks,
             device=device,
+            stage=stage,
             output_dir=str(output_dir),
         )
-        target = Path(output_dir).resolve()
-        target.mkdir(parents=True, exist_ok=True)
-        model = SentenceTransformer(model_id, device=device)
-        chunking_rows = database.conn.execute(
-            """
-            SELECT DISTINCT chunking_runs.config_json
-            FROM chunks
-            JOIN chunking_runs ON chunking_runs.chunking_run_id = chunks.chunking_run_id
-            JOIN articles ON articles.article_id = chunks.article_id
-            WHERE articles.is_valid = 1
-            """
-        ).fetchall()
-        if len(chunking_rows) != 1:
-            raise ValueError("Semantic indexing requires exactly one chunking configuration.")
-        chunking_config = json.loads(chunking_rows[0]["config_json"])
-        rows = database.conn.execute(
-            """
-            SELECT chunks.chunk_id, chunks.text
-            FROM chunks
-            JOIN articles ON articles.article_id = chunks.article_id
-            WHERE articles.is_valid = 1
-            ORDER BY chunks.chunk_id
-            """
-        )
-        total_chunks = int(
-            database.conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM chunks
-                JOIN articles ON articles.article_id = chunks.article_id
-                WHERE articles.is_valid = 1
-                """
-            ).fetchone()[0]
-        )
-        with tqdm(
-            total=total_chunks,
-            desc="Building semantic index",
-            unit="chunk",
-            dynamic_ncols=True,
-        ) as progress:
-            while batch := rows.fetchmany(batch_size):
-                texts = [str(row["text"]) for row in batch]
-                encode = getattr(model, "encode_document", model.encode)
-                vectors = encode(
-                    texts,
-                    batch_size=batch_size,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                matrix = np.asarray(vectors, dtype="float32")
-                if index is None:
-                    index = faiss.IndexFlatIP(matrix.shape[1])
-                index.add(matrix)
-                chunk_ids.extend(str(row["chunk_id"]) for row in batch)
-                progress.update(len(batch))
-        if index is None:
-            raise ValueError("The database contains no valid chunks to index.")
-        index_temp = target / ".index.faiss.tmp"
-        ids_temp = target / ".chunk_ids.json.tmp"
-        manifest_temp = target / ".manifest.json.tmp"
-        faiss.write_index(index, str(index_temp))
-        ids_temp.write_text(
-            json.dumps(chunk_ids, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        manifest = {
-            "format": "semora.semantic.v1",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "model_id": model_id,
-            "dimensions": int(index.d),
-            "normalized": True,
-            "metric": "cosine_via_inner_product",
-            "chunking": chunking_config,
-            "chunks": len(chunk_ids),
-            "database": Path(database_path).name,
-        }
-        manifest_temp.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        index_temp.replace(target / "index.faiss")
-        ids_temp.replace(target / "chunk_ids.json")
-        manifest_temp.replace(target / "manifest.json")
+        indexed_chunks = 0
+        vector_stats = None
+        faiss_stats = None
+        if stage in {"vectors", "all"}:
+            vector_stats = build_semantic_vectors(
+                database_path,
+                output_dir,
+                model_id=model_id,
+                model_revision=model_revision,
+                dimensions=dimensions,
+                batch_size=batch_size,
+                shard_size=shard_size,
+                max_chunks=max_chunks,
+                device=device,
+            )
+            indexed_chunks = vector_stats.indexed_chunks
+        if stage in {"faiss", "all"}:
+            faiss_stats = build_faiss_index(
+                output_dir,
+                config=index_config,
+                allow_partial=allow_partial_index,
+                checkpoint_shards=checkpoint_shards,
+            )
+            indexed_chunks = faiss_stats.indexed_chunks
         indexing_log.complete(
-            indexed_chunks=len(chunk_ids),
-            dimensions=int(index.d),
-            output_dir=str(target),
+            indexed_chunks=indexed_chunks,
+            vector_chunks=vector_stats.indexed_chunks if vector_stats else None,
+            vectors_complete=vector_stats.complete if vector_stats else None,
+            faiss_complete=faiss_stats.index_complete if faiss_stats else None,
+            dimensions=dimensions,
+            output_dir=str(Path(output_dir).resolve()),
+            stage=stage,
         )
-        return len(chunk_ids)
+        return indexed_chunks
     except BaseException as error:
         _log_indexing_failure(indexing_log, error)
         raise

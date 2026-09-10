@@ -22,6 +22,8 @@ from semora.retrieval.engine import (
     SearchEngine,
 )
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
+from semora.retrieval.semantic_faiss import FaissBuildConfig
+from semora.retrieval.semantic_vectors import DEFAULT_DIMENSIONS, DEFAULT_SHARD_SIZE
 from semora.retrieval.stdio import run_stdio
 from semora.text import download_classla_models
 
@@ -73,10 +75,33 @@ def main() -> None:
             database_path,
             semantic_dir,
             model_id=args.model_id,
+            model_revision=args.model_revision,
+            dimensions=args.dimensions,
             batch_size=args.batch_size,
+            shard_size=args.shard_size,
+            max_chunks=args.max_chunks,
             device=args.device,
+            stage=args.stage,
+            index_config=FaissBuildConfig(
+                index_type=args.faiss_type,
+                nlist=args.nlist,
+                pq_m=args.pq_m,
+                pq_bits=args.pq_bits,
+                train_samples=args.train_samples,
+                nprobe=args.nprobe,
+            ),
+            allow_partial_index=args.allow_partial_index,
+            checkpoint_shards=args.checkpoint_shards,
         )
-        _print_json({"indexed_chunks": count, "index": "semantic", "model_id": args.model_id})
+        _print_json(
+            {
+                "indexed_chunks": count,
+                "index": "semantic",
+                "stage": args.stage,
+                "model_id": args.model_id,
+                "dimensions": args.dimensions,
+            }
+        )
         return
     if args.command == "index" and args.index_type == "lemma":
         lemma_stats = build_lemma_index(
@@ -246,8 +271,25 @@ def _parser() -> argparse.ArgumentParser:
     bm25.add_argument("--rebuild", action="store_true", help="Clear both lexical indexes before adding articles.")
     semantic = index_types.add_parser("semantic", help="Build the persistent FAISS semantic index.")
     semantic.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    semantic.add_argument("--model-revision")
+    semantic.add_argument("--dimensions", type=int, default=DEFAULT_DIMENSIONS)
     semantic.add_argument("--batch-size", type=int, default=64)
+    semantic.add_argument("--shard-size", type=int, default=DEFAULT_SHARD_SIZE)
+    semantic.add_argument("--max-chunks", type=int, help="Stop when vector storage reaches this total size.")
     semantic.add_argument("--device", default=None, help="Sentence Transformers device, such as cpu or cuda.")
+    semantic.add_argument("--stage", choices=("vectors", "faiss", "all"), default="all")
+    semantic.add_argument("--faiss-type", choices=("flat", "ivfpq"), default="ivfpq")
+    semantic.add_argument("--nlist", type=int, default=16_384)
+    semantic.add_argument("--pq-m", type=int, default=32)
+    semantic.add_argument("--pq-bits", type=int, default=8)
+    semantic.add_argument("--train-samples", type=int, default=1_000_000)
+    semantic.add_argument("--nprobe", type=int, default=32)
+    semantic.add_argument("--checkpoint-shards", type=int, default=1)
+    semantic.add_argument(
+        "--allow-partial-index",
+        action="store_true",
+        help="Publish a pilot FAISS index before all vector shards exist.",
+    )
     lemma = index_types.add_parser("lemma", help="Build or resume the CLASSLA lemma BM25 index.")
     lemma.add_argument("--max-articles", type=int, help="Stop when this total number of articles is processed.")
     lemma.add_argument("--batch-articles", type=int, default=50)

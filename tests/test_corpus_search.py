@@ -15,6 +15,7 @@ from semora.cli.main import _configure_console_encoding, _parser
 from semora.corpus import indexer
 from semora.retrieval import SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
+from semora.retrieval.semantic_faiss import FaissBuildConfig
 from semora.retrieval.stdio import run_stdio
 from semora.storage import Database
 
@@ -520,6 +521,9 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
         def add(self, vectors) -> None:
             self.vectors = np.vstack((self.vectors, vectors))
 
+        def add_with_ids(self, vectors, _ids) -> None:
+            self.add(vectors)
+
         def search(self, queries, limit: int):
             similarities = queries @ self.vectors.T
             indices = np.argsort(-similarities, axis=1)[:, :limit]
@@ -533,7 +537,7 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
         return stored_indexes[path]
 
     class FakeModel:
-        def __init__(self, model_id: str, device=None) -> None:
+        def __init__(self, model_id: str, device=None, **_kwargs) -> None:
             assert model_id == "google/embeddinggemma-300m"
 
         def encode(self, texts, **_kwargs):
@@ -556,7 +560,12 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
     monkeypatch.setitem(
         sys.modules,
         "faiss",
-        types.SimpleNamespace(IndexFlatIP=FakeIndex, write_index=write_index, read_index=read_index),
+        types.SimpleNamespace(
+            IndexFlatIP=FakeIndex,
+            IndexIDMap2=lambda index: index,
+            write_index=write_index,
+            read_index=read_index,
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -564,7 +573,13 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
         types.SimpleNamespace(SentenceTransformer=FakeModel),
     )
     semantic_dir = root / "indexes" / "semantic"
-    count = build_semantic_index(root / "indexes" / "semora.sqlite", semantic_dir, batch_size=2)
+    count = build_semantic_index(
+        root / "indexes" / "semora.sqlite",
+        semantic_dir,
+        batch_size=2,
+        dimensions=2,
+        index_config=FaissBuildConfig(index_type="flat"),
+    )
     assert count == 4
     semantic_events = _index_log_events(root / "indexes" / "semora.sqlite", "index_semantic")
     assert [event[2]["event"] for event in semantic_events] == [

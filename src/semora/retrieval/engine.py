@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from semora.storage import Database
 DEFAULT_MAX_SNIPPET_CHARS = 600
 DEFAULT_MAX_READ_BYTES = 65_536
 DEFAULT_SOURCE_WRAP_CHARS = 240
+DEFAULT_SEMANTIC_CANDIDATES = 10_000
 URN_PREFIX = "URN:NBN:SI:doc-"
 SOURCE_POSITION_PATTERN = re.compile(r"^(?P<line>[1-9][0-9]*)(?:\.(?P<section>[1-9][0-9]*))?$")
 
@@ -30,7 +32,7 @@ class SearchEngine:
         self.semantic_dir = Path(semantic_dir).resolve()
         self._semantic_index: Any = None
         self._semantic_model: Any = None
-        self._semantic_chunk_ids: list[str] = []
+        self._semantic_mapping: sqlite3.Connection | None = None
         self._semantic_manifest: dict[str, Any] | None = None
         self.last_profile: dict[str, Any] | None = None
         self._active_profile: dict[str, Any] | None = None
@@ -38,6 +40,9 @@ class SearchEngine:
             self.load_semantic()
 
     def close(self) -> None:
+        if self._semantic_mapping is not None:
+            self._semantic_mapping.close()
+            self._semantic_mapping = None
         self.database.close()
 
     @property
@@ -60,7 +65,7 @@ class SearchEngine:
         semantic_files = {
             "manifest": self.semantic_dir / "manifest.json",
             "index": self.semantic_dir / "index.faiss",
-            "chunk_ids": self.semantic_dir / "chunk_ids.json",
+            "mapping": self.semantic_dir / "mapping.sqlite",
         }
         semantic_available = all(path.is_file() for path in semantic_files.values())
         semantic: dict[str, Any] = {
@@ -71,6 +76,7 @@ class SearchEngine:
         if semantic_available:
             manifest = json.loads(semantic_files["manifest"].read_text(encoding="utf-8"))
             semantic.update(
+                complete=bool(manifest.get("index_complete", True)),
                 model_id=manifest.get("model_id"),
                 chunks=manifest.get("chunks"),
                 dimensions=manifest.get("dimensions"),
@@ -105,15 +111,29 @@ class SearchEngine:
             raise RuntimeError("Semantic search requires the 'retrieval' extra.") from exc
         manifest_path = self.semantic_dir / "manifest.json"
         index_path = self.semantic_dir / "index.faiss"
-        chunk_ids_path = self.semantic_dir / "chunk_ids.json"
-        if not manifest_path.is_file() or not index_path.is_file() or not chunk_ids_path.is_file():
+        mapping_path = self.semantic_dir / "mapping.sqlite"
+        if not manifest_path.is_file() or not index_path.is_file() or not mapping_path.is_file():
             raise FileNotFoundError(f"Semantic index is incomplete: {self.semantic_dir}")
         self._semantic_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self._semantic_chunk_ids = json.loads(chunk_ids_path.read_text(encoding="utf-8"))
-        self._semantic_index = faiss.read_index(str(index_path))
-        if self._semantic_index.ntotal != len(self._semantic_chunk_ids):
+        flags = getattr(faiss, "IO_FLAG_MMAP", 0) | getattr(faiss, "IO_FLAG_READ_ONLY", 0)
+        try:
+            self._semantic_index = faiss.read_index(str(index_path), flags)
+        except TypeError:
+            self._semantic_index = faiss.read_index(str(index_path))
+        self._semantic_mapping = sqlite3.connect(f"{mapping_path.as_uri()}?mode=ro", uri=True)
+        self._semantic_mapping.row_factory = sqlite3.Row
+        mapped_chunks = int(self._semantic_mapping.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0])
+        if self._semantic_index.ntotal != int(self._semantic_manifest.get("chunks", -1)):
+            raise ValueError("FAISS index and semantic manifest contain different numbers of entries.")
+        if self._semantic_index.ntotal > mapped_chunks:
             raise ValueError("FAISS index and chunk ID mapping contain different numbers of entries.")
-        self._semantic_model = SentenceTransformer(self._semantic_manifest["model_id"])
+        faiss_config = self._semantic_manifest.get("faiss", {})
+        if hasattr(self._semantic_index, "nprobe"):
+            self._semantic_index.nprobe = int(faiss_config.get("nprobe", 32))
+        model_options: dict[str, Any] = {"truncate_dim": int(self._semantic_manifest["dimensions"])}
+        if self._semantic_manifest.get("model_revision") is not None:
+            model_options["revision"] = self._semantic_manifest["model_revision"]
+        self._semantic_model = SentenceTransformer(self._semantic_manifest["model_id"], **model_options)
 
     def read_source(
         self,
@@ -536,22 +556,34 @@ class SearchEngine:
         self.load_semantic()
         import numpy as np
 
+        assert self._semantic_manifest is not None
         encode = getattr(self._semantic_model, "encode_query", self._semantic_model.encode)
         vector = encode(
             [query],
             convert_to_numpy=True,
-            normalize_embeddings=True,
+            normalize_embeddings=False,
             show_progress_bar=False,
         )
-        candidate_limit = min(int(self._semantic_index.ntotal), max(limit, limit * 20))
+        dimensions = int(self._semantic_manifest["dimensions"])
+        vector = np.asarray(vector, dtype="float32")[:, :dimensions]
+        norms = np.linalg.norm(vector, axis=1, keepdims=True)
+        if not np.isfinite(vector).all() or np.any(norms == 0):
+            raise ValueError("Embedding model returned an invalid query vector.")
+        vector /= norms
+        maximum_candidates = min(int(self._semantic_index.ntotal), DEFAULT_SEMANTIC_CANDIDATES)
+        candidate_limit = min(maximum_candidates, max(limit, limit * 20))
         while True:
-            scores, indices = self._semantic_index.search(np.asarray(vector, dtype="float32"), candidate_limit)
+            scores, indices = self._semantic_index.search(vector, candidate_limit)
+            vector_ids = [int(index) for index in indices[0] if index >= 0]
+            chunk_ids = self._semantic_chunk_id_map(vector_ids)
+            rows = self._chunk_rows([chunk_ids[index] for index in vector_ids if index in chunk_ids])
             results: list[tuple[Any, float]] = []
             seen_articles: set[str] = set()
             for score, index in zip(scores[0], indices[0], strict=True):
                 if index < 0:
                     continue
-                row = self._chunk_row(self._semantic_chunk_ids[int(index)])
+                chunk_id = chunk_ids.get(int(index))
+                row = rows.get(chunk_id) if chunk_id is not None else None
                 if (
                     row is not None
                     and str(row["article_id"]) not in seen_articles
@@ -561,25 +593,47 @@ class SearchEngine:
                     results.append((row, float(score)))
                     if len(results) >= limit:
                         return results
-            if candidate_limit >= int(self._semantic_index.ntotal):
+            if candidate_limit >= maximum_candidates:
                 return results
-            candidate_limit = min(int(self._semantic_index.ntotal), candidate_limit * 2)
+            candidate_limit = min(maximum_candidates, candidate_limit * 2)
 
-    def _chunk_row(self, chunk_id: str) -> Any:
-        return self.database.conn.execute(
-            """
-            SELECT chunks.*, articles.title AS article_title,
-                   newspapers.source, newspapers.title AS newspaper_title,
-                   newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
-                   newspapers.relative_path
-            FROM chunks
-            JOIN articles ON articles.article_id = chunks.article_id
-            JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
-            WHERE chunks.chunk_id = ?
-              AND articles.is_valid = 1
-            """,
-            (chunk_id,),
-        ).fetchone()
+    def _semantic_chunk_id_map(self, vector_ids: list[int]) -> dict[int, str]:
+        if self._semantic_mapping is None or not vector_ids:
+            return {}
+        result: dict[int, str] = {}
+        unique = list(dict.fromkeys(vector_ids))
+        for start in range(0, len(unique), 900):
+            batch = unique[start : start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._semantic_mapping.execute(
+                f"SELECT vector_id, chunk_id FROM semantic_chunks WHERE vector_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            result.update({int(row["vector_id"]): str(row["chunk_id"]) for row in rows})
+        return result
+
+    def _chunk_rows(self, chunk_ids: list[str]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        unique = list(dict.fromkeys(chunk_ids))
+        for start in range(0, len(unique), 900):
+            batch = unique[start : start + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self.database.conn.execute(
+                f"""
+                SELECT chunks.*, articles.title AS article_title,
+                       newspapers.source, newspapers.title AS newspaper_title,
+                       newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
+                       newspapers.relative_path
+                FROM chunks
+                JOIN articles ON articles.article_id = chunks.article_id
+                JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
+                WHERE chunks.chunk_id IN ({placeholders})
+                  AND articles.is_valid = 1
+                """,
+                batch,
+            ).fetchall()
+            result.update({str(row["chunk_id"]): row for row in rows})
+        return result
 
     def _make_hit(
         self,
