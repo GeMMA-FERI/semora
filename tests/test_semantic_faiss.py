@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from semora.retrieval.engine import _read_faiss_index
 from semora.retrieval.semantic_faiss import FaissBuildConfig, build_faiss_index
 from semora.retrieval.semantic_store import SemanticBuildSpec, SemanticVectorStore
 
@@ -147,3 +148,55 @@ def test_rebuild_faiss_keeps_vector_shards(tmp_path: Path) -> None:
 def test_ivfpq_configuration_requires_divisible_dimensions() -> None:
     with pytest.raises(ValueError, match="divisible"):
         FaissBuildConfig(index_type="ivfpq", pq_m=32).validate(386)
+
+
+def test_real_ivfpq_index_can_be_trained_persisted_and_searched(tmp_path: Path) -> None:
+    faiss = pytest.importorskip("faiss")
+    target = tmp_path / "semantic"
+    dimensions = 8
+    count = 256
+    spec = SemanticBuildSpec(
+        model_id="model",
+        model_revision="revision",
+        dimensions=dimensions,
+        database="semora.sqlite",
+        chunking_run_id="chunks",
+        chunking={"token_count": 256, "token_overlap": 64},
+        valid_chunks=count,
+        first_chunk_id="chunk-000",
+        last_chunk_id="chunk-255",
+    )
+    random = np.random.default_rng(42)
+    vectors = random.normal(size=(count, dimensions)).astype("float32")
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    with SemanticVectorStore(target, spec) as store:
+        path = store.vectors_dir / "shard-000000.f16"
+        vectors.astype("float16").tofile(path)
+        store.record_shard(
+            shard_index=0,
+            file_name=path.name,
+            chunk_ids=[f"chunk-{index:03d}" for index in range(count)],
+            dimensions=dimensions,
+            dtype="float16",
+            byte_size=path.stat().st_size,
+            sha256="0" * 64,
+        )
+
+    stats = build_faiss_index(
+        target,
+        config=FaissBuildConfig(
+            index_type="ivfpq",
+            nlist=4,
+            pq_m=2,
+            pq_bits=4,
+            train_samples=count,
+            nprobe=4,
+        ),
+    )
+
+    assert stats.index_complete is True
+    index = _read_faiss_index(faiss, target / "index.faiss")
+    scores, ids = index.search(vectors[:1], 5)
+    assert scores.shape == (1, 5)
+    assert ids.shape == (1, 5)
+    assert all(0 <= int(vector_id) < count for vector_id in ids[0])

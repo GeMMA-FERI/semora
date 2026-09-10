@@ -115,11 +115,7 @@ class SearchEngine:
         if not manifest_path.is_file() or not index_path.is_file() or not mapping_path.is_file():
             raise FileNotFoundError(f"Semantic index is incomplete: {self.semantic_dir}")
         self._semantic_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        flags = getattr(faiss, "IO_FLAG_MMAP", 0) | getattr(faiss, "IO_FLAG_READ_ONLY", 0)
-        try:
-            self._semantic_index = faiss.read_index(str(index_path), flags)
-        except TypeError:
-            self._semantic_index = faiss.read_index(str(index_path))
+        self._semantic_index = _read_faiss_index(faiss, index_path)
         self._semantic_mapping = sqlite3.connect(f"{mapping_path.as_uri()}?mode=ro", uri=True)
         self._semantic_mapping.row_factory = sqlite3.Row
         mapped_chunks = int(self._semantic_mapping.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0])
@@ -933,6 +929,16 @@ def _trim_source_span(
     actual_line_start = source.count("\n", 0, excerpt_start) + 1
     actual_line_end = source.count("\n", 0, max(excerpt_start, excerpt_end - 1)) + 1
     return excerpt, actual_line_start, actual_line_end
+
+
+def _read_faiss_index(faiss: Any, path: Path) -> Any:
+    flags = getattr(faiss, "IO_FLAG_MMAP", 0) | getattr(faiss, "IO_FLAG_READ_ONLY", 0)
+    if flags:
+        try:
+            return faiss.read_index(str(path), flags)
+        except (TypeError, RuntimeError):
+            pass
+    return faiss.read_index(str(path))
 
 
 def _matches_filters(

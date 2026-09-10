@@ -161,7 +161,8 @@ much larger and is intended for pilots, not the full archive.
 Stop other GPU-heavy services, including llama.cpp, while generating vectors.
 FAISS construction uses the stored shards and does not need the embedding model
 or GPU. Search attempts to memory-map the published index where FAISS supports
-it and resolves numeric IDs from `mapping.sqlite` in bounded batches.
+it, falls back to loading the compact PQ index when the local FAISS build does
+not, and resolves numeric IDs from `mapping.sqlite` in bounded batches.
 
 The default model is gated. Accept the
 [EmbeddingGemma model terms](https://huggingface.co/google/embeddinggemma-300m)
