@@ -882,6 +882,7 @@ def build_semantic_index(
     index_config: FaissBuildConfig | None = None,
     allow_partial_index: bool = False,
     checkpoint_shards: int = 1,
+    rebuild_faiss: bool = False,
 ) -> int:
     """Build resumable vector shards, a FAISS index, or both stages."""
     if stage not in {"vectors", "faiss", "all"}:
@@ -925,6 +926,7 @@ def build_semantic_index(
                 config=index_config,
                 allow_partial=allow_partial_index,
                 checkpoint_shards=checkpoint_shards,
+                rebuild=rebuild_faiss,
             )
             indexed_chunks = faiss_stats.indexed_chunks
         indexing_log.complete(

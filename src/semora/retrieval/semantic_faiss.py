@@ -59,6 +59,7 @@ def build_faiss_index(
     config: FaissBuildConfig | None = None,
     allow_partial: bool = False,
     checkpoint_shards: int = 1,
+    rebuild: bool = False,
     faiss_module: Any = None,
 ) -> FaissIndexStats:
     """Build or resume a FAISS index without recomputing embeddings."""
@@ -66,6 +67,8 @@ def build_faiss_index(
         raise ValueError("checkpoint_shards must be positive.")
     faiss = faiss_module if faiss_module is not None else _import_faiss()
     target = Path(output_dir).resolve()
+    if rebuild:
+        _clear_faiss_files(target)
     spec = _read_vector_spec(target)
     active_config = config or FaissBuildConfig()
     active_config.validate(spec.dimensions)
@@ -360,3 +363,19 @@ def _import_faiss() -> Any:
     except ImportError as exc:
         raise RuntimeError("Semantic indexing requires the 'retrieval' extra.") from exc
     return faiss
+
+
+def _clear_faiss_files(target: Path) -> None:
+    for name in (
+        ".index.build.faiss",
+        ".index.build.json",
+        "index.faiss",
+        "manifest.json",
+        "..index.build.faiss.tmp",
+        "..index.build.json.tmp",
+        ".index.faiss.tmp",
+        ".manifest.json.tmp",
+    ):
+        path = target / name
+        if path.is_file():
+            path.unlink()

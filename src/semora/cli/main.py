@@ -92,6 +92,7 @@ def main() -> None:
             ),
             allow_partial_index=args.allow_partial_index,
             checkpoint_shards=args.checkpoint_shards,
+            rebuild_faiss=args.rebuild_faiss,
         )
         _print_json(
             {
@@ -285,6 +286,11 @@ def _parser() -> argparse.ArgumentParser:
     semantic.add_argument("--train-samples", type=int, default=1_000_000)
     semantic.add_argument("--nprobe", type=int, default=32)
     semantic.add_argument("--checkpoint-shards", type=int, default=1)
+    semantic.add_argument(
+        "--rebuild-faiss",
+        action="store_true",
+        help="Discard only FAISS files and rebuild them from retained vector shards.",
+    )
     semantic.add_argument(
         "--allow-partial-index",
         action="store_true",

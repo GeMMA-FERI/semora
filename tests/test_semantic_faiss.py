@@ -122,6 +122,28 @@ def test_faiss_requires_complete_vectors_by_default(tmp_path: Path) -> None:
     assert stats.index_complete is False
 
 
+def test_rebuild_faiss_keeps_vector_shards(tmp_path: Path) -> None:
+    target = tmp_path / "semantic"
+    _vectors(target)
+    faiss = FakeFaiss()
+    build_faiss_index(
+        target,
+        config=FaissBuildConfig(index_type="flat"),
+        faiss_module=faiss,
+    )
+
+    stats = build_faiss_index(
+        target,
+        config=FaissBuildConfig(index_type="flat", pq_bits=4),
+        rebuild=True,
+        faiss_module=faiss,
+    )
+
+    assert stats.added_chunks == 4
+    assert (target / "mapping.sqlite").is_file()
+    assert len(list((target / "vectors").glob("*.f16"))) == 2
+
+
 def test_ivfpq_configuration_requires_divisible_dimensions() -> None:
     with pytest.raises(ValueError, match="divisible"):
         FaissBuildConfig(index_type="ivfpq", pq_m=32).validate(386)
