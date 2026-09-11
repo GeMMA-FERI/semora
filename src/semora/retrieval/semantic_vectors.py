@@ -12,6 +12,7 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
+from semora.retrieval.semantic_diagnostics import SemanticVectorJournal
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.retrieval.semantic_store import (
     SemanticBuildSpec,
@@ -49,18 +50,31 @@ def build_semantic_vectors(
 ) -> SemanticVectorStats:
     """Embed valid chunks into atomic float16 shards and resume from checkpoints."""
     with SemanticBuildLock(Path(output_dir).resolve() / ".vectors.lock", "vector"):
-        return _build_semantic_vectors_unlocked(
-            database_path,
-            output_dir,
-            model_id=model_id,
-            model_revision=model_revision,
-            dimensions=dimensions,
-            batch_size=batch_size,
-            shard_size=shard_size,
-            max_chunks=max_chunks,
-            device=device,
-            model=model,
-        )
+        with SemanticVectorJournal(output_dir) as journal:
+            journal.write(
+                "build_started",
+                database=str(Path(database_path).resolve()),
+                model_id=model_id,
+                model_revision=model_revision,
+                dimensions=dimensions,
+                batch_size=batch_size,
+                shard_size=shard_size,
+                max_chunks=max_chunks,
+                device=device,
+            )
+            return _build_semantic_vectors_unlocked(
+                database_path,
+                output_dir,
+                model_id=model_id,
+                model_revision=model_revision,
+                dimensions=dimensions,
+                batch_size=batch_size,
+                shard_size=shard_size,
+                max_chunks=max_chunks,
+                device=device,
+                model=model,
+                journal=journal,
+            )
 
 
 def _build_semantic_vectors_unlocked(
@@ -75,6 +89,7 @@ def _build_semantic_vectors_unlocked(
     max_chunks: int | None,
     device: str | None,
     model: Any,
+    journal: SemanticVectorJournal,
 ) -> SemanticVectorStats:
     if dimensions <= 0 or batch_size <= 0 or shard_size <= 0:
         raise ValueError("Dimensions, batch size, and shard size must be positive.")
@@ -104,7 +119,15 @@ def _build_semantic_vectors_unlocked(
         target_chunks = spec.valid_chunks if max_chunks is None else min(max_chunks, spec.valid_chunks)
         with SemanticVectorStore(output_dir, spec) as store:
             starting_chunks = store.state.indexed_chunks
+            journal.write(
+                "build_state_loaded",
+                indexed_chunks=starting_chunks,
+                target_chunks=target_chunks,
+                available_chunks=spec.valid_chunks,
+                vectors_complete=store.state.vectors_complete,
+            )
             if starting_chunks >= target_chunks:
+                journal.write("build_completed", indexed_chunks=starting_chunks, added_chunks=0)
                 return SemanticVectorStats(
                     available_chunks=spec.valid_chunks,
                     target_chunks=target_chunks,
@@ -112,16 +135,17 @@ def _build_semantic_vectors_unlocked(
                     added_chunks=0,
                     complete=store.state.vectors_complete,
                 )
-            embedding_model = (
-                model
-                if model is not None
-                else _load_embedding_model(
+            if model is None:
+                journal.write("model_loading")
+                embedding_model = _load_embedding_model(
                     model_id,
                     model_revision=model_revision,
                     dimensions=dimensions,
                     device=device,
                 )
-            )
+                journal.write("model_loaded")
+            else:
+                embedding_model = model
             with tqdm(
                 total=target_chunks,
                 initial=starting_chunks,
@@ -132,6 +156,31 @@ def _build_semantic_vectors_unlocked(
                 while store.state.indexed_chunks < target_chunks:
                     state = store.state
                     count = min(shard_size, target_chunks - state.indexed_chunks)
+                    journal.write(
+                        "shard_started",
+                        shard_index=state.next_shard_index,
+                        indexed_chunks=state.indexed_chunks,
+                        shard_chunks=count,
+                    )
+                    next_report = 10_000
+
+                    def report(
+                        shard_chunks: int,
+                        shard_target: int = count,
+                        shard_index: int = state.next_shard_index,
+                        indexed_before: int = state.indexed_chunks,
+                    ) -> None:
+                        nonlocal next_report
+                        if shard_chunks < next_report and shard_chunks != shard_target:
+                            return
+                        journal.write(
+                            "shard_progress",
+                            shard_index=shard_index,
+                            shard_chunks=shard_chunks,
+                            indexed_chunks=indexed_before + shard_chunks,
+                        )
+                        next_report = ((shard_chunks // 10_000) + 1) * 10_000
+
                     chunk_ids, vectors = _embed_next_shard(
                         database,
                         embedding_model,
@@ -139,6 +188,7 @@ def _build_semantic_vectors_unlocked(
                         count=count,
                         batch_size=batch_size,
                         dimensions=dimensions,
+                        progress_callback=report,
                     )
                     if len(chunk_ids) != count:
                         raise RuntimeError("The semantic corpus changed or ended before the expected target.")
@@ -154,8 +204,21 @@ def _build_semantic_vectors_unlocked(
                         byte_size=byte_size,
                         sha256=digest,
                     )
+                    journal.write(
+                        "shard_committed",
+                        shard_index=state.next_shard_index,
+                        shard_chunks=len(chunk_ids),
+                        indexed_chunks=store.state.indexed_chunks,
+                        file_name=file_name,
+                        byte_size=byte_size,
+                    )
                     progress.update(len(chunk_ids))
             finished = store.state
+            journal.write(
+                "build_completed",
+                indexed_chunks=finished.indexed_chunks,
+                added_chunks=finished.indexed_chunks - starting_chunks,
+            )
             return SemanticVectorStats(
                 available_chunks=spec.valid_chunks,
                 target_chunks=target_chunks,
@@ -245,6 +308,7 @@ def _embed_next_shard(
     count: int,
     batch_size: int,
     dimensions: int,
+    progress_callback: Any = None,
 ) -> tuple[list[str], Any]:
     import numpy as np
 
@@ -287,6 +351,8 @@ def _embed_next_shard(
         batch_ids = [str(row["chunk_id"]) for row in rows]
         chunk_ids.extend(batch_ids)
         cursor = batch_ids[-1]
+        if progress_callback is not None:
+            progress_callback(len(chunk_ids))
     vectors = np.concatenate(vector_batches, axis=0) if vector_batches else np.empty((0, dimensions), dtype="float16")
     return chunk_ids, vectors
 
