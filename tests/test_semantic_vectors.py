@@ -65,7 +65,9 @@ def _database(path: Path, count: int = 5) -> Path:
     return path
 
 
-def test_semantic_vectors_write_normalized_float16_shards_and_resume(tmp_path: Path) -> None:
+def test_semantic_vectors_write_normalized_float16_shards_and_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database_path = _database(tmp_path / "semora.sqlite")
     output_dir = tmp_path / "semantic"
     first = build_semantic_vectors(
@@ -84,6 +86,14 @@ def test_semantic_vectors_write_normalized_float16_shards_and_resume(tmp_path: P
         "shard-000000.f16",
         "shard-000001.f16",
     ]
+
+    def reject_corpus_scan(*_args, **_kwargs):
+        raise AssertionError("A resumed vector build must use its recorded specification.")
+
+    monkeypatch.setattr(
+        "semora.retrieval.semantic_vectors._semantic_build_spec",
+        reject_corpus_scan,
+    )
 
     second = build_semantic_vectors(
         database_path,
@@ -121,7 +131,7 @@ def test_semantic_vectors_reject_changed_corpus_on_resume(tmp_path: Path) -> Non
     with sqlite3.connect(database_path) as connection:
         connection.execute("UPDATE articles SET is_valid = 0")
 
-    with pytest.raises(ValueError, match="exactly one valid chunking run"):
+    with pytest.raises(RuntimeError, match="corpus changed"):
         build_semantic_vectors(
             database_path,
             output_dir,

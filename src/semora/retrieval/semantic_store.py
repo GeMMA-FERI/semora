@@ -264,3 +264,19 @@ class SemanticVectorStore:
             raise ValueError(
                 "Semantic build configuration or corpus changed; use a new output directory or explicitly rebuild it."
             )
+
+
+def read_semantic_build_spec(directory: str | Path) -> SemanticBuildSpec | None:
+    database_path = Path(directory).resolve() / "mapping.sqlite"
+    if not database_path.is_file():
+        return None
+    connection = sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True)
+    try:
+        row = connection.execute("SELECT spec_json FROM semantic_build_state WHERE state_id = 1").fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise ValueError("Semantic vector build specification is missing.")
+    values = json.loads(str(row[0]))
+    values.pop("format", None)
+    return SemanticBuildSpec(**values)

@@ -12,7 +12,12 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
-from semora.retrieval.semantic_store import SemanticBuildSpec, SemanticVectorStore
+from semora.retrieval.semantic_lock import SemanticBuildLock
+from semora.retrieval.semantic_store import (
+    SemanticBuildSpec,
+    SemanticVectorStore,
+    read_semantic_build_spec,
+)
 from semora.storage import Database
 
 DEFAULT_DIMENSIONS = 256
@@ -43,6 +48,34 @@ def build_semantic_vectors(
     model: Any = None,
 ) -> SemanticVectorStats:
     """Embed valid chunks into atomic float16 shards and resume from checkpoints."""
+    with SemanticBuildLock(Path(output_dir).resolve() / ".vectors.lock", "vector"):
+        return _build_semantic_vectors_unlocked(
+            database_path,
+            output_dir,
+            model_id=model_id,
+            model_revision=model_revision,
+            dimensions=dimensions,
+            batch_size=batch_size,
+            shard_size=shard_size,
+            max_chunks=max_chunks,
+            device=device,
+            model=model,
+        )
+
+
+def _build_semantic_vectors_unlocked(
+    database_path: str | Path,
+    output_dir: str | Path,
+    *,
+    model_id: str,
+    model_revision: str | None,
+    dimensions: int,
+    batch_size: int,
+    shard_size: int,
+    max_chunks: int | None,
+    device: str | None,
+    model: Any,
+) -> SemanticVectorStats:
     if dimensions <= 0 or batch_size <= 0 or shard_size <= 0:
         raise ValueError("Dimensions, batch size, and shard size must be positive.")
     if max_chunks is not None and max_chunks < 0:
@@ -51,13 +84,23 @@ def build_semantic_vectors(
     database = Database(database_path)
     try:
         database.initialize()
-        spec = _semantic_build_spec(
-            database,
-            database_path=database_path,
-            model_id=model_id,
-            model_revision=model_revision,
-            dimensions=dimensions,
-        )
+        spec = read_semantic_build_spec(output_dir)
+        if spec is None:
+            spec = _semantic_build_spec(
+                database,
+                database_path=database_path,
+                model_id=model_id,
+                model_revision=model_revision,
+                dimensions=dimensions,
+            )
+        else:
+            _validate_resume_spec(
+                spec,
+                database_path=database_path,
+                model_id=model_id,
+                model_revision=model_revision,
+                dimensions=dimensions,
+            )
         target_chunks = spec.valid_chunks if max_chunks is None else min(max_chunks, spec.valid_chunks)
         with SemanticVectorStore(output_dir, spec) as store:
             starting_chunks = store.state.indexed_chunks
@@ -161,6 +204,20 @@ def _semantic_build_spec(
         first_chunk_id=str(row["first_chunk_id"]),
         last_chunk_id=str(row["last_chunk_id"]),
     )
+
+
+def _validate_resume_spec(
+    spec: SemanticBuildSpec,
+    *,
+    database_path: str | Path,
+    model_id: str,
+    model_revision: str | None,
+    dimensions: int,
+) -> None:
+    requested = (Path(database_path).name, model_id, model_revision, dimensions)
+    recorded = (spec.database, spec.model_id, spec.model_revision, spec.dimensions)
+    if requested != recorded:
+        raise ValueError("Semantic database, model, revision, or dimensions changed; use a new output directory.")
 
 
 def _load_embedding_model(
