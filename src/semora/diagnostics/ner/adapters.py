@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .base import Adapter, Entity, Prediction
+from .decoding import word_pipeline_class
 
 
 def align_classla_tokens(document: Any, text: str) -> None:
@@ -108,12 +109,14 @@ class TransformersAdapter:
         stride: int = 64,
         pretokenized: bool = False,
         precision: str = "float32",
+        aggregation: str | None = None,
         **_: Any,
     ):
         import torch
         from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
         model = model or "ivlcic/xlmr-ner-slavic-pline"
+        aggregation = aggregation or ("first" if model == "ivlcic/xlmr-ner-slavic-pline" else "simple")
         tokenizer = AutoTokenizer.from_pretrained(model, revision=revision, use_fast=True)
         network = AutoModelForTokenClassification.from_pretrained(
             model,
@@ -129,7 +132,8 @@ class TransformersAdapter:
             model=network,
             tokenizer=tokenizer,
             device=0 if device == "cuda" else -1,
-            aggregation_strategy="simple",
+            aggregation_strategy=aggregation,
+            pipeline_class=word_pipeline_class(),
         )
         self.pretokenized = pretokenized or model == "ivlcic/xlmr-ner-slavic-pline"
         self.stride = stride
@@ -143,6 +147,8 @@ class TransformersAdapter:
             "stride": stride,
             "pretokenized": self.pretokenized,
             "precision": precision,
+            "aggregation": aggregation,
+            "word_id_aggregation": True,
         }
 
     def predict(self, texts: list[str], batch_size: int) -> Prediction:

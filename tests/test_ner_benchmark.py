@@ -10,6 +10,7 @@ import pytest
 
 from semora.diagnostics.ner.adapters import align_classla_tokens
 from semora.diagnostics.ner.base import Entity, Prediction, validate
+from semora.diagnostics.ner.decoding import mark_subwords
 from semora.diagnostics.ner.name_checks import check_names
 from semora.diagnostics.ner.report import highlight, report
 from semora.diagnostics.ner.runner import run
@@ -75,6 +76,12 @@ def test_name_checks_distinguish_fragments_from_complete_names():
     assert result[0]["models"]["whole"]["covering_labels"] == ["PER"]
     assert result[0]["models"]["split"]["covering_labels"] == []
     assert len(result[0]["models"]["split"]["overlapping_entities"]) == 2
+
+
+def test_subword_boundaries_use_word_ids_including_punctuation():
+    entities = [{"index": index} for index in (1, 2, 3, 4, 5)]
+    mark_subwords(entities, [None, 0, 0, 1, 2, 2, None])
+    assert [e["is_subword"] for e in entities] == [False, True, False, False, True]
 
 
 class FakeAdapter:
@@ -184,10 +191,17 @@ def test_real_models_preserve_boundaries_unicode_and_long_article_tail(adapter):
 
     model = load_adapter(adapter, device="cuda")
     sentence = "Janez Novak živi v Ljubljani."
-    texts = ["Že danes: " + sentence, "To je preprost stavek.\n\n" * 400 + sentence]
+    texts = [
+        "Že danes: " + sentence,
+        "To je preprost stavek.\n\n" * 400 + sentence,
+        "BEOGRAD; SFRJ. - Titova policija je dala začasno svobodo znanemu profesorju Mihajlovu, "
+        "ki ga je zaprla radi njegovega potopisa po Rusiji.",
+    ]
     prediction = model.predict(texts, batch_size=16)
-    assert len(prediction.entities) == 2
-    for text, entities in zip(texts, prediction.entities, strict=True):
+    assert len(prediction.entities) == 3
+    for text, entities in zip(texts[:2], prediction.entities[:2], strict=True):
         validate(text, entities)
         expected = text.index("Janez Novak")
         assert any(e.start == expected and e.text == "Janez Novak" and e.label == "PER" for e in entities)
+    validate(texts[2], prediction.entities[2])
+    assert any(e.text == "Mihajlovu" and e.label == "PER" for e in prediction.entities[2])

@@ -55,7 +55,12 @@ rare decades or poor OCR. OCR quality is not automatically labelled.
 `--download` explicitly downloads CLASSLA tokenization/NER resources. An optional
 `--resources` selects another CLASSLA resource directory. XLM-R downloads through
 Hugging Face's cache. Its pipeline-compatible checkpoint uses the author's
-lossless pretokenization and simple aggregation. Full articles use overlapping
+lossless pretokenization. The Slavic adapter defaults to `--aggregation first`,
+using actual tokenizer word IDs to combine subword scores before BIO grouping.
+This prevents separate pieces of a single name becoming separate entities.
+The model card's `--aggregation simple` remains available as a baseline; other
+checkpoints default to simple. `average` and `max` are also available.
+Full articles use overlapping
 windows (`--max-length 256 --stride 64`); nothing is silently truncated. Entity
 offsets are half-open Python character offsets into `articles.content`, not
 newspaper-level source coordinates. Every span is checked against the source.
@@ -135,6 +140,9 @@ each model's covering labels and overlapping spans. This exposes fragmented
 names as well as missed or differently labelled mentions. It is not recall:
 inflected forms need their own query, and a name absent from the sample is not a
 model miss.
+
+The label inventories are not identical: for example, CLASSLA distinguishes
+`DERIV-PER`. A label or boundary disagreement is not automatically an error.
 
 Disagreement rates and entity counts are **not precision, recall or F1**. Shared
 omissions are invisible. Reports expose practical differences without implying

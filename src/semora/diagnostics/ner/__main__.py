@@ -55,6 +55,11 @@ def main():
         command.add_argument("--max-length", type=int, default=256)
         command.add_argument("--stride", type=int, default=64)
         command.add_argument("--pretokenized", action="store_true", help="Lossless pretokenization for HF models")
+        command.add_argument(
+            "--aggregation",
+            choices=["simple", "first", "average", "max"],
+            help="HF subword aggregation; Slavic checkpoint defaults to first, other models to simple",
+        )
         command.add_argument("--precision", choices=["float32", "float16", "bfloat16"], default="float32")
         if name == "run":
             command.add_argument("--batch-size", type=int, default=32)
