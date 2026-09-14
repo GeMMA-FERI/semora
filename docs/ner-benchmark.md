@@ -4,6 +4,9 @@ The benchmark lives in `semora.diagnostics.ner`, separately from production
 indexing. Source SQLite is opened read-only. All outputs are new files; existing
 samples and run directories cannot be overwritten accidentally.
 
+The first local comparison and its limitations are recorded in
+[NER benchmark results](ner-benchmark-results.md).
+
 ## Environment
 
 Use a separate environment, especially while Nora is running. Example for Windows
@@ -37,6 +40,8 @@ This is a uniform sample of valid nonempty articles, selected by random rowid
 rejection without scanning all article bodies or favoring articles after rowid
 gaps. It preserves original content, capitalization and metadata. The sample
 stores a fingerprint and summaries of decades, newspapers and length buckets.
+Models process `articles.content`; the separate title is retained as metadata,
+not prepended to the text, so offsets remain relative to the stored content.
 Uniform sampling represents the corpus mix; it does not guarantee coverage of
 rare decades or poor OCR. OCR quality is not automatically labelled.
 
@@ -109,6 +114,9 @@ include that directory in a new summary.
 Transformers. `--batch-articles` (default 32) controls the outer read/write batch.
 Use each model's fastest stable settings; equal batch numbers are not equal work.
 `--precision` controls Transformers only; CLASSLA uses its native precision.
+Transformers may print its generic "pipelines sequentially on GPU" advisory
+after repeated calls. Each call here receives a batch, but the benchmark uses
+bounded outer batches rather than a single corpus-wide pipeline iterator.
 
 Timing includes sample SQLite reads, prediction, validation, indexed mention
 writes and commits. Startup and warm-up are separate. This is **not a measurement

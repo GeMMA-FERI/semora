@@ -119,6 +119,21 @@ def report(
             )
         caption = html.escape(f"{item['newspaper']} | {item['date']} | {item['urn']} | {item['article_id']}")
         body.append(f"<section><p>{caption}</p><table><tr>{columns}</tr></table></section>")
+    name_table = ""
+    if queries:
+        headers = "".join(f"<th>{html.escape(name)}</th>" for name in names)
+        rows_html = []
+        for query in queries:
+            checks = [check for check in name_checks if check["query"] == query]
+            counts = "".join(
+                f"<td>{sum(bool(check['models'][name]['covering_labels']) for check in checks)}</td>" for name in names
+            )
+            rows_html.append(f"<tr><td>{html.escape(query)}</td><td>{len(checks)}</td>{counts}</tr>")
+        name_table = (
+            "<h2>Name spot checks</h2><p>Literal whole-name occurrences and mentions covered by a single "
+            "entity span (any label). These counts are not recall. See name_checks.json for labels and context.</p>"
+            f"<table><tr><th>Name</th><th>Occurrences</th>{headers}</tr>{''.join(rows_html)}</table>"
+        )
     document = f"""<!doctype html><html lang="en"><meta charset="utf-8">
     <title>NER comparison</title><style>
     body{{font:16px system-ui;max-width:1400px;margin:2rem auto;padding:1rem;background:#fafafa}}
@@ -130,7 +145,7 @@ def report(
     <p>{disagreement_count} of {total} articles disagree on {html.escape(", ".join(sorted(labels_set)))}.
     Showing {len(choices)} sampled articles, one passage each. Hover highlights for labels.
     Disagreement is not accuracy; shared omissions are invisible. No precision/recall/F1 is inferred.</p>
-    {"".join(body)}</html>"""
+    {name_table}{"".join(body)}</html>"""
     (output / "report.html").write_text(document, encoding="utf-8")
     (output / "review.json").write_text(json.dumps(choices, ensure_ascii=False, indent=2), encoding="utf-8")
     if queries:

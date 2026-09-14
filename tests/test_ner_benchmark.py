@@ -152,9 +152,10 @@ def test_run_report_and_failure(sample, tmp_path, monkeypatch):
     monkeypatch.setattr("semora.diagnostics.ner.runner.load_adapter", lambda *a, **k: FakeAdapter(empty=True))
     b = tmp_path / "b"
     run(source, b, "fake", device="cpu", batch_articles=2)
-    report(source, [a, b], tmp_path / "report", limit=3)
+    report(source, [a, b], tmp_path / "report", limit=3, queries=["Janez", "Missing"])
     page = (tmp_path / "report" / "report.html").read_text(encoding="utf-8")
     assert "6 of 6" in page and "<script>" not in page and "&lt;script&gt;" in page
+    assert "Name spot checks" in page and "Missing" in page
     monkeypatch.setattr("semora.diagnostics.ner.runner.load_adapter", lambda *a, **k: FakeAdapter(fail=True))
     failed = tmp_path / "failed"
     with pytest.raises(RuntimeError, match="simulated"):

@@ -51,6 +51,12 @@ def summarize(runs: list[Path], output: Path) -> None:
         row = {
             "adapter": config["adapter"],
             "model": config["model"].get("model", config["model"].get("package")),
+            "articles": config["completed_articles"],
+            "batch_articles": config["batch_articles"],
+            "device": config["device"],
+            "precision": config["model"].get("precision", "native"),
+            "aggregation": config["model"].get("aggregation", "native"),
+            "sample_sha256": config["sample_sha256"],
             "batch_size": config["batch_size"],
             "repeats": len(items),
             "configuration": config,
