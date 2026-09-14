@@ -14,7 +14,7 @@ CUDA wheels for your machine):
 uv venv artifacts/ner-benchmark/.venv --python 3.14
 $py = "$PWD/artifacts/ner-benchmark/.venv/Scripts/python.exe"
 uv pip install --python $py torch --index-url https://download.pytorch.org/whl/cu130
-uv pip install --python $py -e . classla transformers psutil
+uv pip install --python $py -e ".[ner,classla]"
 # Alternatively, use the local CLASSLA fork instead of the published package:
 uv pip install --python $py -e C:/GitHub/classla
 ```
@@ -59,6 +59,8 @@ lossless pretokenization and simple aggregation. Full articles use overlapping
 windows (`--max-length 256 --stride 64`); nothing is silently truncated. Entity
 offsets are half-open Python character offsets into `articles.content`, not
 newspaper-level source coordinates. Every span is checked against the source.
+Obeliks restarts offsets at paragraph boundaries; the CLASSLA adapter restores
+article-relative positions from its ordered tokens and rejects unalignable text.
 
 ## 3. Compare throughput
 
@@ -81,6 +83,21 @@ two hours, `--timeout`) does not prevent subsequent configurations running. The
 sweep exits unsuccessfully if any configuration fails. Incomplete runs cannot
 be used in the report. Committed partial predictions remain for diagnosis, but
 timed benchmarks do not resume: run again into a new output directory.
+
+Aggregate sweeps and repeat runs without loading models:
+
+```powershell
+& $py -m semora.diagnostics.ner summarize `
+  --runs artifacts/ner-benchmark/classla-sweep artifacts/ner-benchmark/xlmr-sweep `
+  --output artifacts/ner-benchmark/timing-summary
+```
+
+`summary.csv` and `summary.json` contain means and sample standard deviations
+(blank for a single repeat); `statuses.csv` includes failed/incomplete runs.
+Only identical model configurations, hardware, package versions and sample
+prefixes are grouped. For three repeats of the selected batch size, run a new
+sweep with `--batch-sizes SELECTED_SIZE --repeats 3` into another directory and
+include that directory in a new summary.
 
 `--batch-size` means NER sentence batches for CLASSLA and model-window batches for
 Transformers. `--batch-articles` (default 32) controls the outer read/write batch.

@@ -32,6 +32,11 @@ dependencies = [
 classla = [
     "classla",
 ]
+ner = [
+    "torch>=2.2",
+    "transformers>=5.17",
+    "psutil",
+]
 chunking = [
     "langchain-text-splitters>=0.2",
     "tqdm>=4.66",

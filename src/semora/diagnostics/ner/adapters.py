@@ -1,11 +1,28 @@
 """Lazy model adapters. Extra adapters may be supplied as module:factory."""
 
+import hashlib
 import importlib
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from .base import Adapter, Entity, Prediction
+
+
+def align_classla_tokens(document: Any, text: str) -> None:
+    """Obeliks offsets restart per paragraph; reconstruct and verify article offsets."""
+    cursor = 0
+    for token in document.iter_tokens():
+        start = text.find(token.text, cursor)
+        if start < 0 or text[cursor:start].strip():
+            raise ValueError(f"Cannot align CLASSLA token {token.text!r} at article character {cursor}")
+        # CLASSLA exposes read-only properties backed by these fields.
+        token._start_char = start
+        token._end_char = start + len(token.text)
+        cursor = token.end_char
+    if text[cursor:].strip():
+        raise ValueError(f"CLASSLA tokenization omitted text after article character {cursor}")
 
 
 def load_adapter(name: str, **options: Any) -> Adapter:
@@ -40,12 +57,19 @@ class ClasslaAdapter:
             "classla_version": classla.__version__,
             "ner_config": self.pipeline.processors["ner"].config,
         }
+        digest = hashlib.sha256()
+        with Path(self.pipeline.processors["ner"].config["model_path"]).open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        self.metadata["model_sha256"] = digest.hexdigest()
 
     def predict(self, texts: list[str], batch_size: int) -> Prediction:
         from classla.models.common.doc import Document
 
         started = time.perf_counter()
         documents = [self.pipeline.processors["tokenize"].process(text) for text in texts]
+        for document, text in zip(documents, texts, strict=True):
+            align_classla_tokens(document, text)
         tokenized = time.perf_counter()
         # Batch sentences while retaining each sentence's original document pointer.
         # This preserves article boundaries and exact offsets without text sentinels.

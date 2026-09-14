@@ -73,7 +73,7 @@ def report(
             if all(value == signatures[0] for value in signatures):
                 continue
             disagreement_count += 1
-            differences = set.union(*signatures) - set.intersection(*signatures)
+            differences = signatures[0].union(*signatures[1:]) - signatures[0].intersection(*signatures[1:])
             # Prefer a person disagreement when available; show a short local passage.
             anchor = min(differences, key=lambda s: (s[2] != "PER", s[0]))
             start, end = max(0, anchor[0] - 130), min(len(row["content"]), anchor[1] + 180)

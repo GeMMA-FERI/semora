@@ -162,3 +162,9 @@ python -m semora.projection.projector --help
 ```
 
 Additional usage notes are available in [`docs/`](docs/).
+
+For offline named-entity model comparisons, see the
+[NER benchmark guide](docs/ner-benchmark.md). It includes reusable article samples,
+CLASSLA and Transformers adapters, isolated batch-size sweeps, timing summaries,
+and a local HTML report of highlighted disagreements. It does not modify the
+production database or require manually annotating an evaluation corpus.
