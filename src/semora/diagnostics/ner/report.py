@@ -7,6 +7,7 @@ import random
 from contextlib import ExitStack, closing
 from pathlib import Path
 
+from .name_checks import check_names
 from .sample import readonly
 
 
@@ -38,6 +39,7 @@ def report(
     names: list[str] | None = None,
     seed: int = 42,
     labels: list[str] | None = None,
+    queries: list[str] | None = None,
 ) -> None:
     if len(runs) < 2 or limit <= 0:
         raise ValueError("Provide at least two runs and a positive report limit")
@@ -45,6 +47,7 @@ def report(
     if len(names) != len(runs) or len(set(names)) != len(names):
         raise ValueError("Run names must be unique and match the number of runs")
     labels_set = set(labels or ["PER", "LOC", "ORG"])
+    name_checks: list[dict] = []
     metrics = [json.loads((path / "metrics.json").read_text(encoding="utf-8")) for path in runs]
     output.mkdir(parents=True, exist_ok=False)
     with ExitStack() as stack:
@@ -69,6 +72,9 @@ def report(
                 if found is None:
                     raise ValueError(f"Missing predictions for {row['article_id']}")
                 predictions.append(json.loads(found[0]))
+            if queries:
+                checks = check_names(row["content"], dict(zip(names, predictions, strict=True)), queries)
+                name_checks.extend({**check, "article_id": row["article_id"], "urn": row["urn"]} for check in checks)
             signatures = [signature(entities, labels_set) for entities in predictions]
             if all(value == signatures[0] for value in signatures):
                 continue
@@ -99,10 +105,18 @@ def report(
                     choices[replacement] = item
     body = []
     for item in choices:
-        columns = "".join(
-            f"<td><strong>{html.escape(name)}</strong><p>{rendered}</p></td>"
-            for name, rendered in zip(names, item.pop("rendered"), strict=True)
-        )
+        columns = ""
+        for name, rendered in zip(names, item.pop("rendered"), strict=True):
+            mentions = (
+                " · ".join(
+                    html.escape(f"{e['label']}: {e['text']} [{e['start']}:{e['end']}]")
+                    for e in item["predictions"][name]
+                )
+                or "No entities"
+            )
+            columns += (
+                f'<td><strong>{html.escape(name)}</strong><p>{rendered}</p><p class="entities">{mentions}</p></td>'
+            )
         caption = html.escape(f"{item['newspaper']} | {item['date']} | {item['urn']} | {item['article_id']}")
         body.append(f"<section><p>{caption}</p><table><tr>{columns}</tr></table></section>")
     document = f"""<!doctype html><html lang="en"><meta charset="utf-8">
@@ -111,6 +125,7 @@ def report(
     table{{width:100%;table-layout:fixed;border-collapse:collapse}}
     td{{vertical-align:top;padding:1rem;border:1px solid #ddd}}
     p{{white-space:pre-wrap;overflow-wrap:anywhere}}mark{{background:#ffe7a3}}section{{margin:2rem 0}}
+    .entities{{font-size:0.85rem;color:#444;border-top:1px solid #ddd;padding-top:0.6rem}}
     </style><h1>NER disagreements</h1>
     <p>{disagreement_count} of {total} articles disagree on {html.escape(", ".join(sorted(labels_set)))}.
     Showing {len(choices)} sampled articles, one passage each. Hover highlights for labels.
@@ -118,6 +133,15 @@ def report(
     {"".join(body)}</html>"""
     (output / "report.html").write_text(document, encoding="utf-8")
     (output / "review.json").write_text(json.dumps(choices, ensure_ascii=False, indent=2), encoding="utf-8")
+    if queries:
+        name_results = {
+            "note": "Literal whole-name matches only; absent names and inflections are not NER misses. Not recall.",
+            "occurrences": {query: sum(check["query"] == query for check in name_checks) for query in queries},
+            "checks": name_checks,
+        }
+        (output / "name_checks.json").write_text(
+            json.dumps(name_results, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     fields = [
         "name",
         "adapter",

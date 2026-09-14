@@ -74,6 +74,7 @@ repeats of the best setting:
   --corpus-articles 6318092 --output artifacts/ner-benchmark/classla-sweep
 & $py -m semora.diagnostics.ner sweep --sample artifacts/ner-benchmark/sample.sqlite `
   --adapter transformers --device cuda --batch-sizes 16 32 64 --repeats 1 `
+  --precision float16 `
   --corpus-articles 6318092 --output artifacts/ner-benchmark/xlmr-sweep
 ```
 
@@ -127,6 +128,13 @@ articles, preferring person disagreements within each article. Metadata and exac
 offsets are in `review.json`; per-run timings are in `timings.csv`. The default
 comparison uses PER/LOC/ORG, configurable with `--labels`. Full predictions retain
 all labels. All runs must have completed the same sample prefix.
+
+Optionally add `--queries "Ivan Cankar" "Josip Broz" "Marija Abram"` to the
+report command. `name_checks.json` records literal whole-name occurrences and
+each model's covering labels and overlapping spans. This exposes fragmented
+names as well as missed or differently labelled mentions. It is not recall:
+inflected forms need their own query, and a name absent from the sample is not a
+model miss.
 
 Disagreement rates and entity counts are **not precision, recall or F1**. Shared
 omissions are invisible. Reports expose practical differences without implying

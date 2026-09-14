@@ -1,6 +1,7 @@
 """Shared adapter contract and source-relative entity spans."""
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Protocol
 
 
@@ -34,3 +35,5 @@ def validate(text: str, entities: list[Entity]) -> None:
             raise ValueError(f"Entity does not match source text: {entity}")
         if not entity.label:
             raise ValueError("Entity label cannot be empty")
+        if entity.score is not None and not isfinite(entity.score):
+            raise ValueError("Entity score must be finite")

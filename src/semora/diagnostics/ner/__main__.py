@@ -73,6 +73,7 @@ def main():
     comparison.add_argument("--limit", type=int, default=40)
     comparison.add_argument("--seed", type=int, default=42)
     comparison.add_argument("--labels", nargs="+", default=["PER", "LOC", "ORG"])
+    comparison.add_argument("--queries", nargs="+", help="Optional literal names for cached prediction spot checks")
     args = vars(parser.parse_args())
     command = args.pop("command")
     if command == "sample":

@@ -10,6 +10,7 @@ import pytest
 
 from semora.diagnostics.ner.adapters import align_classla_tokens
 from semora.diagnostics.ner.base import Entity, Prediction, validate
+from semora.diagnostics.ner.name_checks import check_names
 from semora.diagnostics.ner.report import highlight, report
 from semora.diagnostics.ner.runner import run
 from semora.diagnostics.ner.sample import create_sample, readonly
@@ -56,10 +57,24 @@ def test_span_alignment_and_html_escaping():
     validate(text, [Entity(0, 4, "PER", "Žiga")])
     with pytest.raises(ValueError):
         validate(text, [Entity(1, 4, "PER", "Žiga")])
+    with pytest.raises(ValueError, match="finite"):
+        validate(text, [Entity(0, 4, "PER", "Žiga", float("nan"))])
     rendered = highlight(text, [{"start": 0, "end": 4, "label": 'PER"<'}], 0, len(text))
     assert "<script>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "&quot;&lt;" in rendered
+
+
+def test_name_checks_distinguish_fragments_from_complete_names():
+    predictions = {
+        "whole": [{"start": 0, "end": 11, "label": "PER"}],
+        "split": [{"start": 0, "end": 4, "label": "PER"}, {"start": 5, "end": 11, "label": "PER"}],
+    }
+    result = check_names("Ivan Cankar in Ivan Cankarja", predictions, ["Ivan Cankar", "Missing"])
+    assert len(result) == 1
+    assert result[0]["models"]["whole"]["covering_labels"] == ["PER"]
+    assert result[0]["models"]["split"]["covering_labels"] == []
+    assert len(result[0]["models"]["split"]["overlapping_entities"]) == 2
 
 
 class FakeAdapter:
