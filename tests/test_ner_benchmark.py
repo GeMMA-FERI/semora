@@ -166,6 +166,8 @@ def test_run_report_and_failure(sample, tmp_path, monkeypatch):
     summarize([a, b, failed], tmp_path / "summary")
     summary = json.loads((tmp_path / "summary" / "summary.json").read_text())
     assert len(summary) == 1 and summary[0]["repeats"] == 2
+    assert summary[0]["pipeline_depth"] == 1
+    assert summary[0]["tokenizer_workers"] == 0
     assert summary[0]["articles_per_second_std"] is not None
     assert "failed" in (tmp_path / "summary" / "statuses.csv").read_text()
 

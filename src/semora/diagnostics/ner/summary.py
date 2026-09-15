@@ -54,6 +54,13 @@ def summarize(runs: list[Path], output: Path) -> None:
             "model": config["model"].get("model", config["model"].get("package")),
             "articles": config["completed_articles"],
             "batch_articles": config["batch_articles"],
+            "pipeline_depth": config["pipeline_depth"],
+            "tokenizer_workers": config["model"].get("tokenizer_workers", 0),
+            "sentence_order": (
+                "length" if config["model"].get("ner_config", {}).get("sort_during_eval", False) else "input"
+            )
+            if config["adapter"] == "classla"
+            else None,
             "device": config["device"],
             "precision": config["model"].get("precision", "native"),
             "aggregation": config["model"].get("aggregation", "native"),
