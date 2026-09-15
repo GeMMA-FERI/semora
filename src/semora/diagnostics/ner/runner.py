@@ -94,7 +94,7 @@ def run(
         "write_seconds": 0.0,
         "timing_scope": "sample SQLite reads + extraction + indexed SQLite writes/commits; warm cache possible",
     }
-    for package in ("torch", "transformers", "classla", "semora"):
+    for package in ("torch", "transformers", "classla", "semora", "numpy", "numba", "llvmlite"):
         try:
             metrics["versions"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
