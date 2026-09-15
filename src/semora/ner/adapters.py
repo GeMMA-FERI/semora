@@ -12,19 +12,23 @@ from typing import Any
 from .base import Adapter, Entity, Prediction
 from .decoding import word_pipeline_class
 
+# Obeliks TokRulesPart1 explicitly discards C0/C1 control characters.
+# They remain in articles.content: permit gaps, never delete/rebase source text.
+_TOKENIZER_GAP = re.compile(r"[\s\x00-\x1f\x7f-\x9f]*\Z")
+
 
 def align_classla_tokens(document: Any, text: str) -> None:
     """Obeliks offsets restart per paragraph; reconstruct and verify article offsets."""
     cursor = 0
     for token in document.iter_tokens():
         start = text.find(token.text, cursor)
-        if start < 0 or text[cursor:start].strip():
+        if start < 0 or not _TOKENIZER_GAP.fullmatch(text[cursor:start]):
             raise ValueError(f"Cannot align CLASSLA token {token.text!r} at article character {cursor}")
         # CLASSLA exposes read-only properties backed by these fields.
         token._start_char = start
         token._end_char = start + len(token.text)
         cursor = token.end_char
-    if text[cursor:].strip():
+    if not _TOKENIZER_GAP.fullmatch(text[cursor:]):
         raise ValueError(f"CLASSLA tokenization omitted text after article character {cursor}")
 
 
