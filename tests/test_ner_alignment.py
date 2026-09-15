@@ -53,3 +53,36 @@ def test_real_obeliks_discarded_controls():
     tokens = list(doc.iter_tokens())
     assert [t.text for t in tokens] == ['-', 'Ana', 'Novak', '!']
     assert all(text[t.start_char:t.end_char] == t.text for t in tokens)
+
+
+def test_controls_inside_token_preserve_span_and_do_not_match_later_occurrence():
+    text = 'J\x03. Novak J.'
+    doc = document('J.', 'Novak', 'J.')
+    align_classla_tokens(doc, text)
+    assert [(t._start_char, t._end_char) for t in doc.iter_tokens()] == [(0, 3), (4, 9), (10, 12)]
+
+
+@pytest.mark.parametrize('gap', [' ', '\n', 'x', '!', '\u200b'])
+def test_does_not_merge_across_whitespace_or_visible_text(gap):
+    with pytest.raises(ValueError, match='Cannot align'):
+        align_classla_tokens(document('J.'), 'J' + gap + '.')
+
+
+def test_real_obeliks_entity_span_includes_internal_controls():
+    pytest.importorskip('classla')
+    from classla.models.common.doc import Document
+    from classla.utils.obeliks import ObeliksTrainer
+
+    from semora.ner.base import Entity, validate
+
+    text = 'J\x03. Novak'
+    raw, sentences, metadata = ObeliksTrainer.tokenize(text)
+    doc = Document(sentences, raw, metasentences=metadata)
+    align_classla_tokens(doc, text)
+    tokens = list(doc.iter_tokens())
+    assert [t.text for t in tokens] == ['J.', 'Novak']
+    for token, label in zip(tokens, ['B-PER', 'I-PER'], strict=True):
+        token.ner = label
+    entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
+    assert entities == [Entity(0, len(text), 'PER', text)]
+    validate(text, entities)
