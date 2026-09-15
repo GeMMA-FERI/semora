@@ -46,13 +46,16 @@ def test_staging_preserves_order_and_single_inference_owner(tmp_path, depth):
     assert [len(batch.prediction.entities) for batch in batches] == [2, 2, 2, 2, 1]
 
 
-def test_staging_propagates_failure_and_cleans_up(tmp_path):
+@pytest.mark.parametrize("stage", ["prepare", "predict_prepared"])
+def test_staging_propagates_failure_and_cleans_up(tmp_path, stage):
     class Broken(Model):
         def prepare(self, texts):
             raise RuntimeError("tokenization failed")
 
+    model = Model()
+    setattr(model, stage, lambda *args: Broken().prepare([]))
     with pytest.raises(RuntimeError, match="tokenization failed"):
-        list(prediction_batches(Broken(), sample(tmp_path), 9, 2, 16, 3))
+        list(prediction_batches(model, sample(tmp_path), 9, 2, 16, 3))
     assert not any(t.name.startswith(("ner-prepare", "ner-infer")) for t in threading.enumerate())
 
 
@@ -61,3 +64,20 @@ def test_early_close_cleans_up(tmp_path):
     next(iterator)
     iterator.close()
     assert not any(t.name.startswith(("ner-prepare", "ner-infer")) for t in threading.enumerate())
+
+
+def test_depth_includes_batch_held_by_writer(tmp_path):
+    prepared = []
+
+    class Counting(Model):
+        def prepare(self, texts):
+            prepared.append(texts)
+            return texts
+
+    iterator = prediction_batches(Counting(), sample(tmp_path), 9, 2, 16, 2)
+    try:
+        next(iterator)
+        time.sleep(0.05)
+        assert len(prepared) == 2
+    finally:
+        iterator.close()

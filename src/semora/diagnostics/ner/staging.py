@@ -78,10 +78,10 @@ def prediction_batches(
                 break
         while pending:
             result = pending.popleft().result()
+            yield result
             next_offset = next(offsets, None)
             if next_offset is not None:
                 pending.append(gpu.submit(infer_after, cpu.submit(prepare, next_offset)))
-            yield result
     finally:
         for future in pending:
             future.cancel()
