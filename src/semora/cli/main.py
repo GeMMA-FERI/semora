@@ -37,6 +37,18 @@ def main() -> None:
     database_path = indexes_dir / "semora.sqlite"
     semantic_dir = indexes_dir / "semantic"
 
+    if args.command == "index" and args.index_type == "ner":
+        from semora.ner.indexing import build_ner_index
+
+        _print_json(build_ner_index(
+            database_path, run_id=args.run_id, device=args.device,
+            batch_articles=args.batch_articles, batch_size=args.batch_size,
+            pipeline_depth=args.pipeline_depth, max_articles=args.max_articles,
+            tokenizer_workers=args.tokenizer_workers, ner_pipeline_depth=args.ner_pipeline_depth,
+            ner_decoder=args.ner_decoder, resources=args.classla_resources_dir,
+        ))
+        return
+
     if args.command == "ingest":
         requested_stages = tuple(
             stage
@@ -296,6 +308,20 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Publish a pilot FAISS index before all vector shards exist.",
     )
+    ner = index_types.add_parser("ner", help="Extract and resume article entities in the corpus database.")
+    ner.add_argument("--run-id", default="classla-sl", help="Stable extraction run ID; reuse to resume.")
+    ner.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    ner.add_argument(
+        "--max-articles", type=int, help="Total completed article target for this run, including previous work."
+    )
+    ner.add_argument("--batch-articles", type=int, default=32)
+    ner.add_argument("--batch-size", type=int, default=16, help="Sentences per NER model batch.")
+    ner.add_argument("--pipeline-depth", type=int, default=3)
+    ner.add_argument("--tokenizer-workers", type=int, default=2)
+    ner.add_argument("--ner-pipeline-depth", type=int, default=1)
+    ner.add_argument("--ner-decoder", choices=("numpy", "numba"), default="numpy")
+    ner.add_argument("--classla-resources-dir")
+
     lemma = index_types.add_parser("lemma", help="Build or resume the CLASSLA lemma BM25 index.")
     lemma.add_argument("--max-articles", type=int, help="Stop when this total number of articles is processed.")
     lemma.add_argument("--batch-articles", type=int, default=50)
