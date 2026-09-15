@@ -50,6 +50,11 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                 )
                 _write(output_stream, {"id": request_id, "source": source.as_dict()})
                 continue
+            if operation in ("search_entities", "search_entity_articles"):
+                arguments = {key: value for key, value in request.items() if key not in ("id", "op")}
+                result = getattr(engine, operation)(**arguments)
+                _write(output_stream, {"id": request_id, **result})
+                continue
             if operation != "search":
                 raise ValueError(f"Unknown operation: {operation}")
             hits = engine.search(

@@ -37,6 +37,17 @@ def main() -> None:
     database_path = indexes_dir / "semora.sqlite"
     semantic_dir = indexes_dir / "semantic"
 
+    if args.command == "extensions":
+        from semora.ner.spellfix import install_spellfix
+
+        _print_json(install_spellfix(root, args.source, args.sha256))
+        return
+    if args.command == "index" and args.index_type == "entities":
+        from semora.ner.names import build_entity_names
+
+        _print_json(build_entity_names(root, args.run_id, args.batch_size))
+        return
+
     if args.command == "index" and args.index_type == "ner":
         from semora.ner.indexing import build_ner_index
 
@@ -308,6 +319,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Publish a pilot FAISS index before all vector shards exist.",
     )
+    extensions = commands.add_parser("extensions", help="Install trusted native SQLite extensions.")
+    extension_commands = extensions.add_subparsers(dest="extension_command", required=True)
+    spellfix = extension_commands.add_parser("install-spellfix")
+    spellfix.add_argument("--source", required=True, help="Trusted local spellfix DLL/SO file to install.")
+    spellfix.add_argument("--sha256", help="Expected SHA-256 checksum, verified before loading.")
+    entities = index_types.add_parser("entities", help="Build a spellfix entity-name snapshot after NER.")
+    entities.add_argument("--run-id", default="classla-sl")
+    entities.add_argument("--batch-size", type=int, default=10000)
+
     ner = index_types.add_parser("ner", help="Extract and resume article entities in the corpus database.")
     ner.add_argument("--run-id", default="classla-sl", help="Stable extraction run ID; reuse to resume.")
     ner.add_argument("--device", choices=("cpu", "cuda"), default="cuda")

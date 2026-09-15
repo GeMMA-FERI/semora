@@ -36,14 +36,30 @@ class SearchEngine:
         self._semantic_manifest: dict[str, Any] | None = None
         self.last_profile: dict[str, Any] | None = None
         self._active_profile: dict[str, Any] | None = None
+        self._entity_search: Any = None
         if load_semantic:
             self.load_semantic()
 
     def close(self) -> None:
+        if self._entity_search is not None:
+            self._entity_search.close()
         if self._semantic_mapping is not None:
             self._semantic_mapping.close()
             self._semantic_mapping = None
         self.database.close()
+
+    def _entities(self):
+        if self._entity_search is None:
+            from semora.ner.search import EntitySearch
+
+            self._entity_search = EntitySearch(self, Path(self.database.path).resolve().parent.parent)
+        return self._entity_search
+
+    def search_entities(self, query: str) -> dict:
+        return self._entities().search_entities(query)
+
+    def search_entity_articles(self, entity: str, **options) -> dict:
+        return self._entities().search_entity_articles(entity, **options)
 
     @property
     def semantic_loaded(self) -> bool:
