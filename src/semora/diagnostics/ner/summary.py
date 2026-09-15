@@ -56,10 +56,12 @@ def summarize(runs: list[Path], output: Path) -> None:
             "batch_articles": config["batch_articles"],
             "pipeline_depth": config["pipeline_depth"],
             "tokenizer_workers": config["model"].get("tokenizer_workers", 0),
+            "ner_pipeline_depth": config["model"].get("ner_config", {}).get("pipeline_depth", 1),
+            "ner_decoder": config["model"].get("ner_config", {}).get("decoder", "numpy"),
             "sentence_order": (
                 "length" if config["model"].get("ner_config", {}).get("sort_during_eval", False) else "input"
             )
-            if config["adapter"] == "classla"
+            if config["model"].get("adapter") == "classla"
             else None,
             "device": config["device"],
             "precision": config["model"].get("precision", "native"),

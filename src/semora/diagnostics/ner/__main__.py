@@ -48,6 +48,18 @@ def main():
         command.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
         command.add_argument("--batch-articles", type=int, default=32)
         command.add_argument(
+            "--ner-decoder",
+            choices=["numpy", "numba"],
+            default="numpy",
+            help="CLASSLA CPU decoder; numba requires the optional classla[ner-jit] extra",
+        )
+        command.add_argument(
+            "--ner-pipeline-depth",
+            type=int,
+            default=1,
+            help="Bounded tensor preparation and CPU decoding within CLASSLA NER",
+        )
+        command.add_argument(
             "--sentence-order",
             choices=["input", "length"],
             default="input",

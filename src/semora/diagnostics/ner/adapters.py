@@ -48,6 +48,8 @@ class ClasslaAdapter:
         download: bool = False,
         tokenizer_workers: int = 0,
         sentence_order: str = "input",
+        ner_pipeline_depth: int = 1,
+        ner_decoder: str = "numpy",
         **_: Any,
     ):
         import classla
@@ -59,7 +61,7 @@ class ClasslaAdapter:
             raise ValueError("Tokenizer workers cannot be negative")
         self.tokenizer_workers = tokenizer_workers
         self.tokenizer_pool: ProcessPoolExecutor | None = None
-        options: dict[str, Any] = {"processors": "tokenize,ner", "type": model or "default"}
+        options: dict[str, Any] = {"processors": "tokenize,ner", "type": model or "default", "ner_decoder": ner_decoder}
         if resources:
             options["dir"] = resources
         if download:
@@ -68,6 +70,9 @@ class ClasslaAdapter:
         if sentence_order not in ("input", "length"):
             raise ValueError("Sentence order must be input or length")
         self.pipeline.processors["ner"].config["sort_during_eval"] = sentence_order == "length"
+        if ner_pipeline_depth < 1:
+            raise ValueError("NER pipeline depth must be positive")
+        self.pipeline.processors["ner"].config["pipeline_depth"] = ner_pipeline_depth
         self.metadata = {
             "adapter": "classla",
             "package": model or "default",
@@ -155,11 +160,14 @@ def classla_source_hash(module: Any) -> str:
         "models/ner/data.py",
         "models/ner/model.py",
         "models/ner/trainer.py",
+        "models/ner/inference.py",
+        "models/ner/numba_decode.py",
         "pipeline/ner_processor.py",
         "models/common/crf.py",
     ):
         digest.update(relative.encode())
-        digest.update((root / relative).read_bytes().replace(b"\r\n", b"\n"))
+        path = root / relative
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n") if path.exists() else b"<absent>")
     return digest.hexdigest()
 
 

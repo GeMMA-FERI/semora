@@ -126,6 +126,26 @@ The incremental optimization history and individual results are maintained in
 default. Optional `--sentence-order length` groups by length for speed, but changed
 two article outputs in the 10,000-article validation sample, with either decoder.
 Use input order when preserving baseline predictions matters.
+The CLASSLA fork also supports `--ner-pipeline-depth 2` to overlap inner CPU
+tensor preparation/decoding with its single GPU caller. This differs from outer
+`--pipeline-depth` (article batches). Inner depth defaults to 1: more threads are
+not necessarily faster. Optional `--ner-decoder numba` requires `classla[ner-jit]`
+or installing `numba` in the same environment. It uses strict arithmetic and
+retains NumPy as the default/fallback. JIT startup is recorded in warm-up, outside
+the extraction timer. Both controls appear in benchmark summary CSVs.
+
+Capture a bounded stage-labeled CPU/CUDA trace (profiling distorts timings):
+
+```powershell
+& $py -m semora.diagnostics.ner.profile_classla `
+  --sample artifacts/ner-benchmark/sample.sqlite `
+  --articles 32 --batch-size 16 --output artifacts/ner-benchmark/NEW_TRACE.json
+```
+
+For a fresh-process original-tensor control, use
+`--adapter semora.diagnostics.ner.ablation:original_tensors --ner-decoder numpy
+--ner-pipeline-depth 1`. This adapter intentionally patches NER tensor preparation
+for that process only; never mix adapters in the same benchmark process.
 Final validation with batch size 16, outer batch 32, depth 3 and two workers
 processed 10,000 articles in **161.35 +/- 0.56 seconds** across three runs
 (61.98 +/- 0.21 articles/s). All three matched every historical baseline entity
