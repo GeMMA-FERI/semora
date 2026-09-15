@@ -4,6 +4,8 @@ import hashlib
 import importlib
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -38,13 +40,24 @@ def load_adapter(name: str, **options: Any) -> Adapter:
 
 class ClasslaAdapter:
     def __init__(
-        self, *, device: str, model: str | None = None, resources: str | None = None, download: bool = False, **_: Any
+        self,
+        *,
+        device: str,
+        model: str | None = None,
+        resources: str | None = None,
+        download: bool = False,
+        tokenizer_workers: int = 0,
+        **_: Any,
     ):
         import classla
         import torch
 
         self.torch = torch
         self.device = device
+        if tokenizer_workers < 0:
+            raise ValueError("Tokenizer workers cannot be negative")
+        self.tokenizer_workers = tokenizer_workers
+        self.tokenizer_pool: ProcessPoolExecutor | None = None
         options: dict[str, Any] = {"processors": "tokenize,ner", "type": model or "default"}
         if resources:
             options["dir"] = resources
@@ -57,6 +70,8 @@ class ClasslaAdapter:
             "processors": "tokenize,ner",
             "classla_version": classla.__version__,
             "ner_config": self.pipeline.processors["ner"].config,
+            "tokenizer_workers": tokenizer_workers,
+            "source_sha256": classla_source_hash(classla),
         }
         digest = hashlib.sha256()
         with Path(self.pipeline.processors["ner"].config["model_path"]).open("rb") as handle:
@@ -64,13 +79,31 @@ class ClasslaAdapter:
                 digest.update(block)
         self.metadata["model_sha256"] = digest.hexdigest()
 
-    def predict(self, texts: list[str], batch_size: int) -> Prediction:
-        from classla.models.common.doc import Document
-
+    def prepare(self, texts: list[str]):
+        """CPU-only stage; one caller owns the tokenizer and its optional pool."""
         started = time.perf_counter()
-        documents = [self.pipeline.processors["tokenize"].process(text) for text in texts]
+        tokenizer = self.pipeline.processors["tokenize"]
+        if self.tokenizer_workers:
+            if self.tokenizer_pool is None:
+                self.tokenizer_pool = ProcessPoolExecutor(
+                    max_workers=self.tokenizer_workers, mp_context=get_context("spawn")
+                )
+            documents = [
+                tokenizer.process_tokenized(*value) for value in self.tokenizer_pool.map(tokenize_article, texts)
+            ]
+        else:
+            documents = [tokenizer.process(text) for text in texts]
         for document, text in zip(documents, texts, strict=True):
             align_classla_tokens(document, text)
+        return documents, time.perf_counter() - started
+
+    def predict(self, texts: list[str], batch_size: int) -> Prediction:
+        return self.predict_prepared(self.prepare(texts), batch_size)
+
+    def predict_prepared(self, prepared, batch_size: int) -> Prediction:
+        from classla.models.common.doc import Document
+
+        documents, tokenize_seconds = prepared
         tokenized = time.perf_counter()
         # Batch sentences while retaining each sentence's original document pointer.
         # This preserves article boundaries and exact offsets without text sentinels.
@@ -91,11 +124,39 @@ class ClasslaAdapter:
         return Prediction(
             result,
             {
-                "tokenize_seconds": tokenized - started,
+                "tokenize_seconds": tokenize_seconds,
                 "inference_seconds": inferred - tokenized,
                 "postprocess_seconds": time.perf_counter() - inferred,
             },
         )
+
+    def close(self):
+        if self.tokenizer_pool is not None:
+            self.tokenizer_pool.shutdown(wait=True, cancel_futures=True)
+            self.tokenizer_pool = None
+
+
+def tokenize_article(text: str):
+    """Spawn-safe CPU worker: no model or CUDA tensors cross process boundaries."""
+    from classla.utils.obeliks import ObeliksTrainer
+
+    return ObeliksTrainer.tokenize(text)
+
+
+def classla_source_hash(module: Any) -> str:
+    """Fingerprint editable code so summaries do not merge different optimizations."""
+    root = Path(module.__file__).parent
+    digest = hashlib.sha256()
+    for relative in (
+        "models/ner/data.py",
+        "models/ner/model.py",
+        "models/ner/trainer.py",
+        "pipeline/ner_processor.py",
+        "models/common/crf.py",
+    ):
+        digest.update(relative.encode())
+        digest.update((root / relative).read_bytes().replace(b"\r\n", b"\n"))
+    return digest.hexdigest()
 
 
 class TransformersAdapter:

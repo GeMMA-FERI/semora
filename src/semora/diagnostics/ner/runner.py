@@ -15,6 +15,7 @@ from typing import Any
 from .adapters import load_adapter
 from .base import validate
 from .sample import readonly
+from .staging import prediction_batches
 
 
 class MemorySampler:
@@ -50,12 +51,13 @@ def run(
     device: str = "cuda",
     limit: int | None = None,
     corpus_articles: int | None = None,
+    pipeline_depth: int = 1,
     **options: Any,
 ) -> None:
     import torch
     from tqdm import tqdm
 
-    if batch_size <= 0 or batch_articles <= 0 or (limit is not None and limit <= 0):
+    if batch_size <= 0 or batch_articles <= 0 or pipeline_depth <= 0 or (limit is not None and limit <= 0):
         raise ValueError("Batch sizes and limit must be positive")
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
@@ -66,6 +68,7 @@ def run(
         "options": options,
         "batch_size": batch_size,
         "batch_articles": batch_articles,
+        "pipeline_depth": pipeline_depth,
         "device": device,
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -91,6 +94,7 @@ def run(
         temporary.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         temporary.replace(metrics_path)
 
+    model = None
     save()
     try:
         with closing(readonly(sample)) as source, closing(sqlite3.connect(output / "predictions.sqlite")) as target:
@@ -127,22 +131,17 @@ def run(
                 metrics["warmup_seconds"] = time.perf_counter() - started
                 save()
                 started = time.perf_counter()
-                with tqdm(total=total, unit="article", desc=adapter) as progress:
-                    for offset in range(0, total, batch_articles):
+                batches = prediction_batches(model, sample, total, batch_articles, batch_size, pipeline_depth)
+                with closing(batches), tqdm(total=total, unit="article", desc=adapter) as progress:
+                    for batch in batches:
+                        rows, prediction = batch.rows, batch.prediction
+                        metrics["read_seconds"] += batch.read_seconds
                         tick = time.perf_counter()
-                        rows = source.execute(
-                            "SELECT article_id, content FROM articles WHERE position >= ? "
-                            "AND position < ? ORDER BY position",
-                            (offset, min(offset + batch_articles, total)),
-                        ).fetchall()
-                        metrics["read_seconds"] += time.perf_counter() - tick
-                        tick = time.perf_counter()
-                        prediction = model.predict([r["content"] for r in rows], batch_size)
                         if len(prediction.entities) != len(rows):
                             raise ValueError("Adapter returned the wrong number of documents")
                         for row, entities in zip(rows, prediction.entities, strict=True):
                             validate(row["content"], entities)
-                        metrics["predict_seconds"] += time.perf_counter() - tick
+                        metrics["predict_seconds"] += batch.predict_seconds + time.perf_counter() - tick
                         for key, value in prediction.timings.items():
                             metrics[key] = metrics.get(key, 0) + value
                         tick = time.perf_counter()
@@ -187,5 +186,9 @@ def run(
         metrics.update(status="failed", error=str(exc), traceback=traceback.format_exc())
         raise
     finally:
-        save()
+        try:
+            if model is not None and hasattr(model, "close"):
+                model.close()
+        finally:
+            save()
     print(json.dumps({key: value for key, value in metrics.items() if key != "sample"}, indent=2, default=str))

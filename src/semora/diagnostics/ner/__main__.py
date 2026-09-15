@@ -47,6 +47,12 @@ def main():
         command.add_argument("--model")
         command.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
         command.add_argument("--batch-articles", type=int, default=32)
+        command.add_argument(
+            "--pipeline-depth", type=int, default=1, help="Bounded overlapping CLASSLA batches; 1 is sequential"
+        )
+        command.add_argument(
+            "--tokenizer-workers", type=int, default=0, help="CPU-only CLASSLA tokenizer processes; 0 tokenizes locally"
+        )
         command.add_argument("--limit", type=int)
         command.add_argument("--corpus-articles", type=int)
         command.add_argument("--resources", help="CLASSLA resources directory")

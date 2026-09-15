@@ -34,6 +34,7 @@ def summarize(runs: list[Path], output: Path) -> None:
             )
         }
         configuration["sample_sha256"] = item["sample"]["sample_sha256"]
+        configuration["pipeline_depth"] = item.get("pipeline_depth", 1)
         configuration["estimated_corpus_articles"] = item.get("estimated_corpus_articles")
         groups[json.dumps(configuration, sort_keys=True)].append(item)
     values = [

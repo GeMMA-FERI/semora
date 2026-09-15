@@ -114,6 +114,14 @@ include that directory in a new summary.
 Transformers. `--batch-articles` (default 32) controls the outer read/write batch.
 Use each model's fastest stable settings; equal batch numbers are not equal work.
 `--precision` controls Transformers only; CLASSLA uses its native precision.
+CLASSLA also supports `--pipeline-depth 3 --tokenizer-workers 2`: bounded CPU
+preparation overlaps one GPU model with result writes. Defaults are depth 1
+(sequential) and zero tokenizer processes. Workers tokenize articles independently;
+source spans and article boundaries are retained. More workers are not necessarily
+faster. Worker startup may partly occur during the measured run; parent RSS does
+not include worker memory. Overlapped stage durations are not additive wall time.
+The incremental optimization history and individual results are maintained in
+`C:/GitHub/classla/NER_OPTIMIZATION_HISTORY.md` in the CLASSLA fork.
 Transformers may print its generic "pipelines sequentially on GPU" advisory
 after repeated calls. Each call here receives a batch, but the benchmark uses
 bounded outer batches rather than a single corpus-wide pipeline iterator.
