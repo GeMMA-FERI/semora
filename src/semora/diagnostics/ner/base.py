@@ -1,39 +1,5 @@
-"""Shared adapter contract and source-relative entity spans."""
+"""Compatibility imports for benchmark adapters."""
 
-from dataclasses import dataclass, field
-from math import isfinite
-from typing import Any, Protocol
+from semora.ner.base import Adapter, Entity, Prediction, validate
 
-
-@dataclass(frozen=True)
-class Entity:
-    start: int
-    end: int
-    label: str
-    text: str
-    score: float | None = None
-
-
-@dataclass
-class Prediction:
-    entities: list[list[Entity]]
-    timings: dict[str, float] = field(default_factory=dict)
-
-
-class Adapter(Protocol):
-    metadata: dict[str, Any]
-
-    def predict(self, texts: list[str], batch_size: int) -> Prediction: ...
-
-
-def validate(text: str, entities: list[Entity]) -> None:
-    """Never silently save misaligned spans or unsupported labels."""
-    for entity in entities:
-        if not 0 <= entity.start < entity.end <= len(text):
-            raise ValueError(f"Invalid entity offsets: {entity}")
-        if text[entity.start : entity.end] != entity.text:
-            raise ValueError(f"Entity does not match source text: {entity}")
-        if not entity.label:
-            raise ValueError("Entity label cannot be empty")
-        if entity.score is not None and not isfinite(entity.score):
-            raise ValueError("Entity score must be finite")
+__all__ = ["Adapter", "Entity", "Prediction", "validate"]
