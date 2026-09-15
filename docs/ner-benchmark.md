@@ -126,6 +126,12 @@ The incremental optimization history and individual results are maintained in
 default. Optional `--sentence-order length` groups by length for speed, but changed
 two article outputs in the 10,000-article validation sample, with either decoder.
 Use input order when preserving baseline predictions matters.
+Final validation with batch size 16, outer batch 32, depth 3 and two workers
+processed 10,000 articles in **161.35 +/- 0.56 seconds** across three runs
+(61.98 +/- 0.21 articles/s). All three matched every historical baseline entity
+exactly. The earlier full-sample baseline was 272.44 seconds; it was not measured
+in the same three-run experiment. See the fork's history for individual steps,
+the faster but non-identical length-grouped trials, and recorded failures.
 Transformers may print its generic "pipelines sequentially on GPU" advisory
 after repeated calls. Each call here receives a batch, but the benchmark uses
 bounded outer batches rather than a single corpus-wide pipeline iterator.
