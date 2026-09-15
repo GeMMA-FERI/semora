@@ -133,6 +133,12 @@ not necessarily faster. Optional `--ner-decoder numba` requires `classla[ner-jit
 or installing `numba` in the same environment. It uses strict arithmetic and
 retains NumPy as the default/fallback. JIT startup is recorded in warm-up, outside
 the extraction timer. Both controls appear in benchmark summary CSVs.
+In alternating 2,000-article comparisons (three repetitions each), original tensor
+construction plus NumPy took 31.00 +/- 0.10 s; bulk construction plus Numba at
+inner depth 1 took 20.26 +/- 0.22 s (1.53x throughput). Inner depth 2 took
+20.56 +/- 0.22 s, so use `--ner-decoder numba --ner-pipeline-depth 1` on this setup.
+All nine trials had identical entity outputs. Do not infer a Numba-only speedup
+from that combined-change comparison.
 
 Capture a bounded stage-labeled CPU/CUDA trace (profiling distorts timings):
 
