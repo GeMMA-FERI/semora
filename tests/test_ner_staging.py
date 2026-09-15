@@ -81,3 +81,41 @@ def test_depth_includes_batch_held_by_writer(tmp_path):
         assert len(prepared) == 2
     finally:
         iterator.close()
+
+
+def test_metrics_replace_retries_temporary_permission_error(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from semora.diagnostics.ner.runner import replace_metrics
+
+    original = Path.replace
+    attempts = []
+
+    def replace(path, target):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise PermissionError("File temporarily held by reader")
+        return original(path, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr("semora.diagnostics.ner.runner.time.sleep", lambda _: None)
+    temporary = tmp_path / "metrics.tmp"
+    temporary.write_text("{}")
+    target = tmp_path / "metrics.json"
+    replace_metrics(temporary, target)
+    assert target.read_text() == "{}"
+    assert len(attempts) == 2
+
+
+def test_metrics_replace_does_not_hide_permanent_failure(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from semora.diagnostics.ner.runner import replace_metrics
+
+    def denied(*args):
+        raise PermissionError("Still denied")
+
+    monkeypatch.setattr(Path, "replace", denied)
+    monkeypatch.setattr("semora.diagnostics.ner.runner.time.sleep", lambda _: None)
+    with pytest.raises(PermissionError):
+        replace_metrics(tmp_path / "metrics.tmp", tmp_path / "metrics.json")

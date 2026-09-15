@@ -122,6 +122,10 @@ faster. Worker startup may partly occur during the measured run; parent RSS does
 not include worker memory. Overlapped stage durations are not additive wall time.
 The incremental optimization history and individual results are maintained in
 `C:/GitHub/classla/NER_OPTIMIZATION_HISTORY.md` in the CLASSLA fork.
+`--sentence-order input` preserves the original sentence batches and is the
+default. Optional `--sentence-order length` groups by length for speed, but changed
+two article outputs in the 10,000-article validation sample, with either decoder.
+Use input order when preserving baseline predictions matters.
 Transformers may print its generic "pipelines sequentially on GPU" advisory
 after repeated calls. Each call here receives a batch, but the benchmark uses
 bounded outer batches rather than a single corpus-wide pipeline iterator.

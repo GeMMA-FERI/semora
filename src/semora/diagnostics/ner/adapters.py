@@ -47,6 +47,7 @@ class ClasslaAdapter:
         resources: str | None = None,
         download: bool = False,
         tokenizer_workers: int = 0,
+        sentence_order: str = "input",
         **_: Any,
     ):
         import classla
@@ -64,6 +65,9 @@ class ClasslaAdapter:
         if download:
             classla.download("sl", **options)
         self.pipeline = classla.Pipeline("sl", **options, use_gpu=device == "cuda", verbose=False)
+        if sentence_order not in ("input", "length"):
+            raise ValueError("Sentence order must be input or length")
+        self.pipeline.processors["ner"].config["sort_during_eval"] = sentence_order == "length"
         self.metadata = {
             "adapter": "classla",
             "package": model or "default",

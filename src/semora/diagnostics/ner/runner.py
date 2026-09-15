@@ -18,6 +18,18 @@ from .sample import readonly
 from .staging import prediction_batches
 
 
+def replace_metrics(temporary: Path, target: Path) -> None:
+    """Readers/virus scanners can briefly deny atomic replacement on Windows."""
+    for attempt in range(6):
+        try:
+            temporary.replace(target)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.05 * 2**attempt)
+
+
 class MemorySampler:
     def __init__(self):
         import psutil
@@ -92,7 +104,7 @@ def run(
     def save():
         temporary = metrics_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(metrics, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        temporary.replace(metrics_path)
+        replace_metrics(temporary, metrics_path)
 
     model = None
     save()

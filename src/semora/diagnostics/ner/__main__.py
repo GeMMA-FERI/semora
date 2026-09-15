@@ -48,6 +48,12 @@ def main():
         command.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
         command.add_argument("--batch-articles", type=int, default=32)
         command.add_argument(
+            "--sentence-order",
+            choices=["input", "length"],
+            default="input",
+            help="CLASSLA sentence grouping; length can change near-tied predictions",
+        )
+        command.add_argument(
             "--pipeline-depth", type=int, default=1, help="Bounded overlapping CLASSLA batches; 1 is sequential"
         )
         command.add_argument(
