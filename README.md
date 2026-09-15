@@ -168,3 +168,7 @@ For offline named-entity model comparisons, see the
 CLASSLA and Transformers adapters, isolated batch-size sweeps, timing summaries,
 and a local HTML report of highlighted disagreements. It does not modify the
 production database or require manually annotating an evaluation corpus.
+
+For resumable extraction into the corpus database, use `semora index ner`.
+See the [production NER guide](docs/ner-indexing.md) for commands, stored entity
+fields, model run identities, and safe batch/resume behavior.
