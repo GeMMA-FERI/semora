@@ -139,6 +139,11 @@ inner depth 1 took 20.26 +/- 0.22 s (1.53x throughput). Inner depth 2 took
 20.56 +/- 0.22 s, so use `--ner-decoder numba --ner-pipeline-depth 1` on this setup.
 All nine trials had identical entity outputs. Do not infer a Numba-only speedup
 from that combined-change comparison.
+The selected Numba configuration completed the full 10,000-article validation
+in **102.40 seconds** (97.65 articles/s), with all 145,079 entities identical to
+the original baseline. This full-sample figure is one run, not a repeated mean.
+Numba was installed only in the isolated benchmark environment; in another
+environment install the fork's `ner-jit` extra or run `uv pip install --python $py numba`.
 
 Capture a bounded stage-labeled CPU/CUDA trace (profiling distorts timings):
 
