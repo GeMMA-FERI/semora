@@ -10,7 +10,8 @@ from semora.storage import Database
 
 
 @pytest.fixture
-def entity_root(tmp_path):
+def entity_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("SEMORA_SPELLFIX_PATH", raising=False)
     library = os.environ.get("SEMORA_TEST_SPELLFIX")
     if not library:
         pytest.skip("Set SEMORA_TEST_SPELLFIX to a trusted test DLL/SO")

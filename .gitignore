@@ -12,5 +12,6 @@ dist/
 data/
 models/
 artifacts/
+/extensions/
 logs/
 temp*/

@@ -4,6 +4,9 @@
 It does not create a new BM25 index or expose a Nora entity-search tool.
 It processes valid, nonempty **article content**, not chunks or article titles.
 
+After extraction, see [entity search](entity-search.md) to build a fuzzy name
+dictionary and look up source articles.
+
 ## Run and resume
 
 Use the tested editable CLASSLA fork and the benchmark environment for now.

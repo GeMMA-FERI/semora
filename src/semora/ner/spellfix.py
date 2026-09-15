@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 
@@ -33,10 +34,9 @@ def install_spellfix(root, source, sha256=None):
     destination = extension_path(root)
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Never download/compile executable code implicitly during a search.
-    with sqlite3.connect(":memory:") as connection:
+    with closing(sqlite3.connect(":memory:")) as connection:
         load_spellfix(connection, source)
         connection.execute("CREATE VIRTUAL TABLE probe USING spellfix1")
-    connection.close()
     if source != destination.resolve():
         fd, temporary = tempfile.mkstemp(dir=destination.parent, suffix=destination.suffix)
         os.close(fd)
