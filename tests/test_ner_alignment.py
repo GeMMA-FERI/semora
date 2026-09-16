@@ -86,3 +86,40 @@ def test_real_obeliks_entity_span_includes_internal_controls():
     entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
     assert entities == [Entity(0, len(text), 'PER', text)]
     validate(text, entities)
+
+
+@pytest.mark.parametrize(('text', 'words', 'spans'), [
+    ('\xad -', ['-', '-'], [(0, 1), (2, 3)]),
+    ('Ana\xadMarija', ['Ana-Marija'], [(0, 10)]),
+    ('A\x03\xadB', ['A-B'], [(0, 4)]),
+])
+def test_soft_hyphen_normalization_keeps_original_offsets(text, words, spans):
+    doc = document(*words)
+    align_classla_tokens(doc, text)
+    assert [(t._start_char, t._end_char) for t in doc.iter_tokens()] == spans
+
+
+@pytest.mark.parametrize('char', ['\u2013', '\u2014', '\u2212'])
+def test_other_dash_characters_are_not_silently_normalized(char):
+    with pytest.raises(ValueError, match='Cannot align'):
+        align_classla_tokens(document('-'), char)
+
+
+def test_real_obeliks_soft_hyphen_entity_preserves_original_text():
+    pytest.importorskip('classla')
+    from classla.models.common.doc import Document
+    from classla.utils.obeliks import ObeliksTrainer
+
+    from semora.ner.base import Entity, validate
+
+    text = 'Ana\xadMarija'
+    raw, sentences, metadata = ObeliksTrainer.tokenize(text)
+    doc = Document(sentences, raw, metasentences=metadata)
+    align_classla_tokens(doc, text)
+    tokens = list(doc.iter_tokens())
+    assert '-' in ''.join(t.text for t in tokens)
+    for i, token in enumerate(tokens):
+        token.ner = 'B-PER' if i == 0 else 'I-PER'
+    entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
+    assert entities == [Entity(0, len(text), 'PER', text)]
+    validate(text, entities)

@@ -39,12 +39,16 @@ def _match_across_controls(text: str, word: str, cursor: int) -> tuple[int, int]
 
 def align_classla_tokens(document: Any, text: str) -> None:
     """Obeliks offsets restart per paragraph; reconstruct and verify article offsets."""
+    # Obeliks normalizes soft hyphens to ASCII hyphens before tokenization.
+    # This substitution is one-to-one, so offsets still address the unmodified
+    # document text used by build_ents() and stored in the database.
+    matching_text = text.replace('\xad', '-')
     cursor = 0
     for token in document.iter_tokens():
-        start = text.find(token.text, cursor)
+        start = matching_text.find(token.text, cursor)
         end = start + len(token.text)
-        if start < 0 or not _TOKENIZER_GAP.fullmatch(text[cursor:start]):
-            start, end = _match_across_controls(text, token.text, cursor)
+        if start < 0 or not _TOKENIZER_GAP.fullmatch(matching_text[cursor:start]):
+            start, end = _match_across_controls(matching_text, token.text, cursor)
             if start < 0:
                 raise ValueError(f"Cannot align CLASSLA token {token.text!r} at article character {cursor}")
         # CLASSLA exposes read-only properties backed by these fields.
