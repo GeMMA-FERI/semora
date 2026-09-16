@@ -137,7 +137,13 @@ def test_worker_cleanup_reaps_descendant():
         stop_worker(process)
         process.stdout.close()
     assert process.poll() is not None
-    assert not psutil.pid_exists(child_pid) or psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE
+    try:
+        status = psutil.Process(child_pid).status()
+    except psutil.NoSuchProcess:
+        # The OS may reap the descendant before or during the status query.
+        pass
+    else:
+        assert status == psutil.STATUS_ZOMBIE
 
 
 def test_run_report_and_failure(sample, tmp_path, monkeypatch):
