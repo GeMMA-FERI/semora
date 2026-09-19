@@ -198,6 +198,7 @@ def main() -> None:
         engine = SearchEngine(
             database_path,
             semantic_dir,
+            semantic_device=args.semantic_device,
         )
         engine_initialization_seconds = time.perf_counter() - engine_started
         try:
@@ -205,6 +206,7 @@ def main() -> None:
                 args.mode,
                 args.query,
                 limit=args.limit,
+                offset=args.offset,
                 before=args.before,
                 after=args.after,
                 context_lines=args.context_lines,
@@ -236,6 +238,7 @@ def main() -> None:
             database_path,
             semantic_dir,
             load_semantic=not args.no_semantic,
+            semantic_device=args.semantic_device,
         )
         try:
             run_stdio(engine)
@@ -416,6 +419,8 @@ def _parser() -> argparse.ArgumentParser:
     search = commands.add_parser("search", help="Run one search and write JSON to stdout.")
     search.add_argument("mode", choices=("bm25", "bm25-lemma", "bm25-combined", "regex", "semantic"))
     search.add_argument("query")
+    search.add_argument("--semantic-device", default="cpu", help="Query encoder device (cpu or cuda).")
+    search.add_argument("--offset", type=int, default=0, help="Skip ranked BM25 or semantic articles.")
     search.add_argument(
         "--profile",
         action="store_true",
@@ -424,6 +429,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_search_options(search)
 
     stdio = commands.add_parser("stdio", help="Serve newline-delimited JSON requests on stdin/stdout.")
+    stdio.add_argument("--semantic-device", default="cpu", help="Query encoder device (cpu or cuda).")
     stdio.add_argument(
         "--no-semantic",
         action="store_true",

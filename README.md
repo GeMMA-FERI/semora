@@ -95,6 +95,14 @@ semora search regex "regular expression" --context-lines 3
 semora search semantic "natural-language query" --before 1 --after 1
 ```
 
+Semantic queries load the manifest's embedding model lazily on CPU by default;
+use `--semantic-device cuda` on `search` or `stdio` to opt into GPU query encoding.
+Use `--offset N` for subsequent BM25 or semantic pages (or `offset` in stdio JSON).
+Semantic pages contain distinct articles, using their best matching chunk, with
+filters applied within at most 10,000 vector candidates. Empty results are not
+proof that no matching article exists. A completed vector stage still requires
+the FAISS stage before the full corpus is searchable; check `semora status`.
+
 Search results use relevance-centered snippets limited to 600 characters by
 default; use `--max-snippet-chars` to choose another limit.
 

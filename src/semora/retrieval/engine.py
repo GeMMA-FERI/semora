@@ -27,9 +27,11 @@ class SearchEngine:
         semantic_dir: str | Path = "indexes/semantic",
         *,
         load_semantic: bool = False,
+        semantic_device: str = "cpu",
     ) -> None:
         self.database = Database(database_path, read_only=True)
         self.semantic_dir = Path(semantic_dir).resolve()
+        self.semantic_device = semantic_device
         self._semantic_index: Any = None
         self._semantic_model: Any = None
         self._semantic_mapping: sqlite3.Connection | None = None
@@ -130,22 +132,35 @@ class SearchEngine:
         mapping_path = self.semantic_dir / "mapping.sqlite"
         if not manifest_path.is_file() or not index_path.is_file() or not mapping_path.is_file():
             raise FileNotFoundError(f"Semantic index is incomplete: {self.semantic_dir}")
-        self._semantic_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self._semantic_index = _read_faiss_index(faiss, index_path)
-        self._semantic_mapping = sqlite3.connect(f"{mapping_path.as_uri()}?mode=ro", uri=True)
-        self._semantic_mapping.row_factory = sqlite3.Row
-        mapped_chunks = int(self._semantic_mapping.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0])
-        if self._semantic_index.ntotal != int(self._semantic_manifest.get("chunks", -1)):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        index = _read_faiss_index(faiss, index_path)
+        if index.ntotal != int(manifest.get("chunks", -1)):
             raise ValueError("FAISS index and semantic manifest contain different numbers of entries.")
-        if self._semantic_index.ntotal > mapped_chunks:
-            raise ValueError("FAISS index and chunk ID mapping contain different numbers of entries.")
-        faiss_config = self._semantic_manifest.get("faiss", {})
-        if hasattr(self._semantic_index, "nprobe"):
-            self._semantic_index.nprobe = int(faiss_config.get("nprobe", 32))
-        model_options: dict[str, Any] = {"truncate_dim": int(self._semantic_manifest["dimensions"])}
-        if self._semantic_manifest.get("model_revision") is not None:
-            model_options["revision"] = self._semantic_manifest["model_revision"]
-        self._semantic_model = SentenceTransformer(self._semantic_manifest["model_id"], **model_options)
+        if index.d != int(manifest["dimensions"]):
+            raise ValueError("FAISS index and semantic manifest have different dimensions.")
+        faiss_config = manifest.get("faiss", {})
+        if hasattr(index, "nprobe"):
+            index.nprobe = int(faiss_config.get("nprobe", 32))
+        model_options: dict[str, Any] = {
+            "truncate_dim": int(manifest["dimensions"]), "device": self.semantic_device,
+        }
+        if manifest.get("model_revision") is not None:
+            model_options["revision"] = manifest["model_revision"]
+        mapping = sqlite3.connect(f"{mapping_path.as_uri()}?mode=ro", uri=True)
+        mapping.row_factory = sqlite3.Row
+        try:
+            mapped_chunks = int(mapping.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0])
+            if index.ntotal > mapped_chunks:
+                raise ValueError("FAISS index and chunk ID mapping contain different numbers of entries.")
+            model = SentenceTransformer(manifest["model_id"], **model_options)
+        except BaseException:
+            mapping.close()
+            raise
+        # Publish only a fully loaded runtime, so a failed load can safely be retried.
+        self._semantic_manifest = manifest
+        self._semantic_mapping = mapping
+        self._semantic_model = model
+        self._semantic_index = index
 
     def read_source(
         self,
@@ -309,7 +324,7 @@ class SearchEngine:
                 date_to=date_to,
             )
         elif mode == "semantic":
-            matches = self._search_semantic(query, limit, newspaper, date_from, date_to)
+            matches = self._search_semantic(query, limit, newspaper, date_from, date_to, offset)
         else:
             raise ValueError(f"Unknown search mode: {mode}")
         self._record_profile_time("retrieval", retrieval_started)
@@ -564,11 +579,15 @@ class SearchEngine:
         newspaper: str | None,
         date_from: str | None,
         date_to: str | None,
+        offset: int = 0,
     ) -> list[tuple[Any, float]]:
         self.load_semantic()
         import numpy as np
 
         assert self._semantic_manifest is not None
+        maximum_candidates = min(int(self._semantic_index.ntotal), DEFAULT_SEMANTIC_CANDIDATES)
+        if offset >= maximum_candidates:
+            return []
         encode = getattr(self._semantic_model, "encode_query", self._semantic_model.encode)
         vector = encode(
             [query],
@@ -577,13 +596,16 @@ class SearchEngine:
             show_progress_bar=False,
         )
         dimensions = int(self._semantic_manifest["dimensions"])
-        vector = np.asarray(vector, dtype="float32")[:, :dimensions]
+        vector = np.asarray(vector, dtype="float32")
+        if vector.ndim != 2 or vector.shape[0] != 1 or vector.shape[1] < dimensions:
+            raise ValueError("Embedding model returned an invalid query vector shape.")
+        vector = np.ascontiguousarray(vector[:, :dimensions])
         norms = np.linalg.norm(vector, axis=1, keepdims=True)
         if not np.isfinite(vector).all() or np.any(norms == 0):
             raise ValueError("Embedding model returned an invalid query vector.")
         vector /= norms
-        maximum_candidates = min(int(self._semantic_index.ntotal), DEFAULT_SEMANTIC_CANDIDATES)
-        candidate_limit = min(maximum_candidates, max(limit, limit * 20))
+        wanted = offset + limit
+        candidate_limit = min(maximum_candidates, wanted * 20)
         while True:
             scores, indices = self._semantic_index.search(vector, candidate_limit)
             vector_ids = [int(index) for index in indices[0] if index >= 0]
@@ -603,10 +625,10 @@ class SearchEngine:
                 ):
                     seen_articles.add(str(row["article_id"]))
                     results.append((row, float(score)))
-                    if len(results) >= limit:
-                        return results
+                    if len(results) >= wanted:
+                        return results[offset:wanted]
             if candidate_limit >= maximum_candidates:
-                return results
+                return results[offset:wanted]
             candidate_limit = min(maximum_candidates, candidate_limit * 2)
 
     def _semantic_chunk_id_map(self, vector_ids: list[int]) -> dict[int, str]:

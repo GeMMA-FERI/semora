@@ -505,7 +505,8 @@ def test_pipelined_lemma_index_checkpoints_completed_writes(tmp_path: Path, monk
     assert finished.complete is True
 
 
-def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("real_faiss", [False, True])
+def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, monkeypatch, real_faiss) -> None:
     root, _ = _build_corpus(tmp_path, monkeypatch)
     stored_indexes = {}
 
@@ -537,8 +538,11 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
         return stored_indexes[path]
 
     class FakeModel:
+        devices = []
+
         def __init__(self, model_id: str, device=None, **_kwargs) -> None:
             assert model_id == "google/embeddinggemma-300m"
+            self.devices.append(device)
 
         def encode(self, texts, **_kwargs):
             return self._vectors(texts)
@@ -557,16 +561,19 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
             )
             return vectors
 
-    monkeypatch.setitem(
-        sys.modules,
-        "faiss",
-        types.SimpleNamespace(
-            IndexFlatIP=FakeIndex,
-            IndexIDMap2=lambda index: index,
-            write_index=write_index,
-            read_index=read_index,
-        ),
-    )
+    if real_faiss:
+        pytest.importorskip("faiss")
+    else:
+        monkeypatch.setitem(
+            sys.modules,
+            "faiss",
+            types.SimpleNamespace(
+                IndexFlatIP=FakeIndex,
+                IndexIDMap2=lambda index: index,
+                write_index=write_index,
+                read_index=read_index,
+            ),
+        )
     monkeypatch.setitem(
         sys.modules,
         "sentence_transformers",
@@ -593,12 +600,48 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
     assert manifest["chunking"]["token_count"] == 3
     assert manifest["chunking"]["token_overlap"] == 1
 
-    engine = SearchEngine(root / "indexes" / "semora.sqlite", semantic_dir, load_semantic=True)
+    engine = SearchEngine(root / "indexes" / "semora.sqlite", semantic_dir)
     try:
+        def failed_model(*args, **kwargs):
+            raise RuntimeError("Temporary model load failure")
+
+        monkeypatch.setattr(sys.modules["sentence_transformers"], "SentenceTransformer", failed_model)
+        with pytest.raises(RuntimeError, match="Temporary model"):
+            engine.load_semantic()
+        assert not engine.semantic_loaded
+        assert engine._semantic_mapping is None
+        monkeypatch.setattr(sys.modules["sentence_transformers"], "SentenceTransformer", FakeModel)
         hits = engine.search("semantic", "needle", limit=1)
+        assert FakeModel.devices[-1] == "cpu"
         assert "Needle appears here." in hits[0].snippet
         article_hits = engine.search("semantic", "needle", limit=2)
         assert len({hit.article_title for hit in article_hits}) == 2
+        assert engine.search("semantic", "needle", limit=1, offset=1) == article_hits[1:]
+        assert engine.search("semantic", "needle", offset=2) == []
         assert engine.search("semantic", "needle", limit=1, newspaper="Other") == []
+        assert engine.search("semantic", "needle", date_from="2099-01-01") == []
+        assert engine.search("semantic", "needle", date_to="1800-01-01") == []
+        output = io.StringIO()
+        run_stdio(engine, io.StringIO(json.dumps({
+            "mode": "semantic", "query": "needle", "limit": 1, "offset": 1,
+        }) + "\n"), output)
+        assert json.loads(output.getvalue())["hits"] == [article_hits[1].as_dict()]
+        source = engine.read_source(hits[0].document_id, position=hits[0].position)
+        assert "Needle appears here." in source.text
+        for invalid in ([[0.0, 0.0]], [[float("nan"), 1.0]], [[1.0]], [1.0, 0.0]):
+            monkeypatch.setattr(engine._semantic_model, "encode_query", lambda *_a, v=invalid, **_k: v)
+            with pytest.raises(ValueError, match="invalid query vector"):
+                engine.search("semantic", "needle")
+        assert engine.search("semantic", "needle", offset=10_000) == []
+        # An empty index must not call FAISS with k=0 or try to encode a query.
+        monkeypatch.setattr(engine, "_semantic_index", types.SimpleNamespace(ntotal=0))
+        assert engine.search("semantic", "needle") == []
     finally:
         engine.close()
+
+
+def test_semantic_cli_query_options() -> None:
+    args = _parser().parse_args(["search", "semantic", "topic", "--offset", "20", "--semantic-device", "cpu"])
+    assert args.offset == 20
+    assert args.semantic_device == "cpu"
+    assert _parser().parse_args(["stdio", "--semantic-device", "cuda"]).semantic_device == "cuda"

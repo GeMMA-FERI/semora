@@ -61,6 +61,7 @@ def run_stdio(engine: SearchEngine, input_stream: TextIO = sys.stdin, output_str
                 request["mode"],
                 request["query"],
                 limit=int(request.get("limit", 10)),
+                offset=int(request.get("offset", 0)),
                 before=int(request.get("before", 0)),
                 after=int(request.get("after", 0)),
                 context_lines=int(request.get("context_lines", 0)),
