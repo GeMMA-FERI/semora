@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
 from types import SimpleNamespace
 
@@ -133,17 +134,25 @@ def test_worker_cleanup_reaps_descendant():
     )
     try:
         child_pid = int(process.stdout.readline())
+        child = psutil.Process(child_pid)
     finally:
         stop_worker(process)
         process.stdout.close()
     assert process.poll() is not None
-    try:
-        status = psutil.Process(child_pid).status()
-    except psutil.NoSuchProcess:
-        # The OS may reap the descendant before or during the status query.
-        pass
-    else:
-        assert status == psutil.STATUS_ZOMBIE
+    # Waiting for the direct worker does not guarantee its descendants have
+    # finished exiting. Accept either terminal state or an already reaped PID.
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            if not child.is_running():  # Also detects PID reuse.
+                break
+            status = child.status()
+        except psutil.NoSuchProcess:
+            break
+        if status in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+            break
+        assert time.monotonic() < deadline, f"Descendant {child_pid} still has status {status!r}"
+        time.sleep(0.05)
 
 
 def test_run_report_and_failure(sample, tmp_path, monkeypatch):
