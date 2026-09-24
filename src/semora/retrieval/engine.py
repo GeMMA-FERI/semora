@@ -28,7 +28,17 @@ class SearchEngine:
         *,
         load_semantic: bool = False,
         semantic_device: str = "cpu",
+        semantic_rerank: bool = False,
+        semantic_candidates: int | None = None,
+        semantic_nprobe: int | None = None,
     ) -> None:
+        if semantic_candidates is not None and not 20 <= semantic_candidates <= 10_000:
+            raise ValueError("semantic_candidates must be between 20 and 10000.")
+        if semantic_nprobe is not None and not 1 <= semantic_nprobe <= 65_536:
+            raise ValueError("semantic_nprobe must be between 1 and 65536.")
+        self.semantic_rerank = semantic_rerank
+        self.semantic_candidates = semantic_candidates
+        self.semantic_nprobe = semantic_nprobe
         self.database = Database(database_path, read_only=True)
         self.semantic_dir = Path(semantic_dir).resolve()
         self.semantic_device = semantic_device
@@ -140,9 +150,12 @@ class SearchEngine:
             raise ValueError("FAISS index and semantic manifest have different dimensions.")
         faiss_config = manifest.get("faiss", {})
         if hasattr(index, "nprobe"):
-            index.nprobe = int(faiss_config.get("nprobe", 32))
+            index.nprobe = self.semantic_nprobe or int(faiss_config.get("nprobe", 32))
+            if index.nprobe > index.nlist:
+                raise ValueError("semantic_nprobe exceeds the index cluster count.")
         model_options: dict[str, Any] = {
-            "truncate_dim": int(manifest["dimensions"]), "device": self.semantic_device,
+            "truncate_dim": int(manifest["dimensions"]),
+            "device": self.semantic_device,
         }
         if manifest.get("model_revision") is not None:
             model_options["revision"] = manifest["model_revision"]
@@ -345,9 +358,7 @@ class SearchEngine:
         if self._active_profile is not None:
             self._active_profile["returned_hits"] = len(hits)
             self._active_profile["sqlite"] = self._sqlite_profile()
-            self._active_profile["timings_seconds"]["total"] = (
-                time.perf_counter() - search_started
-            )
+            self._active_profile["timings_seconds"]["total"] = time.perf_counter() - search_started
             self.last_profile = self._active_profile
             self._active_profile = None
         return hits
@@ -497,25 +508,15 @@ class SearchEngine:
         page_count = int(self.database.conn.execute("PRAGMA page_count").fetchone()[0])
         cache_setting = int(self.database.conn.execute("PRAGMA cache_size").fetchone()[0])
         mmap_size = int(self.database.conn.execute("PRAGMA mmap_size").fetchone()[0])
-        cache_bytes = (
-            abs(cache_setting) * 1024
-            if cache_setting < 0
-            else cache_setting * page_size
-        )
-        plans = [
-            step
-            for plan in profile["query_plans"].values()
-            for step in plan
-        ]
+        cache_bytes = abs(cache_setting) * 1024 if cache_setting < 0 else cache_setting * page_size
+        plans = [step for plan in profile["query_plans"].values() for step in plan]
         warnings = []
         if cache_bytes < 64 * 1024**2:
             warnings.append("SQLite page cache is below 64 MiB; random joins may repeatedly read from disk.")
         if mmap_size == 0:
             warnings.append("SQLite memory-mapped I/O is disabled.")
         if any("USE TEMP B-TREE FOR ORDER BY" in step for step in plans):
-            warnings.append(
-                "SQLite sorts all FTS matches by BM25 rank before LIMIT; common terms can be expensive."
-            )
+            warnings.append("SQLite sorts all FTS matches by BM25 rank before LIMIT; common terms can be expensive.")
         return {
             "database_size_bytes": page_size * page_count,
             "page_size_bytes": page_size,
@@ -604,6 +605,8 @@ class SearchEngine:
         if not np.isfinite(vector).all() or np.any(norms == 0):
             raise ValueError("Embedding model returned an invalid query vector.")
         vector /= norms
+        if self.semantic_rerank or self.semantic_candidates is not None:
+            return self._rank_semantic_candidates(vector, limit, offset, newspaper, date_from, date_to)
         wanted = offset + limit
         candidate_limit = min(maximum_candidates, wanted * 20)
         while True:
@@ -630,6 +633,50 @@ class SearchEngine:
             if candidate_limit >= maximum_candidates:
                 return results[offset:wanted]
             candidate_limit = min(maximum_candidates, candidate_limit * 2)
+
+    def _rank_semantic_candidates(self, vector, limit, offset, newspaper, date_from, date_to):
+        count = min(int(self._semantic_index.ntotal), self.semantic_candidates or 500)
+        if not count or offset >= count:
+            return []
+        scores, indices = self._semantic_index.search(vector, count)
+        ids = [int(index) for index in indices[0] if index >= 0]
+        chunks = self._semantic_chunk_id_map(ids)
+        rows = self._chunk_rows(list(chunks.values()))
+        eligible = {
+            index: rows[chunks[index]]
+            for index in ids
+            if index in chunks
+            and chunks[index] in rows
+            and _matches_filters(rows[chunks[index]], newspaper, date_from, date_to)
+        }
+        if self.semantic_rerank:
+            from semora.retrieval.semantic_rerank import rerank_candidates
+
+            ranked = rerank_candidates(self._semantic_mapping, self.semantic_dir, vector, list(eligible))
+        else:
+            ranked = sorted(
+                (
+                    (int(index), float(score))
+                    for index, score in zip(indices[0], scores[0], strict=True)
+                    if int(index) in eligible
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+        result, seen = [], set()
+        for index, score in ranked:
+            row = eligible[index]
+            article = str(row["article_id"])
+            if article not in seen:
+                seen.add(article)
+                result.append((row, score))
+        return result[offset : offset + limit]
+
+    def semantic_settings(self) -> dict:
+        return {
+            "rerank_enabled": self.semantic_rerank,
+            "candidates": self.semantic_candidates or (500 if self.semantic_rerank else DEFAULT_SEMANTIC_CANDIDATES),
+            "nprobe": int(getattr(self._semantic_index, "nprobe", self.semantic_nprobe or 32)),
+        }
 
     def _semantic_chunk_id_map(self, vector_ids: list[int]) -> dict[int, str]:
         if self._semantic_mapping is None or not vector_ids:
@@ -778,17 +825,12 @@ def _read_wrapped_source(
     target_sections = _wrap_source_line(lines[physical_line - 1], wrap_chars)
     if section > len(target_sections):
         raise ValueError(
-            f"position {position} exceeds physical line {physical_line}'s "
-            f"{len(target_sections)} wrapped sections."
+            f"position {position} exceeds physical line {physical_line}'s {len(target_sections)} wrapped sections."
         )
 
     anchor = (physical_line, section, target_sections[section - 1])
-    preceding = _adjacent_wrapped_sections(
-        lines, physical_line, section, wrap_chars, count=before, direction=-1
-    )
-    following = _adjacent_wrapped_sections(
-        lines, physical_line, section, wrap_chars, count=after, direction=1
-    )
+    preceding = _adjacent_wrapped_sections(lines, physical_line, section, wrap_chars, count=before, direction=-1)
+    following = _adjacent_wrapped_sections(lines, physical_line, section, wrap_chars, count=after, direction=1)
     selected = [anchor]
     used_bytes = len(_format_wrapped_section(anchor).encode("utf-8"))
     if used_bytes > max_bytes:
@@ -798,12 +840,8 @@ def _read_wrapped_source(
     truncated = False
     for distance in range(1, max(before, after) + 1):
         candidates = (
-            ("before", preceding[-distance])
-            if before_open and distance <= len(preceding)
-            else None,
-            ("after", following[distance - 1])
-            if after_open and distance <= len(following)
-            else None,
+            ("before", preceding[-distance]) if before_open and distance <= len(preceding) else None,
+            ("after", following[distance - 1]) if after_open and distance <= len(following) else None,
         )
         for candidate_entry in candidates:
             if candidate_entry is None:
