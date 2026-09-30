@@ -277,6 +277,7 @@ class SearchEngine:
         context_lines: int = 0,
         ignore_case: bool = False,
         newspaper: str | None = None,
+        newspapers: list[str] | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
         lemma_weight: float = 1.0,
@@ -285,6 +286,11 @@ class SearchEngine:
         source_wrap_chars: int = DEFAULT_SOURCE_WRAP_CHARS,
         profile: bool = False,
     ) -> list[SearchHit]:
+        if newspapers is not None:
+            if mode != "semantic" or newspaper is not None:
+                raise ValueError("newspapers is supported only for semantic search without newspaper.")
+            if not 1 <= len(newspapers) <= 100 or any(not isinstance(name, str) or not name.strip() or len(name) > 200 for name in newspapers):
+                raise ValueError("Select between 1 and 100 nonblank newspaper titles.")
         if limit < 1 or offset < 0 or before < 0 or after < 0 or context_lines < 0:
             raise ValueError("limit must be positive; offset and context values must be non-negative.")
         if lemma_weight < 0:
@@ -337,7 +343,7 @@ class SearchEngine:
                 date_to=date_to,
             )
         elif mode == "semantic":
-            matches = self._search_semantic(query, limit, newspaper, date_from, date_to, offset)
+            matches = self._search_semantic(query, limit, newspapers if newspapers is not None else newspaper, date_from, date_to, offset)
         else:
             raise ValueError(f"Unknown search mode: {mode}")
         self._record_profile_time("retrieval", retrieval_started)
@@ -577,7 +583,7 @@ class SearchEngine:
         self,
         query: str,
         limit: int,
-        newspaper: str | None,
+        newspaper: str | list[str] | None,
         date_from: str | None,
         date_to: str | None,
         offset: int = 0,
@@ -1019,11 +1025,12 @@ def _read_faiss_index(faiss: Any, path: Path) -> Any:
 
 def _matches_filters(
     row: Any,
-    newspaper: str | None,
+    newspaper: str | list[str] | None,
     date_from: str | None,
     date_to: str | None,
 ) -> bool:
-    if newspaper is not None and newspaper not in {row["source"], row["newspaper_title"]}:
+    titles = [newspaper] if isinstance(newspaper, str) else newspaper
+    if titles is not None and not any(title in {row["source"], row["newspaper_title"]} for title in titles):
         return False
     date = row["date"]
     if date_from is not None and (date is None or date < date_from):

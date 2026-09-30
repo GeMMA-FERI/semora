@@ -619,6 +619,10 @@ def test_semantic_index_is_persistent_and_uses_manifest_model(tmp_path: Path, mo
         assert engine.search("semantic", "needle", limit=1, offset=1) == article_hits[1:]
         assert engine.search("semantic", "needle", offset=2) == []
         assert engine.search("semantic", "needle", limit=1, newspaper="Other") == []
+        assert engine.search("semantic", "needle", limit=2, newspapers=["Other", article_hits[0].newspaper]) == article_hits
+        assert engine.search("semantic", "needle", newspapers=["Other", "Missing"]) == []
+        with pytest.raises(ValueError):
+            engine.search("semantic", "needle", newspapers=[])
         assert engine.search("semantic", "needle", date_from="2099-01-01") == []
         assert engine.search("semantic", "needle", date_to="1800-01-01") == []
         output = io.StringIO()

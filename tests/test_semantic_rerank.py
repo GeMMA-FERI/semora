@@ -88,3 +88,23 @@ def test_filter_then_rerank_then_article_deduplication(vectors):
 def test_invalid_settings_rejected_before_opening_database(options):
     with pytest.raises(ValueError):
         SearchEngine("does-not-exist", **options)
+
+
+@pytest.mark.parametrize("rerank", [True, False])
+def test_multiple_titles_filter_one_ranked_candidate_set(vectors, rerank):
+    db, root = vectors
+    engine = object.__new__(SearchEngine)
+    engine.semantic_rerank = rerank
+    engine.semantic_candidates = 500
+    engine.semantic_dir = root
+    engine._semantic_mapping = db
+    engine._semantic_index = Mock(ntotal=3)
+    engine._semantic_index.search.return_value = (np.array([[0.9, 0.8, 0.7]]), np.array([[0, 2, 1]]))
+    engine._semantic_chunk_id_map = lambda ids: {i: str(i) for i in ids}
+    engine._chunk_rows = lambda ids: {
+        str(i): {"article_id": str(i), "date": "1930-01-01", "source": ["Jutro", "Excluded", "Slovenec"][i], "newspaper_title": None}
+        for i in range(3)
+    }
+    results = engine._rank_semantic_candidates(np.array([[1, 0]]), 20, 0, ["Jutro", "Slovenec"], "1920-01-01", "1940-01-01")
+    assert [row["source"] for row, _ in results] == ["Jutro", "Slovenec"]
+    engine._semantic_index.search.assert_called_once()
