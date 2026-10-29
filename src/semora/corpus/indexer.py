@@ -346,12 +346,13 @@ def _token_chunks(
     return result
 
 
-def _load_tokenizer(model_id: str) -> Any:
+def _load_tokenizer(model_id: str, *, revision: str | None = None) -> Any:
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
         raise RuntimeError("Corpus ingestion requires the 'chunking' extra.") from exc
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    options = {"revision": revision} if revision is not None else {}
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, **options)
     if not getattr(tokenizer, "is_fast", False):
         raise RuntimeError(f"Tokenizer must support offset mappings: {model_id}")
     return tokenizer

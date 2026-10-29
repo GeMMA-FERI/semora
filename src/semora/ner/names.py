@@ -10,6 +10,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from semora.pipeline.guards import reject_pipeline_batches
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage.connection import open_connection
 
@@ -23,6 +24,7 @@ def normalize_name(value):
 def build_entity_names(root, run_id="classla-sl", batch_size=10000):
     """Build off to the side; expose only a complete index via an atomic manifest."""
     root = Path(root).resolve()
+    reject_pipeline_batches(root / "indexes" / "semora.sqlite")
     folder = root / "indexes" / "entities"
     folder.mkdir(parents=True, exist_ok=True)
     if batch_size < 1:

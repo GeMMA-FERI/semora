@@ -15,6 +15,7 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
+from semora.pipeline.guards import reject_pipeline_batches
 from semora.retrieval.semantic_faiss import FaissBuildConfig, build_faiss_index
 from semora.retrieval.semantic_vectors import (
     DEFAULT_DIMENSIONS,
@@ -136,6 +137,7 @@ def build_bm25_index(
     rebuild: bool = False,
 ) -> int:
     """Build or resume the contentless BM25 index up to a total article target."""
+    reject_pipeline_batches(database_path)
     if max_articles is not None and max_articles < 0:
         raise ValueError("max_articles must be non-negative.")
     if batch_size <= 0:
@@ -296,6 +298,7 @@ def build_lemma_index(
     lemmatizer: Lemmatizer | None = None,
 ) -> LemmaIndexStats:
     """Lemmatize and index each article present in the surface BM25 index."""
+    reject_pipeline_batches(database_path)
     if max_articles is not None and max_articles < 0:
         raise ValueError("max_articles must be non-negative.")
     if batch_articles <= 0:
@@ -885,6 +888,7 @@ def build_semantic_index(
     rebuild_faiss: bool = False,
 ) -> int:
     """Build resumable vector shards, a FAISS index, or both stages."""
+    reject_pipeline_batches(database_path)
     if stage not in {"vectors", "faiss", "all"}:
         raise ValueError("stage must be 'vectors', 'faiss', or 'all'.")
     database = Database(database_path)

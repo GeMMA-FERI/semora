@@ -171,6 +171,11 @@ python -m semora.projection.projector --help
 
 Additional usage notes are available in [`docs/`](docs/).
 
+For recurring imports, see [additive newspaper indexing](docs/additive-indexing.md).
+The first milestone provides manifest planning and additive corpus ingestion;
+baseline adoption and additive retrieval stages are still required before a
+production import.
+
 For offline named-entity model comparisons, see the
 [NER benchmark guide](docs/ner-benchmark.md). It includes reusable article samples,
 CLASSLA and Transformers adapters, isolated batch-size sweeps, timing summaries,

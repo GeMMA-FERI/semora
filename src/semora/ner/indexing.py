@@ -8,6 +8,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from semora.pipeline.guards import reject_pipeline_batches
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
@@ -29,6 +30,7 @@ def build_ner_index(
     model is an injected adapter for applications/tests; CLI loads the shared adapter.
     Only completed batches are skipped. A failed batch is recomputed on resume.
     """
+    reject_pipeline_batches(database_path)
     path = Path(database_path).resolve(strict=True)
     if not run_id.strip():
         raise ValueError("NER run ID cannot be empty")

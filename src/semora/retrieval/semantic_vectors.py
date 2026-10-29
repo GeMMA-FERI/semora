@@ -12,6 +12,7 @@ from typing import Any
 from tqdm import tqdm
 
 from semora.corpus import DEFAULT_MODEL_ID
+from semora.pipeline.guards import reject_pipeline_batches
 from semora.retrieval.semantic_diagnostics import SemanticVectorJournal
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.retrieval.semantic_store import (
@@ -49,6 +50,7 @@ def build_semantic_vectors(
     model: Any = None,
 ) -> SemanticVectorStats:
     """Embed valid chunks into atomic float16 shards and resume from checkpoints."""
+    reject_pipeline_batches(database_path)
     with SemanticBuildLock(Path(output_dir).resolve() / ".vectors.lock", "vector"):
         with SemanticVectorJournal(output_dir) as journal:
             journal.write(
