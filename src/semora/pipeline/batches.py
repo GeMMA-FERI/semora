@@ -255,8 +255,10 @@ def run_batch(
                     if (
                         not _has_table(existing, "pipeline_issue_stages")
                         or existing.execute(
-                            "SELECT 1 FROM articles a WHERE NOT EXISTS (SELECT 1 FROM pipeline_issue_stages s "
-                            "WHERE s.newspaper_id=a.newspaper_id AND s.stage='articles') LIMIT 1"
+                        "SELECT 1 FROM newspapers n WHERE EXISTS "
+                        "(SELECT 1 FROM articles a WHERE a.newspaper_id=n.newspaper_id) "
+                        "AND NOT EXISTS (SELECT 1 FROM pipeline_issue_stages s "
+                        "WHERE s.newspaper_id=n.newspaper_id AND s.stage='articles') LIMIT 1"
                         ).fetchone()
                     ):
                         raise ValueError(
@@ -275,6 +277,8 @@ def run_batch(
                             raise ValueError(
                                 f"Existing {stage} configuration differs; explicit processing migration is required."
                             )
+                if "chunks" in stages:
+                    _check_legacy_chunking(existing, config["chunking"])
         database = Database(target)
         try:
             database.initialize()
@@ -377,6 +381,22 @@ def _store_issue(
             source_identifier.casefold() if source_identifier else None,
         ),
     )
+
+
+def _check_legacy_chunking(conn: sqlite3.Connection, requested: dict) -> None:
+    """An adopted article baseline must not conceal incompatible old chunks."""
+    for row in conn.execute(
+        "SELECT DISTINCT r.method,r.config_json FROM chunking_runs r "
+        "WHERE EXISTS (SELECT 1 FROM chunks c WHERE c.chunking_run_id=r.chunking_run_id)"
+    ):
+        settings = json.loads(row["config_json"] or "{}")
+        if not isinstance(settings, dict):
+            raise ValueError("Historical chunk configuration is invalid; explicit migration is required.")
+        settings.setdefault("tokenizer_revision", None)
+        if row["method"] != "token" or settings != requested:
+            raise ValueError(
+                "Historical chunk configuration differs; audit tokenizer compatibility before adding chunks."
+            )
 
 
 def _stage(conn: sqlite3.Connection, newspaper_id: str, stage: str) -> sqlite3.Row | None:
@@ -509,6 +529,8 @@ def _chunks(conn: sqlite3.Connection, newspaper_id: str, config: dict, tokenizer
 def batch_status(database_path: str | Path, batch_id: str) -> dict:
     """Report committed ingestion stages, without claiming retrieval readiness."""
     with closing(open_connection(database_path, read_only=True)) as conn:
+        if not _has_table(conn, "pipeline_batches"):
+            raise ValueError(f"Unknown batch: {batch_id}; this archive has no additive batch ledger.")
         row = conn.execute("SELECT * FROM pipeline_batches WHERE batch_id=?", (batch_id,)).fetchone()
         if row is None:
             raise ValueError(f"Unknown batch: {batch_id}")
@@ -520,12 +542,35 @@ def batch_status(database_path: str | Path, batch_id: str) -> dict:
             ).fetchone()[0]
             for stage in ("articles", "chunks")
         }
+        eligible = conn.execute(
+            "SELECT COUNT(*) FROM articles a JOIN pipeline_batch_issues b USING(newspaper_id) "
+            "WHERE b.batch_id=? AND a.is_valid=1",
+            (batch_id,),
+        ).fetchone()[0]
+        lexical = {}
+        for stage in ("surface", "lemma"):
+            recorded = (
+                conn.execute(
+                    "SELECT COUNT(*) FROM pipeline_lexical_state s JOIN articles a USING(article_id) "
+                    "JOIN pipeline_batch_issues b USING(newspaper_id) "
+                    "WHERE b.batch_id=? AND s.stage=? AND a.is_valid=1",
+                    (batch_id, stage),
+                ).fetchone()[0]
+                if _has_table(conn, "pipeline_lexical_state")
+                else 0
+            )
+            lexical[stage] = {
+                "eligible_articles": eligible,
+                "recorded_articles": recorded,
+                "pending_articles": eligible - recorded,
+            }
         return {
             **dict(row),
             "issues": conn.execute(
                 "SELECT COUNT(*) FROM pipeline_batch_issues WHERE batch_id=?", (batch_id,)
             ).fetchone()[0],
             "stages": stages,
+            "lexical": lexical,
             "ingestion_complete": row["state"] == "ingested"
             and all(count == row["issue_count"] for count in stages.values()),
             "retrieval_ready": False,

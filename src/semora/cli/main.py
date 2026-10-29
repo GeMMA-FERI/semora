@@ -38,40 +38,9 @@ def main() -> None:
     semantic_dir = indexes_dir / "semantic"
 
     if args.command == "pipeline":
-        from semora.pipeline.batches import batch_status, plan_batch, run_batch
-        from semora.pipeline.manifest import load_manifest
+        from semora.pipeline.cli import run_pipeline_command
 
-        target = Path(args.database).resolve() if args.database else database_path
-        if args.pipeline_command == "status":
-            _print_json(batch_status(target, args.batch))
-            return
-        manifest = load_manifest(args.manifest)
-        input_root = Path(args.input_root).resolve()
-        def progress(event: dict) -> None:
-            print(json.dumps(event), file=sys.stderr, flush=True)
-
-        if args.pipeline_command == "plan":
-            _print_json(plan_batch(manifest, input_root, target, progress=progress))
-            return
-        if not args.maintenance:
-            raise ValueError(
-                "Stop retrieval readers and index writers, then pass --maintenance. "
-                "This milestone ingests corpus data only; retrieval indexes are not additive yet."
-            )
-        stages = ("newspapers", "articles", "chunks")
-        _print_json(
-            run_batch(
-                manifest,
-                input_root,
-                target,
-                stages=stages[: stages.index(args.through) + 1],
-                model_id=args.model_id,
-                token_count=args.token_count,
-                token_overlap=args.token_overlap,
-                tokenizer_revision=args.tokenizer_revision,
-                progress=progress,
-            )
-        )
+        run_pipeline_command(args, database_path)
         return
 
     if args.command == "extensions":
@@ -310,29 +279,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--root",
         default=".",
-        help="Repository root containing ./corpus and ./indexes (default: current directory).",
+        help="Data root containing ./corpus and ./indexes (default: current directory).",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    pipeline = commands.add_parser("pipeline", help="Plan and ingest additive batches (not retrieval-ready yet).")
-    pipeline_commands = pipeline.add_subparsers(dest="pipeline_command", required=True)
-    for name in ("plan", "run", "status"):
-        command = pipeline_commands.add_parser(name)
-        command.add_argument("--database", help="Explicit SQLite path, independent of --root.")
-        if name == "status":
-            command.add_argument("--batch", required=True)
-            continue
-        command.add_argument("--manifest", required=True, help="Portable semora.batch.v1 JSON manifest.")
-        command.add_argument("--input-root", required=True, help="Root resolving manifest input file paths.")
-        if name == "run":
-            command.add_argument(
-                "--maintenance", action="store_true", help="Confirm readers and old writers are stopped."
-            )
-            command.add_argument("--through", choices=("newspapers", "articles", "chunks"), default="chunks")
-            command.add_argument("--model-id", default=DEFAULT_MODEL_ID)
-            command.add_argument("--tokenizer-revision", help="Pin the tokenizer revision for reproducible chunks.")
-            command.add_argument("--token-count", type=int, default=DEFAULT_TOKEN_COUNT)
-            command.add_argument("--token-overlap", type=int, default=DEFAULT_TOKEN_OVERLAP)
+    from semora.pipeline.cli import add_pipeline_parser
+
+    add_pipeline_parser(commands)
 
     ingest = commands.add_parser("ingest", help="Build indexes/semora.sqlite from corpus Markdown and metadata.")
     ingest.add_argument(

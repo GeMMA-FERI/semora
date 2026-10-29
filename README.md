@@ -172,9 +172,9 @@ python -m semora.projection.projector --help
 Additional usage notes are available in [`docs/`](docs/).
 
 For recurring imports, see [additive newspaper indexing](docs/additive-indexing.md).
-The first milestone provides manifest planning and additive corpus ingestion;
-baseline adoption and additive retrieval stages are still required before a
-production import.
+The pipeline supports manifest planning, historical baseline audit/adoption and
+additive corpus/surface/lemma indexing. Semantic/entity updates, reader
+publication and Linux/Docker packaging remain in progress.
 
 For offline named-entity model comparisons, see the
 [NER benchmark guide](docs/ner-benchmark.md). It includes reusable article samples,
