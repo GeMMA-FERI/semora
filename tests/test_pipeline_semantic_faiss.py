@@ -170,6 +170,35 @@ def test_checkpoint_pointer_fault_resumes_exact_ids_once(tmp_path: Path, monkeyp
     assert len(list((directory / "generations").glob("[0-9a-f]*/manifest.json"))) == 1
 
 
+def test_completed_private_generation_recovers_after_final_rename_failure(tmp_path: Path, monkeypatch) -> None:
+    database, directory = vectors(tmp_path)
+    rename = semantic_faiss.os.rename
+    faulted = False
+
+    def interrupted(source, target):
+        nonlocal faulted
+        if Path(source).name.startswith(".build-") and not faulted:
+            faulted = True
+            raise OSError("generation rename interrupted")
+        return rename(source, target)
+
+    monkeypatch.setattr(semantic_faiss.os, "rename", interrupted)
+    with pytest.raises(OSError, match="generation rename interrupted"):
+        build(database, directory)
+    private = next((directory / "generations").glob(".build-*"))
+    assert (private / "manifest.json").is_file() and (private / "index.faiss").is_file()
+
+    monkeypatch.setattr(semantic_faiss.os, "rename", rename)
+    monkeypatch.setattr(
+        semantic_faiss, "_new_index", lambda *_a, **_k: pytest.fail("Must reuse complete private index")
+    )
+    result = build(database, directory)
+
+    assert result["added_vectors"] == 0
+    assert ids(read_index(result)) == list(range(result["chunks"]))
+    assert not private.exists()
+
+
 def test_vector_shard_checksum_tampering_stops_before_generation(tmp_path: Path) -> None:
     database, directory = vectors(tmp_path)
     shard = next((directory / "vectors").glob("*.f16"))

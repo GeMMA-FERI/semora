@@ -235,7 +235,14 @@ def _cleanup_checkpoints(build: Path, *, keep: str | None = None) -> None:
 
 
 def _load_generation(
-    faiss, directory: Path, store: dict, shards: list[SemanticShard], config: FaissBuildConfig, corpus_id: str
+    faiss,
+    directory: Path,
+    store: dict,
+    shards: list[SemanticShard],
+    config: FaissBuildConfig,
+    corpus_id: str,
+    *,
+    private_build: bool = False,
 ):
     manifest = json.loads(_child(directory, "manifest.json").read_text(encoding="utf-8"))
     if (
@@ -254,7 +261,8 @@ def _load_generation(
     if manifest["vector_fingerprint"] != _ledger_hash(store, prefix):
         raise ValueError("FAISS generation vector prefix changed.")
     expected = _digest({"corpus_id": corpus_id, "vectors": manifest["vector_fingerprint"], "faiss": manifest["faiss"]})
-    if manifest.get("generation") != expected or directory.name != expected:
+    expected_directory = f".build-{expected}" if private_build else expected
+    if manifest.get("generation") != expected or directory.name != expected_directory:
         raise ValueError("FAISS generation identity is inconsistent.")
     path = _child(directory, "index.faiss")
     if _file_hash(path) != manifest["index_sha256"]:
@@ -329,6 +337,25 @@ def build_semantic_generation(
             }
         build.mkdir(exist_ok=True)
         pointer = build / "checkpoint.json"
+        # A failed final rename leaves a fully written private generation. Verify
+        # its checksum, exact IDs and current ledger before retrying publication;
+        # otherwise a retry could retrain/replay millions of unchanged vectors.
+        if (build / "manifest.json").exists() and (build / "index.faiss").exists():
+            _, completed = _load_generation(faiss, build, store, shards, active, corpus_id, private_build=True)
+            if completed["chunks"] != vectors:
+                raise ValueError("Private FAISS generation does not cover the current vector ledger.")
+            pointer.unlink(missing_ok=True)
+            _cleanup_checkpoints(build)
+            os.rename(build, final)
+            _sync_directory(generations)
+            return {
+                "generation": fingerprint,
+                "generation_dir": str(final),
+                "chunks": vectors,
+                "added_vectors": 0,
+                "index_complete": True,
+                "retrieval_ready": False,
+            }
         start = 0
         if pointer.exists():
             saved = json.loads(_child(build, "checkpoint.json").read_text(encoding="utf-8"))
