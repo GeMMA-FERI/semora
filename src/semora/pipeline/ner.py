@@ -14,6 +14,7 @@ from typing import Any
 from semora.ner.adapters import load_adapter
 from semora.ner.staging import iter_predictions
 from semora.ner.storage import save_batch
+from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage.connection import open_connection
 
@@ -219,6 +220,8 @@ def index_batch_ner(
             elif recorded is not None and adapter in {"classla", "transformers"} and recorded["adapter"] != adapter:
                 raise ValueError("NER adapter changed; use the matching adapter or a different run ID.")
             eligible, initial = _coverage(connection, batch_id, run_id)
+            if eligible > initial:
+                invalidate_publication(path)
             added = mentions = 0
             cursor = ""
             upper = connection.execute(

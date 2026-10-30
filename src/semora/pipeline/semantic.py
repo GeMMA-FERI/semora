@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from semora.corpus import DEFAULT_MODEL_ID
+from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.retrieval.semantic_vectors import _load_embedding_model
 from semora.storage.connection import open_connection
@@ -530,6 +531,7 @@ def index_batch_vectors(
             corpus_identity = _corpus_identity(corpus)
         config = vector_config(model_id, model_revision, dimensions, chunking)
         _store_preflight(mapping, config, corpus_identity, source)
+        invalidate_publication(source)
         directory.mkdir(parents=True, exist_ok=True)
         vectors = directory / "vectors"
         vectors.mkdir(exist_ok=True)

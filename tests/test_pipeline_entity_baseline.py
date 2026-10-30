@@ -194,6 +194,8 @@ def test_additive_dictionary_updates_only_new_memberships_and_retries(legacy):
     _batch(source, "batch-a", "issue-a", "Ana arrives.")
 
     first = index_batch_entities(source, "batch-a", dictionary.parent)
+    with closing(sqlite3.connect(dictionary)) as conn:
+        token = conn.execute("SELECT advancement_token FROM pipeline_entity_profile").fetchone()[0]
     second = index_batch_entities(source, "batch-a", dictionary.parent)
 
     assert first["complete"] and first["added_memberships"] == 1
@@ -202,6 +204,7 @@ def test_additive_dictionary_updates_only_new_memberships_and_retries(legacy):
         assert conn.execute("SELECT article_count FROM names WHERE normalized_name='ana'").fetchone()[0] == 2
         assert conn.execute("SELECT rank FROM name_spellfix_vocab WHERE word='ana'").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM pipeline_entity_articles").fetchone()[0] == 1
+        assert conn.execute("SELECT advancement_token FROM pipeline_entity_profile").fetchone()[0] == token
 
 
 def test_new_unicode_name_and_zero_name_article_are_checkpointed(legacy):
@@ -255,6 +258,57 @@ def test_dictionary_binding_rejects_wrong_corpus_identity(legacy):
 
     with pytest.raises(ValueError, match="not adopted for this corpus"):
         index_batch_entities(source, "batch-a", dictionary.parent)
+
+
+def test_restored_older_corpus_with_same_uuid_cannot_extend_newer_dictionary(legacy, tmp_path):
+    source, dictionary = legacy
+    adopt_ner_baseline(source)
+    adopt_entity_baseline(source, dictionary.parent)
+    _batch(source, "batch-a", "issue-a", "Ana arrives.")
+    backup = tmp_path / "older.sqlite"
+    with closing(sqlite3.connect(source)) as original, closing(sqlite3.connect(backup)) as saved:
+        original.backup(saved)
+
+    assert index_batch_entities(source, "batch-a", dictionary.parent)["added_memberships"] == 1
+    with closing(sqlite3.connect(backup)) as saved, closing(sqlite3.connect(source)) as restored:
+        saved.backup(restored)
+    _batch(source, "batch-b", "issue-b", "Zürich works.")
+
+    with pytest.raises(ValueError, match="advancement tokens differ"):
+        index_batch_entities(source, "batch-b", dictionary.parent)
+    with closing(sqlite3.connect(dictionary)) as conn:
+        assert conn.execute("SELECT 1 FROM names WHERE normalized_name='zürich'").fetchone() is None
+
+
+def test_interrupted_finalization_can_reconcile_committed_dictionary_checkpoint(legacy):
+    source, dictionary = legacy
+    adopt_ner_baseline(source)
+    adopt_entity_baseline(source, dictionary.parent)
+    _batch(source, "batch-a", "issue-a", "Ana arrives.")
+    with closing(sqlite3.connect(source)) as conn:
+        old_token = conn.execute(
+            "SELECT advancement_token FROM pipeline_entity_bindings WHERE ner_run_id='classla-sl'"
+        ).fetchone()[0]
+    assert index_batch_entities(source, "batch-a", dictionary.parent)["added_memberships"] == 1
+    with closing(sqlite3.connect(dictionary)) as conn:
+        new_token = conn.execute(
+            "SELECT advancement_token FROM pipeline_entity_profile WHERE profile_id=1"
+        ).fetchone()[0]
+    with closing(sqlite3.connect(source)) as conn, conn:
+        conn.execute(
+            "UPDATE pipeline_entity_bindings SET advancement_token=?,pending_token=? "
+            "WHERE ner_run_id='classla-sl'", (old_token, new_token),
+        )
+
+    result = index_batch_entities(source, "batch-a", dictionary.parent)
+    assert result["added_articles"] == result["added_memberships"] == 0
+    with closing(sqlite3.connect(source)) as conn, closing(sqlite3.connect(dictionary)) as target:
+        assert conn.execute(
+            "SELECT advancement_token,pending_token FROM pipeline_entity_bindings "
+            "WHERE ner_run_id='classla-sl'"
+        ).fetchone() == (
+            target.execute("SELECT advancement_token FROM pipeline_entity_profile").fetchone()[0], None
+        )
 
 
 def test_overlapping_batch_registers_existing_dictionary_pairs_without_incrementing_counts(legacy):

@@ -18,6 +18,7 @@ from semora.corpus import indexer
 from semora.corpus.spans import LineMap, SourceArticle, split_articles
 from semora.pipeline.identities import identity_owners, metadata_identifiers, register_identity
 from semora.pipeline.manifest import BatchIssue, BatchManifest, read_issue
+from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
@@ -288,6 +289,7 @@ def run_batch(
             ).fetchone()
             if saved and saved[0] != encoded:
                 raise ValueError("Batch processing configuration changed; resume with the original configuration.")
+            invalidate_publication(target)
             with conn:
                 conn.execute(
                     "INSERT INTO pipeline_batches(batch_id,manifest_fingerprint,config_json,issue_count,state) "

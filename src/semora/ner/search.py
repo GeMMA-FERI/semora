@@ -1,5 +1,6 @@
 """Bounded spellfix discovery and keyset-paged source lookup."""
 
+import hashlib
 import json
 import sqlite3
 from datetime import date
@@ -13,19 +14,44 @@ class EntitySearch:
     def __init__(self, engine, root):
         self.engine = engine
         root = Path(root)
-        manifest_path = root / "indexes" / "entities" / "manifest.json"
+        manifest_path = root / "manifest.json"
         if not manifest_path.exists():
             raise ValueError("Entity index is not built. Run semora index entities after NER extraction.")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.generation = manifest["generation"]
-        if len(self.generation) != 32 or any(c not in "0123456789abcdef" for c in self.generation):
+        raw = manifest_path.read_bytes()
+        manifest = json.loads(raw.decode("utf-8"))
+        legacy_generation = manifest["generation"]
+        if len(legacy_generation) != 32 or any(c not in "0123456789abcdef" for c in legacy_generation):
             raise ValueError("Invalid entity index generation")
+        publication = engine.publication
+        if publication is not None and (
+            legacy_generation != publication["entities"]["generation"]
+            or hashlib.sha256(raw).hexdigest() != publication["entities"]["manifest_sha256"]
+            or manifest["ner_run_id"] != publication["entities"]["ner_run_id"]
+        ):
+            raise ValueError("Entity dictionary differs from the serving publication.")
+        self.generation = publication["publication_id"] if publication is not None else legacy_generation
         self.run_id = manifest["ner_run_id"]
-        path = manifest_path.parent / f"{self.generation}.sqlite"
+        path = manifest_path.parent / f"{legacy_generation}.sqlite"
+        if path.is_symlink() or not path.resolve(strict=True).is_relative_to(manifest_path.parent.resolve()):
+            raise ValueError("Entity dictionary file escapes its artifact root.")
         self.connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         self.connection.row_factory = sqlite3.Row
         try:
-            load_spellfix(self.connection, extension_path(root))
+            if publication is not None:
+                binding = engine.database.conn.execute(
+                    "SELECT advancement_token,pending_token FROM pipeline_entity_bindings "
+                    "WHERE ner_run_id=? AND corpus_id=? AND generation=?",
+                    (self.run_id, publication["corpus_id"], legacy_generation),
+                ).fetchone()
+                profile = self.connection.execute(
+                    "SELECT advancement_token FROM pipeline_entity_profile WHERE profile_id=1"
+                ).fetchone()
+                if (
+                    binding is None or profile is None or binding["pending_token"] is not None
+                    or binding["advancement_token"] != profile["advancement_token"]
+                ):
+                    raise ValueError("Entity dictionary advancement differs from the corpus.")
+            load_spellfix(self.connection, extension_path(Path(engine.database.path).resolve().parent.parent))
             self.connection.execute("ATTACH DATABASE ? AS corpus", (
                 Path(engine.database.path).resolve().as_uri() + "?mode=ro",))
             self.connection.execute("PRAGMA query_only=ON")

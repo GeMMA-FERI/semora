@@ -11,6 +11,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
@@ -290,6 +291,8 @@ def index_batch_lexical(
             database.initialize()
             connection = database.conn
             eligible, initial = _validate_existing(connection, batch_id, stage, config)
+            if eligible > initial:
+                invalidate_publication(path)
             added = 0
             cursor = ""
             registered = False

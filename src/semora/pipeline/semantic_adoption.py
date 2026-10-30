@@ -48,6 +48,8 @@ def adopt_semantic_baseline(
         corpus = Database(source)
         try:
             corpus.initialize()
+            from semora.pipeline.publication_state import invalidate_publication
+            invalidate_publication(source)
             with corpus.conn:
                 corpus.conn.execute("BEGIN IMMEDIATE")
                 corpus_id = corpus.conn.execute(

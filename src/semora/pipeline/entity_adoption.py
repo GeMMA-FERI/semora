@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from contextlib import ExitStack, closing
 from pathlib import Path
 
@@ -49,16 +50,34 @@ def adopt_entity_baseline(
                 if adopted is None and config.get("format") != "semora.pipeline.ner.v1":
                     raise ValueError("Audit and adopt the historical NER run before dictionary adoption.")
 
-                _, dictionary, manifest_hash = _manifest(root, run_id)
+                manifest, dictionary, manifest_hash = _manifest(root, run_id)
                 if dictionary.samefile(source):
                     raise ValueError("Dictionary cannot alias the corpus database.")
+                corpus.execute("""
+                    CREATE TABLE IF NOT EXISTS pipeline_entity_bindings (
+                        ner_run_id TEXT PRIMARY KEY,
+                        corpus_id TEXT NOT NULL,
+                        generation TEXT NOT NULL,
+                        advancement_token TEXT NOT NULL,
+                        pending_token TEXT
+                    )
+                """)
+                binding = corpus.execute(
+                    "SELECT * FROM pipeline_entity_bindings WHERE ner_run_id=?", (run_id,)
+                ).fetchone()
+                if binding is not None and (
+                    binding["corpus_id"] != identity[0]
+                    or binding["generation"] != manifest["generation"]
+                    or binding["pending_token"] is not None
+                ):
+                    raise ValueError("Corpus entity binding differs or has an unfinished checkpoint.")
                 with closing(open_connection(dictionary, read_only=True)) as recorded:
                     has_profile = recorded.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_entity_profile'"
                     ).fetchone()
                     if has_profile:
                         previous = recorded.execute(
-                            "SELECT corpus_id,ner_run_id,normalization,evidence_json "
+                            "SELECT corpus_id,ner_run_id,normalization,advancement_token,evidence_json "
                             "FROM pipeline_entity_profile WHERE profile_id=1"
                         ).fetchone()
                         if previous is None or (
@@ -70,6 +89,8 @@ def adopt_entity_baseline(
                         evidence = json.loads(previous["evidence_json"])
                         if evidence["manifest_sha256"] != manifest_hash:
                             raise ValueError("Entity manifest changed after dictionary adoption.")
+                        if binding is None or binding["advancement_token"] != previous["advancement_token"]:
+                            raise ValueError("Corpus and entity dictionary advancement tokens differ.")
                         return {**evidence, "adoption": {"already_adopted": True, "corpus_id": identity[0]}}
 
                 report = audit_entity_baseline(
@@ -81,6 +102,13 @@ def adopt_entity_baseline(
                 )
                 if not report["eligible"] or not report["complete"]:
                     raise ValueError("Entity baseline is incomplete or invalid; review the read-only audit report.")
+                token = binding["advancement_token"] if binding is not None else uuid.uuid4().hex
+                if binding is None:
+                    corpus.execute(
+                        "INSERT INTO pipeline_entity_bindings VALUES (?,?,?,?,NULL)",
+                        (run_id, identity[0], manifest["generation"], token),
+                    )
+                corpus.execute("COMMIT")
                 with closing(open_connection(dictionary)) as target:
                     target.execute("BEGIN IMMEDIATE")
                     try:
@@ -94,6 +122,7 @@ def adopt_entity_baseline(
                                 corpus_id TEXT NOT NULL,
                                 ner_run_id TEXT NOT NULL,
                                 normalization TEXT NOT NULL,
+                                advancement_token TEXT NOT NULL,
                                 audit_fingerprint TEXT NOT NULL,
                                 evidence_json TEXT NOT NULL
                             )
@@ -112,11 +141,12 @@ def adopt_entity_baseline(
                             "CREATE INDEX pipeline_entity_articles_lookup ON entity_articles(article_id,entity_id)"
                         )
                         target.execute(
-                            "INSERT INTO pipeline_entity_profile VALUES (1,?,?,?,?,?)",
+                            "INSERT INTO pipeline_entity_profile VALUES (1,?,?,?,?,?,?)",
                             (
                                 identity[0],
                                 run_id,
                                 NORMALIZATION,
+                                token,
                                 report["evidence_fingerprint"],
                                 json.dumps(report, ensure_ascii=False, sort_keys=True, allow_nan=False),
                             ),
@@ -128,4 +158,5 @@ def adopt_entity_baseline(
                         raise
                 return {**report, "adoption": {"already_adopted": False, "corpus_id": identity[0]}}
             finally:
-                corpus.execute("ROLLBACK")
+                if corpus.in_transaction:
+                    corpus.execute("ROLLBACK")

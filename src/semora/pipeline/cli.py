@@ -125,6 +125,21 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--batch", required=True)
             command.add_argument("--batch-articles", type=int, default=1000)
 
+    publication = operations.add_parser("publication", help="Audit a complete private serving revision.")
+    _add_io(publication)
+    publication.add_argument("--batch", required=True, help="Registered ingested batch ID to certify.")
+    publication.add_argument("--semantic-dir", help="Semantic artifact root; default: <database parent>/semantic.")
+    publication.add_argument(
+        "--semantic-generation", required=True, help="Exact 64-character private FAISS generation ID."
+    )
+    publication.add_argument("--entity-dir", help="Entity dictionary root; default: <database parent>/entities.")
+    publication.add_argument("--run-id", default="classla-sl", help="NER run associated with the dictionary.")
+    publication.add_argument("--spellfix-path", help="Trusted local spellfix DLL/SO; default: <root>/extensions.")
+    publication.add_argument(
+        "--publish", action="store_true", help="Repeat the audit and atomically select this revision."
+    )
+    _add_maintenance(publication)
+
 
 def _add_io(command: argparse.ArgumentParser) -> None:
     command.add_argument(
@@ -170,6 +185,12 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         protected.extend((entity_dir, entity_dir / "manifest.json"))
         if args.spellfix_path:
             protected.append(Path(args.spellfix_path))
+    if args.pipeline_command == "publication":
+        semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
+        entity_dir = Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities"
+        protected.extend((semantic_dir, entity_dir, database.parent / "publication.json"))
+        if args.spellfix_path:
+            protected.append(Path(args.spellfix_path))
     output = report_path(args.output, protected=protected) if args.output else None
     operation = args.pipeline_command
     mutates = (
@@ -178,6 +199,7 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         or (operation == "semantic" and args.semantic_command != "audit")
         or (operation == "ner" and args.ner_command != "audit")
         or (operation == "entities" and args.entities_command != "audit")
+        or (operation == "publication" and args.publish)
     )
     if mutates and not args.maintenance:
         raise ValueError("Stop retrieval readers and legacy index writers, then pass --maintenance.")
@@ -338,6 +360,25 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 spellfix_path=spellfix,
                 progress=_progress,
             )
+    elif operation == "publication":
+        if args.publish:
+            from semora.pipeline.publication_publish import publish_batch
+            action = publish_batch
+        else:
+            from semora.pipeline.publication_audit import audit_publication
+            action = audit_publication
+
+        report = action(
+            database,
+            args.batch,
+            Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic",
+            args.semantic_generation,
+            Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities",
+            run_id=args.run_id,
+            spellfix_path=Path(args.spellfix_path).resolve() if args.spellfix_path else None,
+            progress=_progress,
+        )
+        success = report["eligible"] and (not args.publish or report["published"])
     else:
         from semora.pipeline.lexical import index_batch_lexical
 

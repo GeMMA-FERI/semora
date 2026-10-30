@@ -304,6 +304,7 @@ def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None
     unchanged. Audit and completion markers share one writer-reserved snapshot.
     """
     from semora.pipeline.lexical import adopt_legacy_lexical
+    from semora.pipeline.publication_state import invalidate_publication
 
     target = Path(database_path).resolve(strict=True)
     with ExitStack() as locks:
@@ -316,6 +317,7 @@ def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None
         try:
             database.initialize()
             conn = database.conn
+            invalidate_publication(target)
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
                 report = _audit(conn, progress)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from semora.retrieval.models import SearchHit, SourceExcerpt
+from semora.retrieval.publication import read_publication
 from semora.storage import Database
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
@@ -26,6 +27,7 @@ class SearchEngine:
         database_path: str | Path = "indexes/semora.sqlite",
         semantic_dir: str | Path = "indexes/semantic",
         *,
+        entity_dir: str | Path | None = None,
         load_semantic: bool = False,
         semantic_device: str = "cpu",
         semantic_rerank: bool = False,
@@ -40,7 +42,17 @@ class SearchEngine:
         self.semantic_candidates = semantic_candidates
         self.semantic_nprobe = semantic_nprobe
         self.database = Database(database_path, read_only=True)
+        try:
+            self.publication = read_publication(self.database.conn, Path(self.database.path))
+        except BaseException:
+            self.database.close()
+            raise
         self.semantic_dir = Path(semantic_dir).resolve()
+        self.entity_dir = (
+            Path(entity_dir).resolve()
+            if entity_dir is not None
+            else Path(self.database.path).resolve().parent / "entities"
+        )
         self.semantic_device = semantic_device
         self._semantic_index: Any = None
         self._semantic_model: Any = None
@@ -64,7 +76,7 @@ class SearchEngine:
         if self._entity_search is None:
             from semora.ner.search import EntitySearch
 
-            self._entity_search = EntitySearch(self, Path(self.database.path).resolve().parent.parent)
+            self._entity_search = EntitySearch(self, self.entity_dir)
         return self._entity_search
 
     def search_entities(self, query: str) -> dict:
@@ -90,11 +102,7 @@ class SearchEngine:
             WHERE state_id = 1
             """
         ).fetchone()
-        semantic_files = {
-            "manifest": self.semantic_dir / "manifest.json",
-            "index": self.semantic_dir / "index.faiss",
-            "mapping": self.semantic_dir / "mapping.sqlite",
-        }
+        semantic_files = self._semantic_files()
         semantic_available = all(path.is_file() for path in semantic_files.values())
         semantic: dict[str, Any] = {
             "available": semantic_available,
@@ -103,6 +111,10 @@ class SearchEngine:
         }
         if semantic_available:
             manifest = json.loads(semantic_files["manifest"].read_text(encoding="utf-8"))
+            if self.publication is not None:
+                if not isinstance(manifest.get("store_config"), dict):
+                    raise ValueError("Serving semantic generation has no store configuration.")
+                manifest = {**manifest["store_config"], **manifest}
             semantic.update(
                 complete=bool(manifest.get("index_complete", True)),
                 model_id=manifest.get("model_id"),
@@ -137,12 +149,27 @@ class SearchEngine:
             from sentence_transformers import SentenceTransformer
         except ImportError as exc:
             raise RuntimeError("Semantic search requires the 'retrieval' extra.") from exc
-        manifest_path = self.semantic_dir / "manifest.json"
-        index_path = self.semantic_dir / "index.faiss"
-        mapping_path = self.semantic_dir / "mapping.sqlite"
+        semantic_files = self._semantic_files()
+        manifest_path = semantic_files["manifest"]
+        index_path = semantic_files["index"]
+        mapping_path = semantic_files["mapping"]
         if not manifest_path.is_file() or not index_path.is_file() or not mapping_path.is_file():
             raise FileNotFoundError(f"Semantic index is incomplete: {self.semantic_dir}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if self.publication is not None:
+            reference = self.publication["semantic"]
+            if (
+                manifest.get("format") != "semora.semantic.faiss-generation.v1"
+                or manifest.get("generation") != reference["generation"]
+                or manifest.get("corpus_id") != self.publication["corpus_id"]
+                or manifest.get("chunks") != reference["chunks"]
+                or manifest.get("index_sha256") != reference["index_sha256"]
+                or manifest.get("index_complete") is not True
+            ):
+                raise ValueError("Serving semantic generation differs from the publication pointer.")
+            if not isinstance(manifest.get("store_config"), dict):
+                raise ValueError("Serving semantic generation has no store configuration.")
+            manifest = {**manifest["store_config"], **manifest}
         index = _read_faiss_index(faiss, index_path)
         if index.ntotal != int(manifest.get("chunks", -1)):
             raise ValueError("FAISS index and semantic manifest contain different numbers of entries.")
@@ -174,6 +201,21 @@ class SearchEngine:
         self._semantic_mapping = mapping
         self._semantic_model = model
         self._semantic_index = index
+
+    def _semantic_files(self) -> dict[str, Path]:
+        directory = self.semantic_dir
+        if self.publication is not None:
+            generations = directory / "generations"
+            if generations.is_symlink():
+                raise ValueError("Semantic generations directory must not be a symlink.")
+            directory = directory / "generations" / self.publication["semantic"]["generation"]
+            if directory.is_symlink():
+                raise ValueError("Serving semantic generation must not be a symlink.")
+        return {
+            "manifest": directory / "manifest.json",
+            "index": directory / "index.faiss",
+            "mapping": self.semantic_dir / "mapping.sqlite",
+        }
 
     def read_source(
         self,

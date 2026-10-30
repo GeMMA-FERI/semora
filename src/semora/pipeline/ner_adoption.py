@@ -49,6 +49,8 @@ def adopt_ner_baseline(
                         "model_identity": json.loads(existing["model_identity_json"]),
                     },
                 }
+            from semora.pipeline.publication_state import invalidate_publication
+            invalidate_publication(path)
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
                 report = audit_ner_baseline(path, run_id=run_id, progress=progress)

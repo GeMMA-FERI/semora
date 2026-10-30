@@ -10,12 +10,10 @@ the historical source corpus into a new build directory.
 The implemented path covers strict manifests, read-only planning, additive
 newspapers/articles/chunks, explicit historical baseline audit/adoption,
 batch surface/lemma indexing, private semantic vector/FAISS generations and
-audited batch NER extraction and additive entity dictionary updates. Full
-publication verification and Docker packaging
-remain later milestones.
-`retrieval_ready=false` is intentional even when corpus and lexical stages finish.
-Do not import into the active archive until the remaining retrieval stages can
-be brought to matching coverage before readers restart.
+audited batch NER extraction, additive entity dictionary updates and a full
+publication gate. Linux/Docker packaging and production qualification remain.
+Each indexing stage reports `retrieval_ready=false` until a complete serving
+revision is selected and readers restart.
 
 ```text
 reviewed CSVs -> source adapter -> batch.json + existing source files
@@ -52,6 +50,8 @@ It does not rebase `--manifest`, `--input-root`, `--database` or `--output`.
 | `relative_path` | Canonical logical source path used for stable IDs; independent of host/data/input location. |
 | `--database` | Existing or new corpus SQLite path; baseline commands require an existing archive. |
 | `--semantic-dir` | Semantic artifact root; default `<database parent>/semantic`, independent of `--root`. Holds `mapping.sqlite`, `vectors/`, and private `generations/`. |
+| `--semantic-generation` | Exact 64-character directory ID of a complete private FAISS generation; publication never chooses one implicitly. |
+| `--entity-dir` | Dictionary root; default `<database parent>/entities`. The adopted SQLite file stays in place. |
 | Models/resources | Loaded only by a selected stage that has pending model work. Planning, status, baseline audit/adoption and newspaper storage require no NLP model. |
 | stdin | Unused. Commands read their explicit files/database/configuration. |
 | stdout | Full JSON report; with `--output`, only `{"report_path":"<absolute path>"}`. |
@@ -81,7 +81,27 @@ processes. A source batch can live elsewhere; it must remain immutable while use
 | `pipeline entities audit` | Reads the legacy entity manifest, dictionary, spellfix vocabulary and current NER output; reports valid existing pairs and pending pairs without mutation. Requires a trusted installed spellfix library. |
 | `pipeline entities adopt --maintenance` | Requires complete audited legacy dictionary and adopted NER; binds the existing dictionary file to the corpus/NER profile and builds a one-time article lookup index. Does not copy the dictionary or publish search. |
 | `pipeline entities index --batch <id> --maintenance` | Adds only missing selected-batch name/article memberships, affected counts and spellfix ranks in bounded transactions. Preserves entity IDs and root serving manifest. |
+| `pipeline publication --batch <id> --semantic-generation <id>` | Read-only full gate over ingestion, both lexical paths, NER, all vector shards/FAISS IDs and the complete entity dictionary. Returns a candidate pointer only when eligible; optional new JSON report. |
+| `pipeline publication --batch <id> --semantic-generation <id> --publish --maintenance` | Repeats the full gate under writer locks, then atomically replaces `<database parent>/publication.json`. A failed gate returns an ineligible report and leaves the pointer untouched. Restart retrieval readers after success. |
 | `pipeline status` | Reads committed batch/stage state. Does not create/migrate a missing database or verify every external artifact. |
+
+`pipeline publication` also accepts `--database`, `--semantic-dir`,
+`--entity-dir`, `--run-id` (default `classla-sl`), and optional trusted
+`--spellfix-path`. Without `--publish` it is read-only and does not require
+`--maintenance`. It can take substantial time: it streams the full 15.7 GB
+legacy dictionary and validates every vector shard and FAISS ID. The audit
+returns `candidate` only when all six stage checks pass. `--publish` returns
+`published=true`, `publication_id` and `restart_readers=true` on success; an
+idempotent retry preserves the same publication ID. It does not restart NORA.
+
+The pointer selects one immutable FAISS generation and one revision token for
+entity cursors. The entity SQLite file and corpus/semantic mappings are mutable,
+so each writer commits a corpus publication epoch change before its first
+output. Readers reject a missing or stale pointer after that change. Entity
+checkpoints also advance a matching corpus/dictionary token; this detects a
+restored older corpus even when its logical UUID is unchanged. Stop existing
+readers and legacy writers, take a consistent backup, then use `--publish` and
+restart the gateway. Previously deployed readers do not understand this gate.
 
 ## Manifest contract
 
@@ -225,10 +245,9 @@ verify model weights. Adoption does not invent one for historical outputs.
 
 `pipeline status` reports eligible articles and recorded/pending surface/lemma
 completion for the selected batch. These are bookkeeping counts, not an audit
-of FTS text. Legacy `SearchEngine` readiness counters are not updated by these
-commands yet; synchronizing reader readiness is part of publication. In this
-milestone, direct FTS checks qualify stage outputs and `retrieval_ready` remains
-false. Do not reopen the gateway using a completed lexical stage alone.
+of FTS text. The publication gate checks stored membership and configured
+index structures before selecting a serving revision. Do not reopen the
+gateway using a completed lexical stage alone.
 
 ## Historical baseline and compatibility limits
 
@@ -272,10 +291,11 @@ stopping those processes explicitly.
 
 ## Remaining roadmap and acceptance
 
-1. **Publication:** validate all retrieval paths and publish a consistent
-   corpus/FAISS/dictionary generation token before restarting
-   readers. SQLite plus vector files/FAISS/dictionary cannot share one transaction.
-2. **Semantic lifecycle:** define safe publication and eventual compaction or
+1. **Native qualification:** exercise A/B overlap, interruption/recovery and
+   relocation on a disposable archive, then audit and publish the reviewed
+   production batch in a stopped-reader maintenance window. SQLite and
+   FAISS/dictionary files cannot share one transaction.
+2. **Semantic lifecycle:** define eventual compaction or
    retraining from retained vector shards, without repeating old embeddings.
 3. **Portability/package:** keep one Python runner, thin platform wrappers,
    independent model/data/report roots and a GF adapter emitting this contract.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import sqlite3
+import uuid
 from collections.abc import Callable
 from contextlib import ExitStack, closing
 from pathlib import Path
@@ -18,6 +19,7 @@ from semora.pipeline.entity_baseline import (
     normalized_mentions,
 )
 from semora.pipeline.ner import _recorded_identity, _validate_batch
+from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage.connection import open_connection
 
@@ -74,10 +76,17 @@ def _checkpoint(
     target: sqlite3.Connection,
     rows: list[sqlite3.Row],
     expected: list[tuple[dict[str, int], dict[str, str]]],
+    previous_token: str,
+    next_token: str,
 ) -> tuple[int, int, int]:
     added_articles = added_memberships = added_names = 0
     with target:
         target.execute("BEGIN IMMEDIATE")
+        profile = target.execute(
+            "SELECT advancement_token FROM pipeline_entity_profile WHERE profile_id=1"
+        ).fetchone()
+        if profile is None or profile[0] != previous_token:
+            raise ValueError("Entity dictionary advancement changed during checkpoint.")
         for row, (names, displays) in zip(rows, expected, strict=True):
             article_id, content_hash = row["article_id"], row["content_sha256"]
             digest = expected_names_sha256(names)
@@ -143,6 +152,11 @@ def _checkpoint(
                 (article_id, content_hash, digest, len(names)),
             )
             added_articles += 1
+        if added_articles:
+            target.execute(
+                "UPDATE pipeline_entity_profile SET advancement_token=? WHERE profile_id=1",
+                (next_token,),
+            )
     return added_articles, added_memberships, added_names
 
 
@@ -189,6 +203,31 @@ def index_batch_entities(
                     != (identity[0], run_id, NORMALIZATION)
                 ):
                     raise ValueError("Entity dictionary is not adopted for this corpus/NER profile.")
+                binding = corpus.execute(
+                    "SELECT * FROM pipeline_entity_bindings WHERE ner_run_id=?", (run_id,)
+                ).fetchone()
+                if binding is None or (
+                    binding["corpus_id"], binding["generation"]
+                ) != (identity[0], _manifest_value["generation"]):
+                    raise ValueError("Corpus entity binding differs from the dictionary generation.")
+                current_token = binding["advancement_token"]
+                target_token = profile["advancement_token"]
+                pending_token = binding["pending_token"]
+                if pending_token is None:
+                    if target_token != current_token:
+                        raise ValueError("Corpus and dictionary advancement tokens differ; audit before appending.")
+                elif target_token == current_token:
+                    corpus.execute(
+                        "UPDATE pipeline_entity_bindings SET pending_token=NULL WHERE ner_run_id=?", (run_id,)
+                    )
+                elif target_token == pending_token:
+                    current_token = pending_token
+                    corpus.execute(
+                        "UPDATE pipeline_entity_bindings SET advancement_token=?,pending_token=NULL "
+                        "WHERE ner_run_id=?", (current_token, run_id),
+                    )
+                else:
+                    raise ValueError("Interrupted entity checkpoint has inconsistent advancement tokens.")
                 if (
                     target.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='index' AND name='pipeline_entity_articles_lookup'"
@@ -202,9 +241,12 @@ def index_batch_entities(
                     "WHERE b.batch_id=? AND a.is_valid=1 AND TRIM(a.content)<>''",
                     (batch_id,),
                 ).fetchone()[0]
+                corpus.execute("COMMIT")
+                invalidated = False
                 cursor = ""
                 added_articles = added_memberships = added_names = skipped = 0
                 while True:
+                    corpus.execute("BEGIN IMMEDIATE")
                     rows = corpus.execute(
                         "SELECT a.article_id,a.content,s.content_sha256,s.entity_count FROM articles a "
                         "JOIN pipeline_batch_issues b USING(newspaper_id) "
@@ -214,11 +256,48 @@ def index_batch_entities(
                         (run_id, batch_id, cursor, batch_articles),
                     ).fetchall()
                     if not rows:
+                        corpus.execute("ROLLBACK")
                         break
                     if any(row["content_sha256"] is None for row in rows):
                         raise ValueError("Finish selected batch NER before updating the entity dictionary.")
                     expected = [_expected(corpus, row, run_id) for row in rows]
-                    new_articles, new_memberships, new_names = _checkpoint(target, rows, expected)
+                    complete = all(
+                        target.execute(
+                            "SELECT 1 FROM pipeline_entity_articles WHERE article_id=?", (row["article_id"],)
+                        ).fetchone() is not None for row in rows
+                    )
+                    corpus.execute("COMMIT")
+                    if complete:
+                        new_articles, new_memberships, new_names = _checkpoint(
+                            target, rows, expected, current_token, current_token
+                        )
+                    else:
+                        if not invalidated:
+                            invalidate_publication(source)
+                            invalidated = True
+                        next_token = uuid.uuid4().hex
+                        corpus.execute("BEGIN IMMEDIATE")
+                        corpus.execute(
+                            "UPDATE pipeline_entity_bindings SET pending_token=? WHERE ner_run_id=? "
+                            "AND advancement_token=? AND pending_token IS NULL",
+                            (next_token, run_id, current_token),
+                        )
+                        if corpus.execute("SELECT changes()").fetchone()[0] != 1:
+                            raise ValueError("Corpus entity advancement changed during checkpoint.")
+                        corpus.execute("COMMIT")
+                        new_articles, new_memberships, new_names = _checkpoint(
+                            target, rows, expected, current_token, next_token
+                        )
+                        corpus.execute("BEGIN IMMEDIATE")
+                        corpus.execute(
+                            "UPDATE pipeline_entity_bindings SET advancement_token=?,pending_token=NULL "
+                            "WHERE ner_run_id=? AND advancement_token=? AND pending_token=?",
+                            (next_token, run_id, current_token, next_token),
+                        )
+                        if corpus.execute("SELECT changes()").fetchone()[0] != 1:
+                            raise ValueError("Corpus entity checkpoint finalization changed unexpectedly.")
+                        corpus.execute("COMMIT")
+                        current_token = next_token
                     added_articles += new_articles
                     added_memberships += new_memberships
                     added_names += new_names
@@ -248,4 +327,5 @@ def index_batch_entities(
                     "publication_ready": False,
                 }
             finally:
-                corpus.execute("ROLLBACK")
+                if corpus.in_transaction:
+                    corpus.execute("ROLLBACK")
