@@ -111,6 +111,20 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--ner-decoder", choices=("numpy", "numba"), default="numpy")
             command.add_argument("--resources", help="Installed adapter resources, relative to the working directory.")
 
+    entities = operations.add_parser("entities", help="Audit/adopt and extend the entity-name dictionary.")
+    entity_operations = entities.add_subparsers(dest="entities_command", required=True)
+    for name in ("audit", "adopt", "index"):
+        command = entity_operations.add_parser(name)
+        _add_io(command)
+        command.add_argument("--entity-dir", help="Dictionary root; default: <database parent>/entities.")
+        command.add_argument("--spellfix-path", help="Trusted local spellfix DLL/SO; default: <root>/extensions.")
+        command.add_argument("--run-id", default="classla-sl")
+        if name != "audit":
+            _add_maintenance(command)
+        if name == "index":
+            command.add_argument("--batch", required=True)
+            command.add_argument("--batch-articles", type=int, default=1000)
+
 
 def _add_io(command: argparse.ArgumentParser) -> None:
     command.add_argument(
@@ -151,6 +165,11 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
                 semantic_dir / "index.faiss",
             )
         )
+    if args.pipeline_command == "entities":
+        entity_dir = Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities"
+        protected.extend((entity_dir, entity_dir / "manifest.json"))
+        if args.spellfix_path:
+            protected.append(Path(args.spellfix_path))
     output = report_path(args.output, protected=protected) if args.output else None
     operation = args.pipeline_command
     mutates = (
@@ -158,6 +177,7 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         or (operation == "baseline" and args.baseline_command == "adopt")
         or (operation == "semantic" and args.semantic_command != "audit")
         or (operation == "ner" and args.ner_command != "audit")
+        or (operation == "entities" and args.entities_command != "audit")
     )
     if mutates and not args.maintenance:
         raise ValueError("Stop retrieval readers and legacy index writers, then pass --maintenance.")
@@ -280,6 +300,42 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 ner_pipeline_depth=args.ner_pipeline_depth,
                 ner_decoder=args.ner_decoder,
                 resources=args.resources,
+                progress=_progress,
+            )
+    elif operation == "entities":
+        entity_dir = Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities"
+        spellfix = Path(args.spellfix_path).resolve() if args.spellfix_path else None
+        if args.entities_command == "audit":
+            from semora.pipeline.entity_baseline import audit_entity_baseline
+
+            report = audit_entity_baseline(
+                database,
+                entity_dir,
+                run_id=args.run_id,
+                spellfix_path=spellfix,
+                progress=_progress,
+            )
+            success = report["eligible"]
+        elif args.entities_command == "adopt":
+            from semora.pipeline.entity_adoption import adopt_entity_baseline
+
+            report = adopt_entity_baseline(
+                database,
+                entity_dir,
+                run_id=args.run_id,
+                spellfix_path=spellfix,
+                progress=_progress,
+            )
+        else:
+            from semora.pipeline.entities import index_batch_entities
+
+            report = index_batch_entities(
+                database,
+                args.batch,
+                entity_dir,
+                run_id=args.run_id,
+                batch_articles=args.batch_articles,
+                spellfix_path=spellfix,
                 progress=_progress,
             )
     else:

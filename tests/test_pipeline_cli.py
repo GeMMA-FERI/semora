@@ -432,6 +432,61 @@ def test_cli_ner_index_requires_maintenance_before_model_load(tmp_path: Path, mo
     assert not database.exists()
 
 
+def test_cli_entity_audit_resolves_explicit_artifact_and_spellfix_paths(tmp_path: Path, monkeypatch, capsys) -> None:
+    from semora.pipeline import entity_baseline
+
+    database = tmp_path / "corpus" / "archive.sqlite"
+    entity_dir = tmp_path / "artifacts" / "entities"
+    extension = tmp_path / "extensions" / "spellfix1.dll"
+    seen = []
+
+    def audit(path, root, *, run_id, spellfix_path, progress):
+        seen.append((path, root, run_id, spellfix_path))
+        return {"format": "semora.entity-baseline.v1", "eligible": True, "complete": True}
+
+    monkeypatch.setattr(entity_baseline, "audit_entity_baseline", audit)
+    result = invoke(
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "entities",
+        "audit",
+        "--database",
+        str(database),
+        "--entity-dir",
+        str(entity_dir),
+        "--spellfix-path",
+        str(extension),
+        "--run-id",
+        "classla-sl",
+    )
+    assert result["eligible"]
+    assert seen == [(database, entity_dir, "classla-sl", extension)]
+
+
+def test_cli_entity_index_requires_maintenance_before_dictionary_access(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "archive.sqlite"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "entities",
+            "index",
+            "--database",
+            str(database),
+            "--batch",
+            "batch-a",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="--maintenance"):
+        main()
+
+    assert not database.exists()
+
+
 def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Path, monkeypatch, capsys) -> None:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "data" / "archive.sqlite"

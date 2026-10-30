@@ -10,7 +10,8 @@ the historical source corpus into a new build directory.
 The implemented path covers strict manifests, read-only planning, additive
 newspapers/articles/chunks, explicit historical baseline audit/adoption,
 batch surface/lemma indexing, private semantic vector/FAISS generations and
-audited batch NER extraction. Entity dictionary integration, full publication verification and Docker packaging
+audited batch NER extraction and additive entity dictionary updates. Full
+publication verification and Docker packaging
 remain later milestones.
 `retrieval_ready=false` is intentional even when corpus and lexical stages finish.
 Do not import into the active archive until the remaining retrieval stages can
@@ -28,7 +29,7 @@ reviewed CSVs -> source adapter -> batch.json + existing source files
                       |               |               |
                 surface -> lemma    chunks          NER
                                       |               |
-                                vectors          dictionary [next]
+                                vectors          dictionary
                                       |
                                  FAISS
 ```
@@ -77,6 +78,9 @@ processes. A source batch can live elsewhere; it must remain immutable while use
 | `pipeline ner audit` | Reads one historical NER run, eligible article contents and every mention in a snapshot; reports exact coverage and structural evidence without migration or model load. |
 | `pipeline ner adopt --maintenance` | Repeats the full audit under writer exclusion and records a historical NER receipt/model identity; preserves extraction rows. |
 | `pipeline ner index --batch <id> --maintenance` | Extracts only pending valid nonblank articles in the selected batch, with atomic completion and mention checkpoints. Loads the adapter only when work is pending. |
+| `pipeline entities audit` | Reads the legacy entity manifest, dictionary, spellfix vocabulary and current NER output; reports valid existing pairs and pending pairs without mutation. Requires a trusted installed spellfix library. |
+| `pipeline entities adopt --maintenance` | Requires complete audited legacy dictionary and adopted NER; binds the existing dictionary file to the corpus/NER profile and builds a one-time article lookup index. Does not copy the dictionary or publish search. |
+| `pipeline entities index --batch <id> --maintenance` | Adds only missing selected-batch name/article memberships, affected counts and spellfix ranks in bounded transactions. Preserves entity IDs and root serving manifest. |
 | `pipeline status` | Reads committed batch/stage state. Does not create/migrate a missing database or verify every external artifact. |
 
 ## Manifest contract
@@ -149,6 +153,12 @@ semora pipeline ner adopt --database /data/indexes/semora.sqlite \
   --run-id classla-sl --maintenance
 semora pipeline ner index --database /data/indexes/semora.sqlite \
   --batch newspapers-2026-10-27 --run-id classla-sl --device cuda --ner-decoder numba --maintenance
+semora pipeline entities audit --database /data/indexes/semora.sqlite \
+  --entity-dir /data/indexes/entities --run-id classla-sl --output /reports/entities-audit.json
+semora pipeline entities adopt --database /data/indexes/semora.sqlite \
+  --entity-dir /data/indexes/entities --run-id classla-sl --maintenance
+semora pipeline entities index --database /data/indexes/semora.sqlite \
+  --entity-dir /data/indexes/entities --batch newspapers-2026-10-27 --maintenance
 semora pipeline status --database /data/indexes/semora.sqlite --batch newspapers-2026-10-27
 ```
 
@@ -176,6 +186,22 @@ require a new run ID. `ner index` accepts `--adapter`, `--device`, `--resources`
 `--batch-articles`, `--batch-size`, `--pipeline-depth`, `--tokenizer-workers`,
 `--ner-pipeline-depth` and `--ner-decoder`. It does not update the entity
 dictionary or serving search index.
+
+Entity commands take `--entity-dir` (default `<database parent>/entities`) and
+optional `--spellfix-path` (default `<database grandparent>/extensions/spellfix1.dll`
+on Windows or `.so` on Linux). The historical audit validates stored normalized
+names, per-article earliest offsets/content hashes, counts and spellfix entries
+against the selected NER run. `eligible` permits valid but missing expected
+memberships; adoption additionally requires `complete=true`. Adoption changes
+only the existing dictionary's control tables and creates an article-first
+lookup index. It is a one-time index build over the existing large file, so plan
+disk space and backup accordingly. `entities index` uses `--batch-articles`
+(default 1000) as the transaction checkpoint size. It mutates the adopted
+dictionary file in place while readers are stopped; it does not clone the 15 GB
+legacy artifact or replace the root manifest. A failure rolls back the current
+checkpoint; earlier checkpoints remain and retry checks per-article completion.
+Publication must issue a new reader token after all index gates pass. Until then,
+the dictionary report says `retrieval_ready=false`.
 
 `--through` selects an ingestion prefix: `newspapers`, `articles` or `chunks`
 (default). Rerun the same manifest/settings to advance or resume. Selected stages
@@ -214,9 +240,8 @@ source tree or run tokenization, CLASSLA, embeddings or NER. Plan separately
 verifies incoming files and their hashes.
 
 Corpus adoption records only validated article and eligible lexical outputs.
-Semantic and NER have separate audits and adoption receipts; neither infers
-historical model execution from stored declarations. Dictionary adoption is
-still pending. Historical contentless FTS text is not
+Semantic, NER and entity dictionaries have separate audits and adoption receipts; none infers
+historical model execution from stored declarations. Historical contentless FTS text is not
 reconstructed or cryptographically verified by this audit. Supported FTS schema
 and tokenizer settings are checked against the actual table definitions. Counts and legacy
 `complete` flags alone do not prove coverage or model compatibility. Audit the
@@ -247,9 +272,8 @@ stopping those processes explicitly.
 
 ## Remaining roadmap and acceptance
 
-1. **Dictionary/publication:** audit and adopt the existing entity dictionary,
-   then increment memberships, counts and spellfix for batch NER outputs with
-   transactional completion. Validate all retrieval paths before restarting
+1. **Publication:** validate all retrieval paths and publish a consistent
+   corpus/FAISS/dictionary generation token before restarting
    readers. SQLite plus vector files/FAISS/dictionary cannot share one transaction.
 2. **Semantic lifecycle:** define safe publication and eventual compaction or
    retraining from retained vector shards, without repeating old embeddings.
