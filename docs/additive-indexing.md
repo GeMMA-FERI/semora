@@ -102,6 +102,12 @@ and stale replay after a later metadata correction are rejected. A source
 identifier omitted from the manifest is derived from unambiguous metadata.
 Straza retains `GF-URN` and provenance; the normalized dLib `urn` stays absent.
 
+Source identity registration covers historical adoption as well as new imports.
+Migration 016 stores case-folded dLib/GF identifiers independently of canonical
+paths, so an adopted issue cannot return under another folder or identifier case.
+Read-only planning against older databases checks stored metadata without
+requiring that migration first.
+
 ## Operator sequence
 
 Use disposable databases to qualify each milestone. The following examples show

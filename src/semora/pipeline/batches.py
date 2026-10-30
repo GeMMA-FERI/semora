@@ -16,6 +16,7 @@ from typing import Any
 
 from semora.corpus import indexer
 from semora.corpus.spans import LineMap, SourceArticle, split_articles
+from semora.pipeline.identities import identity_owners, metadata_identifiers, register_identity
 from semora.pipeline.manifest import BatchIssue, BatchManifest, read_issue
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
@@ -53,15 +54,7 @@ def _paths(conn: sqlite3.Connection | None) -> dict[str, set[str]]:
 
 
 def _metadata_identifiers(metadata: dict) -> set[str]:
-    record = metadata.get("Record", {})
-    values = record.get("identifier", []) if isinstance(record, dict) else []
-    values = values if isinstance(values, list) else [values]
-    identifiers = set()
-    for value in values:
-        text = value.get("#text") if isinstance(value, dict) else value
-        if isinstance(text, str) and text.casefold().startswith(("urn:", "gf-urn:")):
-            identifiers.add(text.casefold())
-    return identifiers
+    return metadata_identifiers(metadata)
 
 
 def _source_identifier(issue: BatchIssue, metadata: dict) -> str | None:
@@ -81,6 +74,7 @@ def _classify(
     content: str,
     metadata: dict,
     paths: dict[str, set[str]],
+    owners: dict[str, set[str]],
     batch_id: str,
 ) -> tuple[str, str]:
     aliases = paths.get(issue.relative_path.casefold(), set())
@@ -105,6 +99,10 @@ def _classify(
     ):
         return "conflict", "Source URN already exists at another canonical path."
     source_identifier = _source_identifier(issue, metadata)
+    if source_identifier:
+        known = owners.get(source_identifier.casefold(), set())
+        if known and known != {newspaper_id}:
+            return "conflict", "Source identifier already exists at another canonical path."
     if source_identifier and _has_table(conn, "pipeline_batch_issues"):
         previous_keys = {
             row[0]
@@ -164,12 +162,13 @@ def plan_batch(
         if conn is not None:
             conn.execute("BEGIN")
         paths = _paths(conn)
+        owners = identity_owners(conn)
         counts = dict.fromkeys(("new", "unchanged", "metadata_changed", "conflict"), 0)
         issues = []
         identifiers: set[str] = set()
         for number, issue in enumerate(manifest.issues, start=1):
             content, metadata = _read_source(input_root, issue)
-            action, reason = _classify(conn, issue, content, metadata, paths, manifest.batch_id)
+            action, reason = _classify(conn, issue, content, metadata, paths, owners, manifest.batch_id)
             source_identifier = _source_identifier(issue, metadata)
             if source_identifier and source_identifier.casefold() in identifiers:
                 action, reason = "conflict", "Duplicate metadata source identifier within the batch."
@@ -298,11 +297,12 @@ def run_batch(
                 )
             try:
                 paths = _paths(conn)
+                owners = identity_owners(conn)
                 for number, issue in enumerate(manifest.issues, start=1):
                     content, metadata = _read_source(input_root, issue)
                     with conn:
                         conn.execute("BEGIN IMMEDIATE")
-                        action, reason = _classify(conn, issue, content, metadata, paths, manifest.batch_id)
+                        action, reason = _classify(conn, issue, content, metadata, paths, owners, manifest.batch_id)
                         if action == "conflict":
                             raise ValueError(reason)
                         newspaper_id = indexer._stable_id("newspaper", issue.relative_path)
@@ -325,6 +325,9 @@ def run_batch(
                                 )
                             _chunks(conn, newspaper_id, config, tokenizer)
                     paths.setdefault(issue.relative_path.casefold(), set()).add(issue.relative_path)
+                    identifier = _source_identifier(issue, metadata)
+                    if identifier:
+                        owners.setdefault(identifier.casefold(), set()).add(newspaper_id)
                     if progress is not None and (number % 1000 == 0 or number == len(manifest.issues)):
                         progress({"event": "issue_ingested", "completed": number, "total": len(manifest.issues)})
                 with conn:
@@ -366,6 +369,7 @@ def _store_issue(
             (_json(metadata), *(normalized[c] for c in columns), newspaper_id),
         )
     source_identifier = _source_identifier(issue, metadata)
+    register_identity(conn, newspaper_id, source_identifier)
     conn.execute(
         "INSERT INTO pipeline_batch_issues(batch_id,relative_path,newspaper_id,action,content_sha256,"
         "metadata_sha256,source_identifier,source_identifier_key) "

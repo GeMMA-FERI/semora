@@ -17,6 +17,7 @@ from pathlib import Path
 from semora.corpus import indexer
 from semora.corpus.spans import split_articles
 from semora.pipeline.batches import SPLITTER, _metadata_identifiers
+from semora.pipeline.identities import register_identity
 from semora.pipeline.manifest import _relative_path
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
@@ -322,8 +323,12 @@ def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None
                     raise ValueError("Historical article audit failed: " + _json(report["corpus"]))
                 config = _json({"splitter": SPLITTER})
                 added = 0
-                for newspaper in conn.execute("SELECT newspaper_id,content FROM newspapers ORDER BY newspaper_id"):
+                for newspaper in conn.execute(
+                    "SELECT newspaper_id,content,metadata_json FROM newspapers ORDER BY newspaper_id"
+                ):
                     newspaper_id = newspaper["newspaper_id"]
+                    identifiers = _metadata_identifiers(json.loads(newspaper["metadata_json"] or "{}"))
+                    register_identity(conn, newspaper_id, next(iter(identifiers), None))
                     count = int(conn.execute(
                         "SELECT COUNT(*) FROM articles WHERE newspaper_id=?", (newspaper_id,),
                     ).fetchone()[0])
