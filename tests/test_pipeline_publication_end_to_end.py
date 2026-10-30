@@ -127,3 +127,40 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
         assert found["generation"] == published["publication_id"]
     finally:
         engine.close()
+
+    # A later batch overlaps the first issue. The old serving pointer must
+    # become stale before its new issue is visible, then receive a new token.
+    later = "# Later\nZürich welcomes Ana.\n".encode()
+    later_metadata = json.dumps({"Record": {"source": "Paper", "date": "1925 02 19"}}).encode()
+    (incoming / "later.md").write_bytes(later)
+    (incoming / "later_metadata.json").write_bytes(later_metadata)
+    second = BatchManifest("later-batch", (
+        manifest.issues[0],
+        BatchIssue("Paper/later.md", "later.md", "later_metadata.json",
+                   hashlib.sha256(later).hexdigest(), hashlib.sha256(later_metadata).hexdigest()),
+    ))
+    run_batch(second, incoming, database, token_count=3, token_overlap=1, tokenizer=Tokenizer())
+    with pytest.raises(ValueError, match="stale"):
+        SearchEngine(database, semantic)
+    assert index_batch_lexical(database, "later-batch")["added_articles"] == 1
+    assert index_batch_lexical(
+        database, "later-batch", stage="lemma", lemmatizer=Lemmatizer()
+    )["added_articles"] == 1
+    assert index_batch_vectors(
+        database, "later-batch", semantic, dimensions=4, shard_size=2, model=TinyEmbedding()
+    )["added_chunks"] > 0
+    assert index_batch_ner(database, "later-batch", model=NerModel())["added_articles"] == 1
+    assert index_batch_entities(database, "later-batch", entity)["added_articles"] == 1
+    later_generation = build_semantic_generation(
+        database, semantic, config=FaissBuildConfig(index_type="flat"), faiss_module=faiss
+    )["generation"]
+    assert later_generation != generation
+    republished = publish_batch(
+        database, "later-batch", semantic, later_generation, entity, faiss_module=faiss
+    )
+    assert republished["published"] and republished["publication_id"] != published["publication_id"]
+    reopened = SearchEngine(database, semantic)
+    try:
+        assert reopened.search_entities("Ana")["generation"] == republished["publication_id"]
+    finally:
+        reopened.close()
