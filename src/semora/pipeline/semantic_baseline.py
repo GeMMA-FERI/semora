@@ -329,20 +329,28 @@ def _inspect(conn: sqlite3.Connection, root: Path, report: dict, error, progress
         "tokenizer_revision": spec.chunking.get("tokenizer_revision"),
         "tokenization_completeness_verified": False,
     }
+    # The known historical indexes let this group stream in run-ID order while
+    # the article validity check stays index-only. Joining the run row inside
+    # the 17M-chunk aggregation caused a large temporary B-tree on Windows.
     runs = conn.execute("""
-        SELECT c.chunking_run_id,r.method,r.config_json,COUNT(*) AS chunks,
+        SELECT c.chunking_run_id,COUNT(*) AS chunks,
                MIN(c.chunk_id) AS first_chunk_id,MAX(c.chunk_id) AS last_chunk_id
-        FROM chunks c JOIN articles a USING(article_id)
-        LEFT JOIN chunking_runs r USING(chunking_run_id) WHERE a.is_valid=1
-        GROUP BY c.chunking_run_id,r.method,r.config_json
+        FROM chunks c INDEXED BY idx_chunks_chunking_run_article
+        JOIN articles a INDEXED BY idx_articles_valid_article_id USING(article_id)
+        WHERE a.is_valid=1 GROUP BY c.chunking_run_id
     """).fetchall()
     if len(runs) != 1:
         raise ValueError("Legacy semantic snapshot must have exactly one eligible chunking run")
     run = runs[0]
+    chunking_run = conn.execute(
+        "SELECT method,config_json FROM chunking_runs WHERE chunking_run_id=?",
+        (run["chunking_run_id"],),
+    ).fetchone()
     if (
         run["chunking_run_id"] != spec.chunking_run_id
-        or run["method"] != "token"
-        or _load_json(run["config_json"]) != spec.chunking
+        or chunking_run is None
+        or chunking_run["method"] != "token"
+        or _load_json(chunking_run["config_json"]) != spec.chunking
     ):
         raise ValueError("Stored chunking run disagrees with legacy semantic specification")
     if (run["chunks"], run["first_chunk_id"], run["last_chunk_id"]) != (
