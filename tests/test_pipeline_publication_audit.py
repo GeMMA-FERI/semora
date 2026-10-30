@@ -6,8 +6,8 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from test_pipeline_lexical import CountingLemmatizer
-from test_pipeline_semantic import ingest
+from tests.test_pipeline_lexical import CountingLemmatizer
+from tests.test_pipeline_semantic import ingest
 
 from semora.pipeline.lexical import index_batch_lexical
 from semora.pipeline.publication_audit import audit_publication

@@ -11,8 +11,8 @@ import types
 from pathlib import Path
 
 import pytest
-from test_pipeline_entity_baseline import Model as NerModel
-from test_pipeline_semantic_baseline import TinyEmbedding
+from tests.test_pipeline_entity_baseline import Model as NerModel
+from tests.test_pipeline_semantic_baseline import TinyEmbedding
 
 from semora.corpus import indexer
 from semora.ner.indexing import build_ner_index
