@@ -22,17 +22,24 @@ def prepare_manifest(tmp_path: Path) -> tuple[Path, Path]:
     (source / "issue.md").write_bytes(markdown)
     (source / "issue_metadata.json").write_bytes(metadata)
     manifest = tmp_path / "batch.json"
-    manifest.write_text(json.dumps({
-        "format": "semora.batch.v1",
-        "batch_id": "cli-batch",
-        "issues": [{
-            "relative_path": "Straza/issue.md",
-            "markdown_path": "issue.md",
-            "metadata_path": "issue_metadata.json",
-            "markdown_sha256": hashlib.sha256(markdown).hexdigest(),
-            "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
-        }],
-    }), encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            {
+                "format": "semora.batch.v1",
+                "batch_id": "cli-batch",
+                "issues": [
+                    {
+                        "relative_path": "Straza/issue.md",
+                        "markdown_path": "issue.md",
+                        "metadata_path": "issue_metadata.json",
+                        "markdown_sha256": hashlib.sha256(markdown).hexdigest(),
+                        "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     return manifest, source
 
 
@@ -58,8 +65,16 @@ def test_cli_plan_run_status_respects_explicit_paths_without_models(tmp_path: Pa
     assert not database.parent.exists()
 
     result = invoke(
-        monkeypatch, capsys, "--root", str(unused_root), "pipeline", "run", *common,
-        "--through", "newspapers", "--maintenance",
+        monkeypatch,
+        capsys,
+        "--root",
+        str(unused_root),
+        "pipeline",
+        "run",
+        *common,
+        "--through",
+        "newspapers",
+        "--maintenance",
     )
     assert result["issues"] == 1
     assert result["stages"] == {"articles": 0, "chunks": 0}
@@ -69,7 +84,14 @@ def test_cli_plan_run_status_respects_explicit_paths_without_models(tmp_path: Pa
         assert connection.execute("SELECT COUNT(*) FROM articles").fetchone()[0] == 0
 
     status = invoke(
-        monkeypatch, capsys, "pipeline", "status", "--database", str(database), "--batch", "cli-batch",
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "status",
+        "--database",
+        str(database),
+        "--batch",
+        "cli-batch",
     )
     assert status["batch_id"] == "cli-batch"
     assert status["manifest_fingerprint"] == plan["manifest_fingerprint"]
@@ -81,10 +103,23 @@ def test_cli_plan_run_status_respects_explicit_paths_without_models(tmp_path: Pa
 def test_cli_run_requires_maintenance_before_creating_database(tmp_path: Path, monkeypatch) -> None:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "not-created" / "semora.sqlite"
-    monkeypatch.setattr(sys, "argv", [
-        "semora", "pipeline", "run", "--manifest", str(manifest), "--input-root", str(source),
-        "--database", str(database), "--through", "newspapers",
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "run",
+            "--manifest",
+            str(manifest),
+            "--input-root",
+            str(source),
+            "--database",
+            str(database),
+            "--through",
+            "newspapers",
+        ],
+    )
 
     with pytest.raises(ValueError, match="--maintenance"):
         main()
@@ -96,8 +131,19 @@ def test_cli_default_database_is_under_data_root(tmp_path: Path, monkeypatch, ca
     manifest, source = prepare_manifest(tmp_path)
     root = tmp_path / "data"
     result = invoke(
-        monkeypatch, capsys, "--root", str(root), "pipeline", "run", "--manifest", str(manifest),
-        "--input-root", str(source), "--through", "newspapers", "--maintenance",
+        monkeypatch,
+        capsys,
+        "--root",
+        str(root),
+        "pipeline",
+        "run",
+        "--manifest",
+        str(manifest),
+        "--input-root",
+        str(source),
+        "--through",
+        "newspapers",
+        "--maintenance",
     )
 
     assert result["issues"] == 1
@@ -110,8 +156,20 @@ def test_cli_report_and_input_paths_resolve_against_cwd_not_root(tmp_path: Path,
     monkeypatch.chdir(tmp_path)
 
     receipt = invoke(
-        monkeypatch, capsys, "--root", "unused-root", "pipeline", "plan", "--manifest", "batch.json",
-        "--input-root", "incoming", "--database", "data/archive.sqlite", "--output", "reports/plan.json",
+        monkeypatch,
+        capsys,
+        "--root",
+        "unused-root",
+        "pipeline",
+        "plan",
+        "--manifest",
+        "batch.json",
+        "--input-root",
+        "incoming",
+        "--database",
+        "data/archive.sqlite",
+        "--output",
+        "reports/plan.json",
     )
 
     output = tmp_path / "reports" / "plan.json"
@@ -129,10 +187,26 @@ def test_cli_run_and_status_reports_use_receipts_and_separate_progress(tmp_path:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "data" / "semora.sqlite"
     output = tmp_path / "reports" / "ingested.json"
-    monkeypatch.setattr(sys, "argv", [
-        "semora", "pipeline", "run", "--manifest", str(manifest), "--input-root", str(source),
-        "--database", str(database), "--through", "newspapers", "--maintenance", "--output", str(output),
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "run",
+            "--manifest",
+            str(manifest),
+            "--input-root",
+            str(source),
+            "--database",
+            str(database),
+            "--through",
+            "newspapers",
+            "--maintenance",
+            "--output",
+            str(output),
+        ],
+    )
 
     main()
 
@@ -145,8 +219,16 @@ def test_cli_run_and_status_reports_use_receipts_and_separate_progress(tmp_path:
     assert report["state"] == "ingested"
     status_file = tmp_path / "reports" / "status.json"
     receipt = invoke(
-        monkeypatch, capsys, "pipeline", "status", "--database", str(database), "--batch", "cli-batch",
-        "--output", str(status_file),
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "status",
+        "--database",
+        str(database),
+        "--batch",
+        "cli-batch",
+        "--output",
+        str(status_file),
     )
     assert receipt == {"report_path": str(status_file)}
     assert json.loads(status_file.read_text(encoding="utf-8"))["manifest_fingerprint"] == report["manifest_fingerprint"]
@@ -159,10 +241,26 @@ def test_cli_invalid_output_prevents_run_mutation(tmp_path: Path, monkeypatch, o
     output = tmp_path / "existing-report.json" if output_kind == "existing" else database
     if output_kind == "existing":
         output.write_text("keep this report", encoding="utf-8")
-    monkeypatch.setattr(sys, "argv", [
-        "semora", "pipeline", "run", "--manifest", str(manifest), "--input-root", str(source),
-        "--database", str(database), "--output", str(output), "--through", "newspapers", "--maintenance",
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "run",
+            "--manifest",
+            str(manifest),
+            "--input-root",
+            str(source),
+            "--database",
+            str(database),
+            "--output",
+            str(output),
+            "--through",
+            "newspapers",
+            "--maintenance",
+        ],
+    )
 
     with pytest.raises(FileExistsError if output_kind == "existing" else ValueError):
         main()
@@ -173,7 +271,9 @@ def test_cli_invalid_output_prevents_run_mutation(tmp_path: Path, monkeypatch, o
 
 
 def test_cli_failed_baseline_audit_returns_report_and_nonzero_without_mutation(
-    tmp_path: Path, monkeypatch, capsys,
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
 ) -> None:
     _manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "legacy" / "semora.sqlite"
@@ -183,9 +283,20 @@ def test_cli_failed_baseline_audit_returns_report_and_nonzero_without_mutation(
         connection.commit()
     before = database.read_bytes()
     output = tmp_path / "reports" / "invalid-baseline.json"
-    monkeypatch.setattr(sys, "argv", [
-        "semora", "pipeline", "baseline", "audit", "--database", str(database), "--output", str(output),
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "baseline",
+            "audit",
+            "--database",
+            str(database),
+            "--output",
+            str(output),
+        ],
+    )
 
     with pytest.raises(SystemExit) as error:
         main()
@@ -225,8 +336,17 @@ def test_cli_semantic_audit_uses_explicit_artifact_root_and_new_report(tmp_path:
 
     monkeypatch.setattr(semantic_baseline, "audit_semantic_baseline", audit)
     receipt = invoke(
-        monkeypatch, capsys, "pipeline", "semantic", "audit", "--database", str(database),
-        "--semantic-dir", str(semantic_dir), "--output", str(output),
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "semantic",
+        "audit",
+        "--database",
+        str(database),
+        "--semantic-dir",
+        str(semantic_dir),
+        "--output",
+        str(output),
     )
     assert receipt == {"report_path": str(output)}
     assert seen == [(database, semantic_dir)]
@@ -236,9 +356,20 @@ def test_cli_semantic_audit_uses_explicit_artifact_root_and_new_report(tmp_path:
 
 def test_cli_semantic_vectors_requires_maintenance_before_loading_model(tmp_path: Path, monkeypatch) -> None:
     database = tmp_path / "data" / "archive.sqlite"
-    monkeypatch.setattr(sys, "argv", [
-        "semora", "pipeline", "semantic", "vectors", "--database", str(database), "--batch", "batch-a",
-    ])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "semantic",
+            "vectors",
+            "--database",
+            str(database),
+            "--batch",
+            "batch-a",
+        ],
+    )
 
     with pytest.raises(ValueError, match="--maintenance"):
         main()
@@ -246,12 +377,78 @@ def test_cli_semantic_vectors_requires_maintenance_before_loading_model(tmp_path
     assert not database.parent.exists()
 
 
+def test_cli_ner_audit_uses_explicit_database_and_report(tmp_path: Path, monkeypatch, capsys) -> None:
+    from semora.pipeline import ner_baseline
+
+    database = tmp_path / "archive.sqlite"
+    output = tmp_path / "reports" / "ner-audit.json"
+    seen = []
+
+    def audit(path, *, run_id, progress):
+        seen.append((path, run_id))
+        progress({"event": "ner_audit_check"})
+        return {"format": "semora.ner-baseline.v1", "eligible": True}
+
+    monkeypatch.setattr(ner_baseline, "audit_ner_baseline", audit)
+    receipt = invoke(
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "ner",
+        "audit",
+        "--database",
+        str(database),
+        "--run-id",
+        "classla-sl",
+        "--output",
+        str(output),
+    )
+    assert receipt == {"report_path": str(output)}
+    assert seen == [(database, "classla-sl")]
+    assert json.loads(output.read_text(encoding="utf-8"))["eligible"]
+    assert not database.exists()
+
+
+def test_cli_ner_index_requires_maintenance_before_model_load(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "archive.sqlite"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "semora",
+            "pipeline",
+            "ner",
+            "index",
+            "--database",
+            str(database),
+            "--batch",
+            "batch-a",
+        ],
+    )
+
+    with pytest.raises(ValueError, match="--maintenance"):
+        main()
+
+    assert not database.exists()
+
+
 def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Path, monkeypatch, capsys) -> None:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "data" / "archive.sqlite"
     invoke(
-        monkeypatch, capsys, "pipeline", "run", "--manifest", str(manifest), "--input-root", str(source),
-        "--database", str(database), "--through", "articles", "--maintenance",
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "run",
+        "--manifest",
+        str(manifest),
+        "--input-root",
+        str(source),
+        "--database",
+        str(database),
+        "--through",
+        "articles",
+        "--maintenance",
     )
 
     def unexpected_model(**_kwargs):
@@ -283,9 +480,23 @@ def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Pat
 
     monkeypatch.setattr(lexical, "ClasslaLemmatizer", FakeLemmatizer)
     lemma = invoke(
-        monkeypatch, capsys, "pipeline", "index", *common, "--stage", "lemma", "--classla-device", "cpu",
-        "--classla-type", "default", "--classla-pos-batch-size", "4", "--classla-lemma-batch-size", "8",
-        "--lemma-model-fingerprint", "qualified-test-model",
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "index",
+        *common,
+        "--stage",
+        "lemma",
+        "--classla-device",
+        "cpu",
+        "--classla-type",
+        "default",
+        "--classla-pos-batch-size",
+        "4",
+        "--classla-lemma-batch-size",
+        "8",
+        "--lemma-model-fingerprint",
+        "qualified-test-model",
     )
     assert lemma["complete"]
     assert lemma["added_articles"] == 1
@@ -295,8 +506,15 @@ def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Pat
     assert created[0].options["pos_batch_size"] == 4
     assert created[0].options["lemma_batch_size"] == 8
     repeated = invoke(
-        monkeypatch, capsys, "pipeline", "index", *common, "--stage", "lemma",
-        "--lemma-model-fingerprint", "qualified-test-model",
+        monkeypatch,
+        capsys,
+        "pipeline",
+        "index",
+        *common,
+        "--stage",
+        "lemma",
+        "--lemma-model-fingerprint",
+        "qualified-test-model",
     )
     assert repeated["added_articles"] == 0
     assert repeated["skipped_articles"] == 1

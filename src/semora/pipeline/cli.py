@@ -91,6 +91,26 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--nprobe", type=int, default=32)
             command.add_argument("--checkpoint-shards", type=int, default=10)
 
+    ner = operations.add_parser("ner", help="Audit/adopt historical NER and extend a selected batch.")
+    ner_operations = ner.add_subparsers(dest="ner_command", required=True)
+    for name in ("audit", "adopt", "index"):
+        command = ner_operations.add_parser(name)
+        _add_io(command)
+        command.add_argument("--run-id", default="classla-sl")
+        if name != "audit":
+            _add_maintenance(command)
+        if name == "index":
+            command.add_argument("--batch", required=True)
+            command.add_argument("--adapter", default="classla")
+            command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+            command.add_argument("--batch-articles", type=int, default=32)
+            command.add_argument("--batch-size", type=int, default=16)
+            command.add_argument("--pipeline-depth", type=int, default=1)
+            command.add_argument("--tokenizer-workers", type=int, default=0)
+            command.add_argument("--ner-pipeline-depth", type=int, default=1)
+            command.add_argument("--ner-decoder", choices=("numpy", "numba"), default="numpy")
+            command.add_argument("--resources", help="Installed adapter resources, relative to the working directory.")
+
 
 def _add_io(command: argparse.ArgumentParser) -> None:
     command.add_argument(
@@ -137,6 +157,7 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         operation in ("run", "index")
         or (operation == "baseline" and args.baseline_command == "adopt")
         or (operation == "semantic" and args.semantic_command != "audit")
+        or (operation == "ner" and args.ner_command != "audit")
     )
     if mutates and not args.maintenance:
         raise ValueError("Stop retrieval readers and legacy index writers, then pass --maintenance.")
@@ -231,6 +252,34 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 semantic_dir,
                 config=config,
                 checkpoint_shards=args.checkpoint_shards,
+                progress=_progress,
+            )
+    elif operation == "ner":
+        if args.ner_command == "audit":
+            from semora.pipeline.ner_baseline import audit_ner_baseline
+
+            report = audit_ner_baseline(database, run_id=args.run_id, progress=_progress)
+            success = report["eligible"]
+        elif args.ner_command == "adopt":
+            from semora.pipeline.ner_adoption import adopt_ner_baseline
+
+            report = adopt_ner_baseline(database, run_id=args.run_id, progress=_progress)
+        else:
+            from semora.pipeline.ner import index_batch_ner
+
+            report = index_batch_ner(
+                database,
+                args.batch,
+                run_id=args.run_id,
+                adapter=args.adapter,
+                device=args.device,
+                batch_articles=args.batch_articles,
+                batch_size=args.batch_size,
+                pipeline_depth=args.pipeline_depth,
+                tokenizer_workers=args.tokenizer_workers,
+                ner_pipeline_depth=args.ner_pipeline_depth,
+                ner_decoder=args.ner_decoder,
+                resources=args.resources,
                 progress=_progress,
             )
     else:

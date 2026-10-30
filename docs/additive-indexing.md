@@ -9,8 +9,8 @@ the historical source corpus into a new build directory.
 
 The implemented path covers strict manifests, read-only planning, additive
 newspapers/articles/chunks, explicit historical baseline audit/adoption,
-batch surface/lemma indexing, and private semantic vector/FAISS generations.
-NER/dictionary integration, full publication verification and Docker packaging
+batch surface/lemma indexing, private semantic vector/FAISS generations and
+audited batch NER extraction. Entity dictionary integration, full publication verification and Docker packaging
 remain later milestones.
 `retrieval_ready=false` is intentional even when corpus and lexical stages finish.
 Do not import into the active archive until the remaining retrieval stages can
@@ -26,7 +26,7 @@ reviewed CSVs -> source adapter -> batch.json + existing source files
                                   articles
                       +---------------+---------------+
                       |               |               |
-                surface -> lemma    chunks          NER [next]
+                surface -> lemma    chunks          NER
                                       |               |
                                 vectors          dictionary [next]
                                       |
@@ -74,6 +74,9 @@ processes. A source batch can live elsewhere; it must remain immutable while use
 | `pipeline semantic adopt --maintenance` | Repeats the audit, records historical chunk input hashes and corpus identity in the mapping database, and leaves old vectors and serving FAISS files unchanged. |
 | `pipeline semantic vectors --maintenance` | Embeds only unmapped chunks in the selected completed batch, writes immutable float16 shards and mapping checkpoints; resumes interrupted publication from its journal. |
 | `pipeline semantic faiss --maintenance` | Builds or extends a private, complete FAISS generation from verified shards, with resumable checkpoints; does not replace the serving index or make retrieval ready. |
+| `pipeline ner audit` | Reads one historical NER run, eligible article contents and every mention in a snapshot; reports exact coverage and structural evidence without migration or model load. |
+| `pipeline ner adopt --maintenance` | Repeats the full audit under writer exclusion and records a historical NER receipt/model identity; preserves extraction rows. |
+| `pipeline ner index --batch <id> --maintenance` | Extracts only pending valid nonblank articles in the selected batch, with atomic completion and mention checkpoints. Loads the adapter only when work is pending. |
 | `pipeline status` | Reads committed batch/stage state. Does not create/migrate a missing database or verify every external artifact. |
 
 ## Manifest contract
@@ -140,6 +143,12 @@ semora pipeline semantic vectors --database /data/indexes/semora.sqlite \
   --semantic-dir /data/indexes/semantic --batch newspapers-2026-10-27 --maintenance
 semora pipeline semantic faiss --database /data/indexes/semora.sqlite \
   --semantic-dir /data/indexes/semantic --maintenance
+semora pipeline ner audit --database /data/indexes/semora.sqlite \
+  --run-id classla-sl --output /reports/ner-audit.json
+semora pipeline ner adopt --database /data/indexes/semora.sqlite \
+  --run-id classla-sl --maintenance
+semora pipeline ner index --database /data/indexes/semora.sqlite \
+  --batch newspapers-2026-10-27 --run-id classla-sl --device cuda --ner-decoder numba --maintenance
 semora pipeline status --database /data/indexes/semora.sqlite --batch newspapers-2026-10-27
 ```
 
@@ -155,6 +164,18 @@ IVFPQ (16,384 lists, 32 PQ subvectors, 8 bits, one million training samples,
 `nprobe=32`); `--index-type flat` is useful for small pilots. `--checkpoint-shards`
 defaults to 10. Completed private generations live under
 `<semantic-dir>/generations/<fingerprint>/`; serving root files remain untouched.
+
+NER `--run-id` selects the extraction profile (default `classla-sl`). The
+historical audit checks the producer's valid nonblank article membership,
+current content hashes, mention counts, indices, spans and text, including
+explicit zero-mention completions. Stored model/source hashes are evidence;
+old execution is not rerun or claimed proven. A populated legacy run requires
+`ner adopt` before additive extraction. New runs store stable model identity
+separately from device, resource paths and batch tuning; incompatible hashes
+require a new run ID. `ner index` accepts `--adapter`, `--device`, `--resources`,
+`--batch-articles`, `--batch-size`, `--pipeline-depth`, `--tokenizer-workers`,
+`--ner-pipeline-depth` and `--ner-decoder`. It does not update the entity
+dictionary or serving search index.
 
 `--through` selects an ingestion prefix: `newspapers`, `articles` or `chunks`
 (default). Rerun the same manifest/settings to advance or resume. Selected stages
@@ -192,9 +213,10 @@ membership/rowids and historical completion evidence. It does not read the old
 source tree or run tokenization, CLASSLA, embeddings or NER. Plan separately
 verifies incoming files and their hashes.
 
-Adoption records only validated article and eligible lexical outputs. Chunk
-baseline adoption, semantic artifact checksums/membership, FAISS validation and
-NER/dictionary adoption are deferred. Historical contentless FTS text is not
+Corpus adoption records only validated article and eligible lexical outputs.
+Semantic and NER have separate audits and adoption receipts; neither infers
+historical model execution from stored declarations. Dictionary adoption is
+still pending. Historical contentless FTS text is not
 reconstructed or cryptographically verified by this audit. Supported FTS schema
 and tokenizer settings are checked against the actual table definitions. Counts and legacy
 `complete` flags alone do not prove coverage or model compatibility. Audit the
@@ -225,15 +247,12 @@ stopping those processes explicitly.
 
 ## Remaining roadmap and acceptance
 
-1. **Semantic:** separate embedding compatibility from batch membership; append
-   immutable verified shards with stable vector IDs; extend a compatible trained
-   FAISS index in a private generation. Journal file/database boundaries and
-   validate membership, not just counts. Periodic compaction/retraining reuses
-   stored vectors rather than repeating historical embeddings.
-2. **Entities/publication:** constrain NER to batch membership, separate model
-   compatibility from tuning, increment dictionary memberships/counts/spellfix,
-   then validate all retrieval paths before restarting readers. SQLite plus
-   vector files/FAISS/dictionary cannot share one transaction.
+1. **Dictionary/publication:** audit and adopt the existing entity dictionary,
+   then increment memberships, counts and spellfix for batch NER outputs with
+   transactional completion. Validate all retrieval paths before restarting
+   readers. SQLite plus vector files/FAISS/dictionary cannot share one transaction.
+2. **Semantic lifecycle:** define safe publication and eventual compaction or
+   retraining from retained vector shards, without repeating old embeddings.
 3. **Portability/package:** keep one Python runner, thin platform wrappers,
    independent model/data/report roots and a GF adapter emitting this contract.
    Build pinned Semora/CLASSLA wheels, qualify Python/PyTorch/CUDA, package Linux
