@@ -45,7 +45,7 @@ class SearchEngine:
         try:
             self.publication = read_publication(self.database.conn, Path(self.database.path))
             self._published_articles = (
-                self.database.conn.execute("SELECT COUNT(*) FROM articles WHERE is_valid=1").fetchone()[0]
+                int(self.database.conn.execute("SELECT COUNT(*) FROM articles WHERE is_valid=1").fetchone()[0])
                 if self.publication is not None
                 else None
             )
@@ -147,6 +147,7 @@ class SearchEngine:
         }
         if self.publication is not None:
             count = self._published_articles
+            assert count is not None
             revision = self.publication["publication_id"]
             status["bm25"].update(
                 available=count > 0, complete=True, indexed_articles=count,
@@ -723,6 +724,7 @@ class SearchEngine:
         if self.semantic_rerank:
             from semora.retrieval.semantic_rerank import rerank_candidates
 
+            assert self._semantic_mapping is not None
             ranked = rerank_candidates(self._semantic_mapping, self.semantic_dir, vector, list(eligible))
         else:
             ranked = sorted(
