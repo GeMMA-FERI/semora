@@ -12,6 +12,7 @@ import json
 import sqlite3
 from collections.abc import Callable
 from contextlib import ExitStack, closing
+from copy import deepcopy
 from pathlib import Path
 
 from semora.corpus import indexer
@@ -296,12 +297,19 @@ def audit_baseline(database_path: str | Path, *, progress: Callable[[dict], None
         return _audit(conn, progress)
 
 
-def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None] | None = None) -> dict:
+def adopt_baseline(
+    database_path: str | Path,
+    *,
+    progress: Callable[[dict], None] | None = None,
+    audit_report: dict | None = None,
+) -> dict:
     """Adopt proven historical articles and eligible legacy lexical memberships.
 
     Retrieval readers and legacy writers must be stopped by the operator. Only
     additive schema migrations are applied; source text and NLP outputs remain
-    unchanged. Audit and completion markers share one writer-reserved snapshot.
+    unchanged. Without audit_report, audit and completion markers share one
+    writer-reserved snapshot. Supplying a prior report explicitly trusts that
+    the historical database has not changed since the report was generated.
     """
     from semora.pipeline.lexical import adopt_legacy_lexical
     from semora.pipeline.publication_state import invalidate_publication
@@ -320,7 +328,23 @@ def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None
             invalidate_publication(target)
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
-                report = _audit(conn, progress)
+                if audit_report is None:
+                    report = _audit(conn, progress)
+                else:
+                    report = deepcopy(audit_report)
+                    corpus_report = report.get("corpus") if isinstance(report, dict) else None
+                    lexical_report = report.get("lexical") if isinstance(report, dict) else None
+                    if (
+                        not isinstance(report, dict)
+                        or report.get("format") != "semora.baseline.v1"
+                        or report.get("eligible") is not True
+                        or not isinstance(corpus_report, dict)
+                        or corpus_report.get("eligible") is not True
+                        or corpus_report.get("error_count") != 0
+                        or not isinstance(lexical_report, dict)
+                        or not all(isinstance(lexical_report.get(stage), dict) for stage in ("surface", "lemma"))
+                    ):
+                        raise ValueError("Supplied baseline audit report is ineligible or invalid.")
                 if not report["corpus"]["eligible"]:
                     raise ValueError("Historical article audit failed: " + _json(report["corpus"]))
                 config = _json({"splitter": SPLITTER})
@@ -370,6 +394,7 @@ def adopt_baseline(database_path: str | Path, *, progress: Callable[[dict], None
                 report["adoption"] = {
                     "baseline_id": baseline_id, "article_issue_markers_added": added,
                     "lexical_markers_added": lexical, "chunk_markers_added": 0,
+                    "audit_source": "fresh_audit" if audit_report is None else "trusted_prior_report",
                 }
                 return report
         finally:

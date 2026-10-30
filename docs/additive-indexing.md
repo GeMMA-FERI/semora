@@ -61,6 +61,11 @@ It does not rebase `--manifest`, `--input-root`, `--database` or `--output`.
 The runner never copies/downloads issue files, assembles a complete source tree,
 or starts/stops services. `--maintenance` is an operator acknowledgement that
 readers and older writers have stopped, not process detection or service control.
+Each historical `adopt` command also accepts `--audit-report <path>` to trust an
+earlier eligible report and skip its repeated full audit. Use this only when the
+operator knows the corpus and index artifacts have remained unchanged. Adoption
+still writes its control state and may traverse existing rows; the report is not
+a backup or a live consistency check.
 Keep writable SQLite and its journal/WAL on local storage shared by same-host
 processes. A source batch can live elsewhere; it must remain immutable while used.
 

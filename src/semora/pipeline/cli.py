@@ -42,6 +42,7 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         _add_io(command)
         if name == "adopt":
             _add_maintenance(command)
+            _add_audit_report(command)
 
     lexical = operations.add_parser("index", help="Add pending lexical entries from an ingested batch.")
     _add_io(lexical)
@@ -74,6 +75,8 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         command.add_argument("--semantic-dir", help="Semantic artifact directory; default: <database parent>/semantic.")
         if name != "audit":
             _add_maintenance(command)
+        if name == "adopt":
+            _add_audit_report(command)
         if name == "vectors":
             command.add_argument("--batch", required=True)
             command.add_argument("--model-id", default=DEFAULT_MODEL_ID)
@@ -99,6 +102,8 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         command.add_argument("--run-id", default="classla-sl")
         if name != "audit":
             _add_maintenance(command)
+        if name == "adopt":
+            _add_audit_report(command)
         if name == "index":
             command.add_argument("--batch", required=True)
             command.add_argument("--adapter", default="classla")
@@ -121,6 +126,8 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         command.add_argument("--run-id", default="classla-sl")
         if name != "audit":
             _add_maintenance(command)
+        if name == "adopt":
+            _add_audit_report(command)
         if name == "index":
             command.add_argument("--batch", required=True)
             command.add_argument("--batch-articles", type=int, default=1000)
@@ -160,6 +167,23 @@ def _add_maintenance(command: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_audit_report(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--audit-report",
+        help="Trust this earlier eligible audit report instead of repeating its full scan."
+    )
+
+
+def _read_audit_report(args: argparse.Namespace) -> dict | None:
+    if not args.audit_report:
+        return None
+    with Path(args.audit_report).open(encoding="utf-8") as stream:
+        report = json.load(stream)
+    if not isinstance(report, dict):
+        raise ValueError("Audit report must be a JSON object.")
+    return report
+
+
 def _progress(event: dict) -> None:
     print(json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True)
 
@@ -170,6 +194,8 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
     protected = [database]
     if hasattr(args, "manifest"):
         protected.append(Path(args.manifest))
+    if getattr(args, "audit_report", None):
+        protected.append(Path(args.audit_report))
     if args.pipeline_command == "semantic":
         semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
         protected.extend(
@@ -250,7 +276,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             report = audit_baseline(database, progress=_progress)
             success = report["eligible"]
         else:
-            report = adopt_baseline(database, progress=_progress)
+            report = adopt_baseline(database, progress=_progress, audit_report=_read_audit_report(args))
     elif operation == "semantic":
         semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
         if args.semantic_command == "audit":
@@ -261,7 +287,9 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
         elif args.semantic_command == "adopt":
             from semora.pipeline.semantic_adoption import adopt_semantic_baseline
 
-            report = adopt_semantic_baseline(database, semantic_dir, progress=_progress)
+            report = adopt_semantic_baseline(
+                database, semantic_dir, progress=_progress, audit_report=_read_audit_report(args)
+            )
         elif args.semantic_command == "vectors":
             from semora.pipeline.semantic import index_batch_vectors
 
@@ -305,7 +333,9 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
         elif args.ner_command == "adopt":
             from semora.pipeline.ner_adoption import adopt_ner_baseline
 
-            report = adopt_ner_baseline(database, run_id=args.run_id, progress=_progress)
+            report = adopt_ner_baseline(
+                database, run_id=args.run_id, progress=_progress, audit_report=_read_audit_report(args)
+            )
         else:
             from semora.pipeline.ner import index_batch_ner
 
@@ -347,6 +377,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 run_id=args.run_id,
                 spellfix_path=spellfix,
                 progress=_progress,
+                audit_report=_read_audit_report(args),
             )
         else:
             from semora.pipeline.entities import index_batch_entities

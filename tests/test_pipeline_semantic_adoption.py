@@ -107,6 +107,35 @@ def test_adoption_preserves_old_vectors_mapping_and_defaults_without_models(tmp_
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_adoption_can_trust_existing_semantic_report_without_rescanning(tmp_path, monkeypatch):
+    from semora.pipeline.semantic_baseline import audit_semantic_baseline
+
+    database, root = _legacy(tmp_path, monkeypatch)
+    report = audit_semantic_baseline(database, root)
+    monkeypatch.setattr(
+        "semora.pipeline.semantic_adoption.audit_semantic_baseline",
+        lambda *_args, **_kwargs: pytest.fail("repeat audit"),
+    )
+
+    adopted = adopt_semantic_baseline(database, root, audit_report=report)
+
+    assert adopted["adoption"]["audit_source"] == "trusted_prior_report"
+    assert adopted["adoption"]["input_hashes_added"] == report["counts"]["mapped_chunks"]
+    assert "adoption" not in report
+
+
+def test_adoption_rejects_stale_semantic_manifest_report(tmp_path, monkeypatch):
+    from semora.pipeline.semantic_baseline import audit_semantic_baseline
+
+    database, root = _legacy(tmp_path, monkeypatch)
+    report = audit_semantic_baseline(database, root)
+    manifest = root / "manifest.json"
+    manifest.write_text(manifest.read_text(encoding="utf-8") + " ", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Supplied semantic audit report"):
+        adopt_semantic_baseline(database, root, audit_report=report)
+
+
 def test_new_batch_after_adoption_embeds_only_new_chunks(tmp_path, monkeypatch):
     database, root = _legacy(tmp_path, monkeypatch)
     adopt_baseline(database)

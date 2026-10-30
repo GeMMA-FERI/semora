@@ -83,6 +83,27 @@ def test_adoption_marks_verified_outputs_only_and_is_idempotent(tmp_path: Path, 
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_adoption_can_trust_existing_audit_without_rerunning_it(tmp_path: Path, monkeypatch) -> None:
+    database = _legacy(tmp_path, lexical=True)
+    report = audit_baseline(database)
+    monkeypatch.setattr("semora.pipeline.baseline._audit", lambda *_args: pytest.fail("repeat audit"))
+
+    adopted = adopt_baseline(database, audit_report=report)
+
+    assert adopted["adoption"]["audit_source"] == "trusted_prior_report"
+    assert adopted["adoption"]["lexical_markers_added"] == {"surface": 2, "lemma": 2}
+    assert "adoption" not in report
+
+
+def test_adoption_rejects_ineligible_prior_audit(tmp_path: Path) -> None:
+    database = _legacy(tmp_path)
+    report = audit_baseline(database)
+    report["eligible"] = False
+
+    with pytest.raises(ValueError, match="Supplied baseline audit report"):
+        adopt_baseline(database, audit_report=report)
+
+
 @pytest.mark.parametrize("column,value", [
     ("content", "Changed article"), ("title", "Wrong title"), ("char_start", 99),
     ("line_end", 99), ("article_id", "wrong-id"),

@@ -49,6 +49,31 @@ def invoke(monkeypatch, capsys, *arguments: str) -> dict:
     return json.loads(capsys.readouterr().out)
 
 
+@pytest.mark.parametrize("operation,module,function,extra", [
+    ("baseline", "baseline", "adopt_baseline", []),
+    ("semantic", "semantic_adoption", "adopt_semantic_baseline", []),
+    ("ner", "ner_adoption", "adopt_ner_baseline", []),
+    ("entities", "entity_adoption", "adopt_entity_baseline", []),
+])
+def test_cli_adoption_passes_explicit_audit_report(
+    tmp_path: Path, monkeypatch, capsys, operation: str, module: str, function: str, extra: list[str]
+) -> None:
+    report_path = tmp_path / "audit.json"
+    report_path.write_text('{"eligible": true}', encoding="utf-8")
+    received = []
+
+    def adopt(*args, **kwargs):
+        received.append(kwargs["audit_report"])
+        return {"adoption": {"already_adopted": False}}
+
+    monkeypatch.setattr(f"semora.pipeline.{module}.{function}", adopt)
+    invoke(
+        monkeypatch, capsys, "pipeline", operation, "adopt", "--database", str(tmp_path / "archive.sqlite"),
+        "--audit-report", str(report_path), "--maintenance", *extra,
+    )
+    assert received == [{"eligible": True}]
+
+
 def test_cli_plan_run_status_respects_explicit_paths_without_models(tmp_path: Path, monkeypatch, capsys) -> None:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "external-data" / "archive.sqlite"

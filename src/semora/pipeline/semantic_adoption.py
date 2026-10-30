@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from contextlib import ExitStack, closing
+from copy import deepcopy
 from pathlib import Path
 
 from semora.pipeline.semantic import (
@@ -25,13 +27,16 @@ def adopt_semantic_baseline(
     semantic_dir: str | Path,
     *,
     progress: Callable[[dict], None] | None = None,
+    audit_report: dict | None = None,
 ) -> dict:
     """Preserve legacy vector IDs/files and record present input hashes.
 
     This trusts recorded legacy configuration and structurally verified files.
     Capturing input hashes now does not prove the historical embedding execution.
     Only control schema/identity may remain after a failed adoption; source text,
-    old manifests and vector files are never rewritten.
+    old manifests and vector files are never rewritten. Supplying audit_report
+    trusts that the corpus and vector artifacts have not changed since its
+    read-only audit; adoption still checks each mapped chunk's input hash.
     """
     source = Path(database_path).resolve(strict=True)
     root = Path(semantic_dir).resolve(strict=True)
@@ -55,7 +60,22 @@ def adopt_semantic_baseline(
                 corpus_id = corpus.conn.execute(
                     "SELECT corpus_id FROM pipeline_corpus_identity WHERE identity_id=1"
                 ).fetchone()[0]
-                report = audit_semantic_baseline(source, root, progress=progress)
+                if audit_report is None:
+                    report = audit_semantic_baseline(source, root, progress=progress)
+                else:
+                    report = deepcopy(audit_report)
+                    if (
+                        not isinstance(report, dict)
+                        or report.get("format") != "semora.semantic-baseline.v1"
+                        or report.get("eligible") is not True
+                        or report.get("error_count") != 0
+                        or not isinstance(report.get("spec"), dict)
+                        or not isinstance(report.get("counts"), dict)
+                        or not isinstance(report.get("evidence_fingerprint"), str)
+                        or report.get("manifest_sha256")
+                        != hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest()
+                    ):
+                        raise ValueError("Supplied semantic audit report is ineligible, invalid, or stale.")
                 if not report["eligible"]:
                     raise ValueError("Semantic baseline audit failed: " + json.dumps(report["errors"]))
                 spec = report["spec"]
@@ -104,6 +124,7 @@ def adopt_semantic_baseline(
                             "receipt_id": report["evidence_fingerprint"],
                             "vector_files_rewritten": 0,
                             "historical_embedding_execution_verified": False,
+                            "audit_source": "fresh_audit" if audit_report is None else "trusted_prior_report",
                         }
                         return report
         finally:

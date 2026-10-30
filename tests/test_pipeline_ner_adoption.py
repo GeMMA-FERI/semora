@@ -10,6 +10,7 @@ import pytest
 from semora.ner.base import Entity, Prediction
 from semora.ner.indexing import build_ner_index
 from semora.pipeline.ner_adoption import adopt_ner_baseline
+from semora.pipeline.ner_baseline import audit_ner_baseline
 from semora.storage import Database
 
 
@@ -78,6 +79,33 @@ def test_ineligible_ner_baseline_cannot_write_adoption_marker(tmp_path):
 
     with pytest.raises(ValueError, match="ineligible"):
         adopt_ner_baseline(database)
+
+    with closing(sqlite3.connect(database)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM pipeline_ner_adoptions").fetchone()[0] == 0
+
+
+def test_ner_adoption_can_trust_prior_report_without_rescan(tmp_path, monkeypatch):
+    database = legacy(tmp_path)
+    report = audit_ner_baseline(database)
+    assert report["eligible"]
+    monkeypatch.setattr(
+        "semora.pipeline.ner_adoption.audit_ner_baseline",
+        lambda *_a, **_k: pytest.fail("repeat NER audit"),
+    )
+
+    adopted = adopt_ner_baseline(database, audit_report=report)
+
+    assert adopted["adoption"]["prior_audit_trusted_without_rescan"] is True
+    assert adopted["evidence_fingerprint"] == report["evidence_fingerprint"]
+
+
+def test_ner_adoption_rejects_altered_prior_report(tmp_path):
+    database = legacy(tmp_path)
+    report = audit_ner_baseline(database)
+    report["counts"]["eligible_articles"] = 999
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        adopt_ner_baseline(database, audit_report=report)
 
     with closing(sqlite3.connect(database)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM pipeline_ner_adoptions").fetchone()[0] == 0

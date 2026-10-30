@@ -141,6 +141,22 @@ def test_entity_adoption_adds_control_schema_without_rewriting_memberships(legac
         ).fetchone()
 
 
+def test_entity_adoption_can_trust_prior_report_without_rescan(legacy, monkeypatch):
+    source, dictionary = legacy
+    adopt_ner_baseline(source)
+    report = audit_entity_baseline(source, dictionary.parent)
+    assert report["eligible"] and report["complete"]
+    monkeypatch.setattr(
+        "semora.pipeline.entity_adoption.audit_entity_baseline",
+        lambda *_a, **_k: pytest.fail("repeat entity audit"),
+    )
+
+    adopted = adopt_entity_baseline(source, dictionary.parent, audit_report=report)
+
+    assert adopted["adoption"]["prior_audit_trusted_without_rescan"] is True
+    assert adopted["evidence_fingerprint"] == report["evidence_fingerprint"]
+
+
 def test_entity_adoption_requires_ner_adoption_and_valid_dictionary(legacy):
     source, dictionary = legacy
     with pytest.raises(ValueError, match="adopt the historical NER"):
