@@ -1,73 +1,42 @@
 # Semora
 
-Semora provides reusable building blocks for newspaper-corpus ingestion,
-document storage, text chunking, embedding generation, dimensionality
-reduction, and lexical or dense retrieval. Its core SQLite storage package has
-no third-party runtime dependencies.
+Semora is a Python toolkit for turning newspaper archives into searchable
+collections. It takes newspaper text in Markdown, separates issues into articles,
+and lets you search by words, meaning, or the names mentioned in the text.
 
-## Installation
+## What you can do
 
-Install the base package from a source checkout:
+- **Build a corpus.** Import newspaper issues with their metadata and keep
+  articles and text chunks in SQLite.
+- **Search the archive.** Find articles with keyword, regular-expression, or
+  semantic search. For Slovene text, lemma search also matches inflected words.
+- **Explore names.** Extract named entities and look up the articles where
+  those names appear.
+- **Work with embeddings.** Split text into token windows, generate embeddings,
+  and reduce their dimensions for analysis.
+- **Add new material.** Import reviewed batches while reusing existing text
+  processing and indexes.
+
+Use the `semora` command for the newspaper workflow, or import the Python modules
+when you only need part of it. Model dependencies are optional, so you can install
+the features you need.
+
+## Getting started
+
+You'll need Python 3.10 or later. From a source checkout, install Semora with:
 
 ```sh
-pip install .
+python -m pip install .
 ```
 
-Install optional capabilities as needed:
+### Search your first articles
 
-```sh
-pip install ".[chunking,embeddings,openai-batch,projection]"
-pip install ".[classla,retrieval,server]"
-```
+Start with keyword search. It uses SQLite's FTS5 support and does not need an
+embedding model or a GPU.
 
-For development:
-
-```sh
-python -m venv .venv
-python -m pip install -e ".[dev]"
-python -m pytest
-```
-
-## SQLite storage and migrations
-
-The database schema and numbered SQL migrations are package resources. Calling
-`Database.initialize()` creates a new database or applies pending migrations:
-
-```python
-from semora import Database
-
-database = Database("data/semantic-search.sqlite")
-try:
-    database.initialize()
-finally:
-    database.close()
-```
-
-Domain repositories are available as `database.documents`, `database.chunks`,
-`database.embeddings`, `database.projections`, and `database.runs`. The direct
-database methods remain available for advanced queries.
-
-## Text and embedding APIs
-
-```python
-from semora.text import TokenWindowProcessor, remove_markdown_images
-from semora.embeddings import get_embedder
-
-clean_text = remove_markdown_images(markdown)
-chunks = TokenWindowProcessor(
-    model_id="intfloat/multilingual-e5-large",
-    token_count=256,
-    token_overlap=64,
-).process("document-id", clean_text)
-
-embedder = get_embedder("intfloat/multilingual-e5-large").load()
-vectors = embedder.embed_documents([text for _, text in chunks])
-```
-
-## Newspaper corpus search
-
-Place source files below `corpus/`. A newspaper issue is a Markdown file and
-may have a matching `_metadata.json` file:
+Place your source files in a `corpus/` folder. Each Markdown file represents a
+newspaper issue, with level-one headings (`# Article title`) marking articles.
+A matching metadata file is optional:
 
 ```text
 corpus/
@@ -76,112 +45,87 @@ corpus/
     └── URN_NBN_SI_doc-0L8XYEOC_metadata.json
 ```
 
-Level-one Markdown headings delimit articles. The following commands build the
-SQLite corpus, BM25 index, and EmbeddingGemma FAISS index under `indexes/`:
+From the directory containing `corpus/`, import the issues and articles, then
+build the keyword index:
 
 ```sh
-semora ingest --newspapers --replace
+semora ingest --newspapers
 semora ingest --articles
-semora ingest --chunks
-semora index bm25 --max-articles 100000
 semora index bm25
-semora models download-classla
-semora index lemma
-semora index semantic --stage vectors --device cuda
-semora index semantic --stage faiss
-semora search bm25 "search terms"
-semora search bm25-combined "iskanje po pregibnih oblikah"
-semora search regex "regular expression" --context-lines 3
-semora search semantic "natural-language query" --before 1 --after 1
+semora search bm25 "gledališče"
 ```
 
-Semantic queries load the manifest's embedding model lazily on CPU by default;
-use `--semantic-device cuda` on `search` or `stdio` to opt into GPU query encoding.
-Use `--offset N` for subsequent BM25 or semantic pages (or `offset` in stdio JSON).
-Semantic pages contain distinct articles, using their best matching chunk, with
-filters applied within at most 10,000 vector candidates. Empty results are not
-proof that no matching article exists. A completed vector stage still requires
-the FAISS stage before the full corpus is searchable; check `semora status`.
+Semora stores the database and indexes under `indexes/`. To work in another
+directory, put `--root PATH` before the subcommand, for example
+`semora --root /path/to/archive search bm25 "gledališče"`.
 
-Search results use relevance-centered snippets limited to 600 characters by
-default; use `--max-snippet-chars` to choose another limit.
+This is the starting workflow for a new corpus. For recurring imports into an
+existing archive, follow the [additive indexing guide](docs/additive-indexing.md),
+which covers batch planning, resume behavior, and publishing updated indexes.
 
-By default, paths are relative to the current directory. Use `--root PATH`
-before the subcommand to select a different repository root. See the
-[corpus-search guide](docs/corpus-search.md) for filters, result fields, and the
-persistent NDJSON interface intended for agent integrations.
+### Add semantic or Slovene lemma search
 
-Running `semora ingest --replace` without stage flags performs all three
-ingestion stages in the same order.
-
-BM25 indexing is contentless, article-oriented, and resumable. `--max-articles` specifies the total
-desired index size, so increasing it continues from the last committed batch;
-omitting it indexes all remaining valid articles. Chunks are used only by the
-semantic index and semantic-search context expansion.
-
-Semantic indexing is split into durable vector and FAISS stages. The vector
-stage stores normalized 256-dimensional float16 shards and resumes after its
-last committed shard. The default FAISS stage builds an IVF-PQ index; it can be
-rebuilt with different search parameters without recomputing embeddings. See
-the [corpus-search guide](docs/corpus-search.md#semantic-indexing) for pilot and
-full-corpus commands and storage estimates.
-
-The optional CLASSLA index lemmatizes Slovene articles in multi-document
-batches and stores a second contentless FTS index. It supports lemma-only and
-combined surface-plus-lemma BM25 search without changing the original text or
-snippets. Use `semora index lemma --profile` to inspect processor throughput
-and CUDA-memory usage. With one CLASSLA worker, tokenization runs in a
-lightweight persistent subprocess while the parent retains the only copy of
-the POS model, lemma model, CUDA context, and lexicon. Set both
-`--pipeline-depth 1` and `--tokenizer-workers 0` to disable this staged path.
-
-Lemma indexing also pipelines SQLite work with CLASSLA inference. Semora fetches
-all chunk mappings for an article group in one query, prefetches the next group
-while CLASSLA is running, and commits completed groups through one ordered writer.
-Each FTS insert and resume checkpoint remains in the same transaction.
-
-For read-only performance diagnosis, use `semora profile classla` to create a
-PyTorch CPU/CUDA trace and `semora benchmark classla --workers 1 2 3 4` to
-measure whether multiple CLASSLA processes improve steady-state throughput.
-When the benchmark supports it, `semora index lemma --workers N` enables the
-same architecture with a single ordered SQLite writer.
-
-To benchmark the shared-memory staged path separately, run:
+Install the relevant extras from the source checkout:
 
 ```sh
-semora benchmark classla --workers 1 --pipeline-depth 3 --tokenizer-workers 1 \
-  --classla-lemma-batch-size 200
+python -m pip install ".[chunking,retrieval]"
+python -m pip install ".[classla]"
 ```
 
-## Command-line tools
+Semantic search needs text chunks and an embedding index. Slovene lemma search
+needs CLASSLA's language resources and a lemma index. The
+[corpus search guide](docs/corpus-search.md) walks through both, including model
+access, CPU/GPU options, and trying a small sample before indexing a full archive.
 
-The package also keeps focused commands for lower-level workflows:
+## Use Semora in Python
+
+The same tools are available without the newspaper command-line workflow.
+For example, you can turn text into overlapping token windows and embed them:
 
 ```sh
-semora-project-embeddings --help
-semora-query --help
-semora-serve --help
+python -m pip install ".[chunking,embeddings]"
 ```
 
-The underlying modules can also be executed with `python -m`, for example:
+```python
+from semora.embeddings import get_embedder
+from semora.text import TokenWindowProcessor
+
+chunks = TokenWindowProcessor(
+    model_id="intfloat/multilingual-e5-large",
+    token_count=256,
+    token_overlap=64,
+).process("article-1", "Your article text goes here.")
+
+embedder = get_embedder("intfloat/multilingual-e5-large").load()
+vectors = embedder.embed_documents([text for _, text in chunks])
+```
+
+See the guides for [text processing](docs/text.md),
+[embeddings](docs/embeddings.md), and [SQLite storage](docs/storage.md) for more
+examples.
+
+## Further reading
+
+| If you want to…                                               | Read                                                |
+| ------------------------------------------------------------- | --------------------------------------------------- |
+| Choose dependencies and set up models                         | [Installation](docs/installation.md)                |
+| Build indexes, filter results, or connect an agent over stdio | [Corpus indexing and search](docs/corpus-search.md) |
+| Add batches to an existing archive                            | [Additive indexing](docs/additive-indexing.md)      |
+| Extract named entities                                        | [NER indexing](docs/ner-indexing.md)                |
+| Find names and their articles                                 | [Entity search](docs/entity-search.md)              |
+| Compare entity extraction models                              | [NER benchmarks](docs/ner-benchmark.md)             |
+| Use projection, query, and server commands                    | [Command-line tools](docs/cli.md)                   |
+
+## Development
+
+Create and activate a virtual environment, then install the development tools
+and run the tests:
 
 ```sh
-python -m semora.projection.projector --help
+python -m venv .venv
+# Activate .venv using the command for your shell.
+python -m pip install -e ".[dev]"
+python -m pytest
 ```
 
-Additional usage notes are available in [`docs/`](docs/).
-
-For recurring imports, see [additive newspaper indexing](docs/additive-indexing.md).
-The pipeline supports manifest planning, historical baseline audit/adoption and
-additive corpus/surface/lemma indexing. Semantic/entity updates, reader
-publication and Linux/Docker packaging remain in progress.
-
-For offline named-entity model comparisons, see the
-[NER benchmark guide](docs/ner-benchmark.md). It includes reusable article samples,
-CLASSLA and Transformers adapters, isolated batch-size sweeps, timing summaries,
-and a local HTML report of highlighted disagreements. It does not modify the
-production database or require manually annotating an evaluation corpus.
-
-For resumable extraction into the corpus database, use `semora index ner`.
-See the [production NER guide](docs/ner-indexing.md) for commands, stored entity
-fields, model run identities, and safe batch/resume behavior.
+Tests for optional features need their corresponding extras installed.
