@@ -85,7 +85,10 @@ processes. A source batch can live elsewhere; it must remain immutable while use
 | `pipeline publication --batch <id> --semantic-generation <id> --publish --maintenance` | Repeats the full gate under writer locks, then atomically replaces `<database parent>/publication.json`. A failed gate returns an ineligible report and leaves the pointer untouched. Restart retrieval readers after success. |
 | `pipeline status` | Reads committed batch/stage state. Does not create/migrate a missing database or verify every external artifact. |
 
-`pipeline publication` also accepts `--database`, `--semantic-dir`,
+The gate checks the selected batch and verifies that no other registered
+batch has unfinished ingestion or lexical coverage; its semantic generation
+must cover every eligible chunk in the current corpus. It also checks global
+NER/entity dictionary consistency. `pipeline publication` accepts `--database`, `--semantic-dir`,
 `--entity-dir`, `--run-id` (default `classla-sl`), and optional trusted
 `--spellfix-path`. Without `--publish` it is read-only and does not require
 `--maintenance`. It can take substantial time: it streams the full 15.7 GB

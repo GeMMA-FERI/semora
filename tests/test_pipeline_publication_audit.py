@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -38,3 +39,36 @@ def test_audit_reports_incomplete_stages_without_publishing(tmp_path: Path) -> N
 def test_audit_rejects_ambiguous_faiss_generation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="64-character"):
         audit_publication(tmp_path, "batch-a", tmp_path, "../unsafe", tmp_path)
+
+
+def test_audit_checks_lexical_coverage_outside_selected_batch(tmp_path: Path) -> None:
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    ingest(tmp_path, "batch-b", "Straza/b.md")
+    index_batch_lexical(source, "batch-b")
+    index_batch_lexical(source, "batch-b", stage="lemma", lemmatizer=CountingLemmatizer())
+    semantic = tmp_path / "indexes" / "semantic"
+    entities = tmp_path / "indexes" / "entities"
+    semantic.mkdir(exist_ok=True)
+    entities.mkdir(exist_ok=True)
+
+    report = audit_publication(source, "batch-b", semantic, "a" * 64, entities)
+
+    assert report["stages"]["surface"]["complete"] is False
+    assert report["stages"]["lemma"]["complete"] is False
+    assert any("outside the selected batch" in item["reason"] for item in report["errors"])
+
+
+def test_audit_rejects_an_unfinished_other_batch(tmp_path: Path) -> None:
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    ingest(tmp_path, "batch-b", "Straza/b.md")
+    with sqlite3.connect(source) as corpus:
+        corpus.execute("UPDATE pipeline_batches SET state='failed' WHERE batch_id='batch-a'")
+    semantic = tmp_path / "indexes" / "semantic"
+    entities = tmp_path / "indexes" / "entities"
+    semantic.mkdir(exist_ok=True)
+    entities.mkdir(exist_ok=True)
+
+    report = audit_publication(source, "batch-b", semantic, "a" * 64, entities)
+
+    assert report["stages"]["ingestion"]["complete"] is False
+    assert any("batch-a" in item["reason"] for item in report["errors"])

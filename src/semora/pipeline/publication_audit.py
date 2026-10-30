@@ -90,9 +90,9 @@ def audit_publication(
     if (semantic / "mapping.sqlite").exists() and source.samefile(semantic / "mapping.sqlite"):
         raise ValueError("Corpus and semantic mapping must be different files.")
 
-    check("ingestion", lambda: _ingestion(batch_status(source, batch_id)))
     with closing(open_connection(source, read_only=True)) as corpus:
         corpus.execute("BEGIN")
+        check("ingestion", lambda: _ingestion(corpus, batch_status(source, batch_id)))
         identity = corpus.execute(
             "SELECT corpus_id FROM pipeline_corpus_identity WHERE identity_id=1"
         ).fetchone()
@@ -136,6 +136,14 @@ def audit_publication(
                 vectors = sum(shard.vector_count for shard in shards)
                 if verified["chunks"] != vectors:
                     raise ValueError("Private FAISS generation does not cover the current mapping.")
+                corpus_chunks = mapping.execute(
+                    "SELECT COUNT(*) FROM corpus.chunks c JOIN corpus.articles a USING(article_id) "
+                    "WHERE a.is_valid=1"
+                ).fetchone()[0]
+                if vectors != corpus_chunks:
+                    raise ValueError(
+                        f"Semantic mapping omits eligible corpus chunks: {vectors}/{corpus_chunks}."
+                    )
                 return {"complete": True, "batch_chunks": eligible, "mapped_chunks": vectors,
                         "generation": semantic_generation, "model_id": config["model_id"],
                         "dimensions": config["dimensions"],
@@ -242,9 +250,19 @@ def audit_publication(
     return report
 
 
-def _ingestion(status: dict) -> dict:
+def _ingestion(corpus: sqlite3.Connection, status: dict) -> dict:
     if not status["ingestion_complete"] or status["issues"] != status["issue_count"]:
         raise ValueError("Selected batch newspaper/article/chunk ingestion is incomplete.")
+    pending = corpus.execute(
+        "SELECT b.batch_id FROM pipeline_batches b WHERE b.state!='ingested' "
+        "OR b.issue_count<>(SELECT COUNT(*) FROM pipeline_batch_issues i WHERE i.batch_id=b.batch_id) "
+        "OR EXISTS (SELECT 1 FROM pipeline_batch_issues i WHERE i.batch_id=b.batch_id "
+        "AND (NOT EXISTS (SELECT 1 FROM pipeline_issue_stages s WHERE s.newspaper_id=i.newspaper_id "
+        "AND s.stage='articles') OR NOT EXISTS (SELECT 1 FROM pipeline_issue_stages s "
+        "WHERE s.newspaper_id=i.newspaper_id AND s.stage='chunks'))) LIMIT 1"
+    ).fetchone()
+    if pending is not None:
+        raise ValueError(f"Another registered batch has unfinished ingestion: {pending['batch_id']}.")
     return {
         "complete": True,
         "issues": status["issues"],
@@ -262,6 +280,14 @@ def _lexical(corpus: sqlite3.Connection, batch_id: str, stage: str) -> dict:
     eligible, completed = _validate_existing(corpus, batch_id, stage, json.loads(row[0]))
     if eligible != completed:
         raise ValueError(f"{stage} lexical index is incomplete: {completed}/{eligible}.")
+    missing = corpus.execute(
+        "SELECT a.article_id FROM articles a LEFT JOIN pipeline_lexical_state s "
+        "ON s.article_id=a.article_id AND s.stage=? "
+        "WHERE a.is_valid=1 AND s.article_id IS NULL LIMIT 1",
+        (stage,),
+    ).fetchone()
+    if missing is not None:
+        raise ValueError(f"{stage} lexical index has an unpublished article outside the selected batch.")
     return {"complete": True, "eligible_articles": eligible, "indexed_articles": completed}
 
 
