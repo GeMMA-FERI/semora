@@ -8,9 +8,10 @@ the historical source corpus into a new build directory.
 ## Current scope
 
 The implemented path covers strict manifests, read-only planning, additive
-newspapers/articles/chunks, explicit historical baseline audit/adoption, and
-batch surface/lemma indexing. Semantic vectors/FAISS, NER/dictionary integration,
-full publication verification and Docker packaging remain later milestones.
+newspapers/articles/chunks, explicit historical baseline audit/adoption,
+batch surface/lemma indexing, and private semantic vector/FAISS generations.
+NER/dictionary integration, full publication verification and Docker packaging
+remain later milestones.
 `retrieval_ready=false` is intentional even when corpus and lexical stages finish.
 Do not import into the active archive until the remaining retrieval stages can
 be brought to matching coverage before readers restart.
@@ -27,9 +28,9 @@ reviewed CSVs -> source adapter -> batch.json + existing source files
                       |               |               |
                 surface -> lemma    chunks          NER [next]
                                       |               |
-                                vectors [next]   dictionary [next]
+                                vectors          dictionary [next]
                                       |
-                                 FAISS [next]
+                                 FAISS
 ```
 
 Historical article/lexical records enter the ledger through explicit baseline
@@ -49,6 +50,7 @@ It does not rebase `--manifest`, `--input-root`, `--database` or `--output`.
 | `--input-root` | Resolves only `markdown_path` and `metadata_path` inside that manifest. |
 | `relative_path` | Canonical logical source path used for stable IDs; independent of host/data/input location. |
 | `--database` | Existing or new corpus SQLite path; baseline commands require an existing archive. |
+| `--semantic-dir` | Semantic artifact root; default `<database parent>/semantic`, independent of `--root`. Holds `mapping.sqlite`, `vectors/`, and private `generations/`. |
 | Models/resources | Loaded only by a selected stage that has pending model work. Planning, status, baseline audit/adoption and newspaper storage require no NLP model. |
 | stdin | Unused. Commands read their explicit files/database/configuration. |
 | stdout | Full JSON report; with `--output`, only `{"report_path":"<absolute path>"}`. |
@@ -68,6 +70,10 @@ processes. A source batch can live elsewhere; it must remain immutable while use
 | `pipeline baseline adopt --maintenance` | Repeats the audit under writer exclusion and registers verified historical article/lexical completion. Adds ledger/schema state; preserves historical source and index rows. |
 | `pipeline run --maintenance` | Validates all inputs before corpus changes, then commits selected source/article/chunk outputs and stage markers per issue. Creates database/ledger and lock files as needed. No retrieval publication. |
 | `pipeline index --maintenance` | Adds selected batch surface/lemma outputs and durable completion; preserves completed compatible work. Acquires writer locks. No semantic/entity publication. |
+| `pipeline semantic audit` | Reads the existing v2 semantic manifest, mapping, corpus and every raw shard; reports eligibility and evidence without migration, model loading or file changes. |
+| `pipeline semantic adopt --maintenance` | Repeats the audit, records historical chunk input hashes and corpus identity in the mapping database, and leaves old vectors and serving FAISS files unchanged. |
+| `pipeline semantic vectors --maintenance` | Embeds only unmapped chunks in the selected completed batch, writes immutable float16 shards and mapping checkpoints; resumes interrupted publication from its journal. |
+| `pipeline semantic faiss --maintenance` | Builds or extends a private, complete FAISS generation from verified shards, with resumable checkpoints; does not replace the serving index or make retrieval ready. |
 | `pipeline status` | Reads committed batch/stage state. Does not create/migrate a missing database or verify every external artifact. |
 
 ## Manifest contract
@@ -126,8 +132,29 @@ semora pipeline index --database /data/indexes/semora.sqlite --batch newspapers-
   --stage surface --maintenance
 semora pipeline index --database /data/indexes/semora.sqlite --batch newspapers-2026-10-27 \
   --stage lemma --classla-device cuda --maintenance
+semora pipeline semantic audit --database /data/indexes/semora.sqlite \
+  --semantic-dir /data/indexes/semantic --output /reports/semantic-audit.json
+semora pipeline semantic adopt --database /data/indexes/semora.sqlite \
+  --semantic-dir /data/indexes/semantic --maintenance
+semora pipeline semantic vectors --database /data/indexes/semora.sqlite \
+  --semantic-dir /data/indexes/semantic --batch newspapers-2026-10-27 --maintenance
+semora pipeline semantic faiss --database /data/indexes/semora.sqlite \
+  --semantic-dir /data/indexes/semantic --maintenance
 semora pipeline status --database /data/indexes/semora.sqlite --batch newspapers-2026-10-27
 ```
+
+Semantic vector defaults match the existing scripts: `google/embeddinggemma-300m`,
+unknown model revision, 256 dimensions, 64 texts per encode call and 10,000 vectors
+per shard. `--model-revision` records a pinned revision when supplied; an omitted
+historical revision is never described as verified. The encode path uses
+`encode_document` where available and L2-normalizes float32 output before
+storing little-endian float16 vectors. A semantic audit checks stored IDs,
+source spans, configuration and shard bytes; it cannot reproduce the exact
+historical model or tokenizer revision from absent metadata. FAISS defaults to
+IVFPQ (16,384 lists, 32 PQ subvectors, 8 bits, one million training samples,
+`nprobe=32`); `--index-type flat` is useful for small pilots. `--checkpoint-shards`
+defaults to 10. Completed private generations live under
+`<semantic-dir>/generations/<fingerprint>/`; serving root files remain untouched.
 
 `--through` selects an ingestion prefix: `newspapers`, `articles` or `chunks`
 (default). Rerun the same manifest/settings to advance or resume. Selected stages

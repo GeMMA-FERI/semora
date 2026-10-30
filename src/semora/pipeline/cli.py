@@ -51,7 +51,9 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     lexical.add_argument("--batch-size", type=int, default=1000, help="Articles per committed checkpoint.")
     lexical.add_argument("--classla-type", default="default")
     lexical.add_argument(
-        "--classla-device", choices=("auto", "cpu", "cuda"), default="cpu",
+        "--classla-device",
+        choices=("auto", "cpu", "cuda"),
+        default="cpu",
         help="CLASSLA device (default: cpu); use cuda explicitly.",
     )
     lexical.add_argument(
@@ -63,6 +65,31 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         "--lemma-model-fingerprint",
         help="Operator-supplied model identity (not computed here); omitted means unknown.",
     )
+
+    semantic = operations.add_parser("semantic", help="Audit/adopt vectors and build additive semantic outputs.")
+    semantic_operations = semantic.add_subparsers(dest="semantic_command", required=True)
+    for name in ("audit", "adopt", "vectors", "faiss"):
+        command = semantic_operations.add_parser(name)
+        _add_io(command)
+        command.add_argument("--semantic-dir", help="Semantic artifact directory; default: <database parent>/semantic.")
+        if name != "audit":
+            _add_maintenance(command)
+        if name == "vectors":
+            command.add_argument("--batch", required=True)
+            command.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+            command.add_argument("--model-revision", help="Optional immutable model revision; omitted means unknown.")
+            command.add_argument("--dimensions", type=int, default=256)
+            command.add_argument("--batch-size", type=int, default=64)
+            command.add_argument("--shard-size", type=int, default=10_000)
+            command.add_argument("--device", help="SentenceTransformer device, such as cpu or cuda.")
+        elif name == "faiss":
+            command.add_argument("--index-type", choices=("flat", "ivfpq"), default="ivfpq")
+            command.add_argument("--nlist", type=int, default=16_384)
+            command.add_argument("--pq-m", type=int, default=32)
+            command.add_argument("--pq-bits", type=int, default=8)
+            command.add_argument("--train-samples", type=int, default=1_000_000)
+            command.add_argument("--nprobe", type=int, default=32)
+            command.add_argument("--checkpoint-shards", type=int, default=10)
 
 
 def _add_io(command: argparse.ArgumentParser) -> None:
@@ -94,9 +121,23 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
     protected = [database]
     if hasattr(args, "manifest"):
         protected.append(Path(args.manifest))
+    if args.pipeline_command == "semantic":
+        semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
+        protected.extend(
+            (
+                semantic_dir,
+                semantic_dir / "mapping.sqlite",
+                semantic_dir / "manifest.json",
+                semantic_dir / "index.faiss",
+            )
+        )
     output = report_path(args.output, protected=protected) if args.output else None
     operation = args.pipeline_command
-    mutates = operation in ("run", "index") or (operation == "baseline" and args.baseline_command == "adopt")
+    mutates = (
+        operation in ("run", "index")
+        or (operation == "baseline" and args.baseline_command == "adopt")
+        or (operation == "semantic" and args.semantic_command != "audit")
+    )
     if mutates and not args.maintenance:
         raise ValueError("Stop retrieval readers and legacy index writers, then pass --maintenance.")
 
@@ -147,6 +188,51 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             success = report["eligible"]
         else:
             report = adopt_baseline(database, progress=_progress)
+    elif operation == "semantic":
+        semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
+        if args.semantic_command == "audit":
+            from semora.pipeline.semantic_baseline import audit_semantic_baseline
+
+            report = audit_semantic_baseline(database, semantic_dir, progress=_progress)
+            success = report["eligible"]
+        elif args.semantic_command == "adopt":
+            from semora.pipeline.semantic_adoption import adopt_semantic_baseline
+
+            report = adopt_semantic_baseline(database, semantic_dir, progress=_progress)
+        elif args.semantic_command == "vectors":
+            from semora.pipeline.semantic import index_batch_vectors
+
+            report = index_batch_vectors(
+                database,
+                args.batch,
+                semantic_dir,
+                model_id=args.model_id,
+                model_revision=args.model_revision,
+                dimensions=args.dimensions,
+                batch_size=args.batch_size,
+                shard_size=args.shard_size,
+                device=args.device,
+                progress=_progress,
+            )
+        else:
+            from semora.pipeline.semantic_faiss import build_semantic_generation
+            from semora.retrieval.semantic_faiss import FaissBuildConfig
+
+            config = FaissBuildConfig(
+                index_type=args.index_type,
+                nlist=args.nlist,
+                pq_m=args.pq_m,
+                pq_bits=args.pq_bits,
+                train_samples=args.train_samples,
+                nprobe=args.nprobe,
+            )
+            report = build_semantic_generation(
+                database,
+                semantic_dir,
+                config=config,
+                checkpoint_shards=args.checkpoint_shards,
+                progress=_progress,
+            )
     else:
         from semora.pipeline.lexical import index_batch_lexical
 

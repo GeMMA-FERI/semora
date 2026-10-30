@@ -20,7 +20,9 @@ def open_connection(path: str | Path, *, read_only: bool = False) -> sqlite3.Con
             connection = sqlite3.connect(database_uri, uri=True)
         else:
             database_path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(database_path)
+            # URI mode also governs ATTACH: keep read-only attached archives
+            # read-only and correctly decode Windows spaces/braces in file URIs.
+            connection = sqlite3.connect(database_path.resolve().as_uri() + "?mode=rwc", uri=True)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 60000")
     connection.execute("PRAGMA foreign_keys = ON")

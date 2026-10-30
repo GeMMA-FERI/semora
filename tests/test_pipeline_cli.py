@@ -210,6 +210,42 @@ def test_cli_baseline_adopt_requires_maintenance_before_database_access(tmp_path
     assert not database.parent.exists()
 
 
+def test_cli_semantic_audit_uses_explicit_artifact_root_and_new_report(tmp_path: Path, monkeypatch, capsys) -> None:
+    from semora.pipeline import semantic_baseline
+
+    database = tmp_path / "corpus" / "archive.sqlite"
+    semantic_dir = tmp_path / "artifacts" / "semantic"
+    output = tmp_path / "reports" / "audit.json"
+    seen = []
+
+    def audit(source, root, *, progress):
+        seen.append((source, root))
+        progress({"event": "audit_check"})
+        return {"eligible": True, "format": "semora.semantic-baseline.v1"}
+
+    monkeypatch.setattr(semantic_baseline, "audit_semantic_baseline", audit)
+    receipt = invoke(
+        monkeypatch, capsys, "pipeline", "semantic", "audit", "--database", str(database),
+        "--semantic-dir", str(semantic_dir), "--output", str(output),
+    )
+    assert receipt == {"report_path": str(output)}
+    assert seen == [(database, semantic_dir)]
+    assert json.loads(output.read_text(encoding="utf-8"))["eligible"]
+    assert not database.parent.exists() and not semantic_dir.exists()
+
+
+def test_cli_semantic_vectors_requires_maintenance_before_loading_model(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "data" / "archive.sqlite"
+    monkeypatch.setattr(sys, "argv", [
+        "semora", "pipeline", "semantic", "vectors", "--database", str(database), "--batch", "batch-a",
+    ])
+
+    with pytest.raises(ValueError, match="--maintenance"):
+        main()
+
+    assert not database.parent.exists()
+
+
 def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Path, monkeypatch, capsys) -> None:
     manifest, source = prepare_manifest(tmp_path)
     database = tmp_path / "data" / "archive.sqlite"
