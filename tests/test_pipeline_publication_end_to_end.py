@@ -127,6 +127,9 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
         found = engine.search_entities("Ana")
         assert found["entities"]
         assert found["generation"] == published["publication_id"]
+        articles = engine.search_entity_articles("Ana", generation=found["generation"])
+        assert articles["hits"]
+        assert articles["generation"] == published["publication_id"]
     finally:
         engine.close()
 
@@ -166,5 +169,12 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
         assert reopened.index_status()["bm25"]["indexed_articles"] == 3
         assert reopened.index_status()["lemma"]["indexed_articles"] == 3
         assert reopened.search_entities("Ana")["generation"] == republished["publication_id"]
+        with pytest.raises(ValueError, match="changed"):
+            reopened.search_entity_articles("Ana", generation=published["publication_id"])
     finally:
         reopened.close()
+    reranked = SearchEngine(database, semantic, semantic_rerank=True)
+    try:
+        assert reranked.search("semantic", "Ana", limit=3)
+    finally:
+        reranked.close()
