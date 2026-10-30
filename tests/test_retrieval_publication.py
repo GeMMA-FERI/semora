@@ -18,6 +18,8 @@ def _corpus(tmp_path):
             "INSERT INTO pipeline_publication_state VALUES (1, 4);"
             "CREATE TABLE pipeline_corpus_identity (identity_id INTEGER PRIMARY KEY, corpus_id TEXT NOT NULL);"
             "INSERT INTO pipeline_corpus_identity VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');"
+            "CREATE TABLE articles (article_id TEXT PRIMARY KEY, is_valid INTEGER NOT NULL);"
+            "INSERT INTO articles VALUES ('one', 1);"
         )
     return path
 

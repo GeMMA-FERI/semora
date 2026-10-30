@@ -120,6 +120,8 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
     monkeypatch.setitem(sys.modules, "sentence_transformers", types.SimpleNamespace(SentenceTransformer=QueryModel))
     engine = SearchEngine(database, semantic)
     try:
+        assert engine.index_status()["bm25"]["indexed_articles"] == 2
+        assert engine.index_status()["lemma"]["indexed_articles"] == 2
         hits = engine.search("semantic", "Ana", limit=10)
         assert hits
         found = engine.search_entities("Ana")
@@ -161,6 +163,8 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
     assert republished["published"] and republished["publication_id"] != published["publication_id"]
     reopened = SearchEngine(database, semantic)
     try:
+        assert reopened.index_status()["bm25"]["indexed_articles"] == 3
+        assert reopened.index_status()["lemma"]["indexed_articles"] == 3
         assert reopened.search_entities("Ana")["generation"] == republished["publication_id"]
     finally:
         reopened.close()

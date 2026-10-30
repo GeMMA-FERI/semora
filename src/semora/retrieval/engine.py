@@ -44,6 +44,11 @@ class SearchEngine:
         self.database = Database(database_path, read_only=True)
         try:
             self.publication = read_publication(self.database.conn, Path(self.database.path))
+            self._published_articles = (
+                self.database.conn.execute("SELECT COUNT(*) FROM articles WHERE is_valid=1").fetchone()[0]
+                if self.publication is not None
+                else None
+            )
         except BaseException:
             self.database.close()
             raise
@@ -122,7 +127,7 @@ class SearchEngine:
                 dimensions=manifest.get("dimensions"),
                 created_at=manifest.get("created_at"),
             )
-        return {
+        status = {
             "bm25": {
                 "available": bm25 is not None and int(bm25["indexed_articles"]) > 0,
                 "complete": bool(bm25["complete"]) if bm25 else False,
@@ -140,6 +145,20 @@ class SearchEngine:
             },
             "semantic": semantic,
         }
+        if self.publication is not None:
+            count = self._published_articles
+            revision = self.publication["publication_id"]
+            status["bm25"].update(
+                available=count > 0, complete=True, indexed_articles=count,
+                updated_at=None, publication_id=revision,
+            )
+            status["lemma"].update(
+                available=count > 0, complete=True, surface_articles=count,
+                processed_articles=count, indexed_articles=count, updated_at=None,
+                publication_id=revision,
+            )
+            status["semantic"]["publication_id"] = revision
+        return status
 
     def load_semantic(self) -> None:
         if self._semantic_index is not None:
@@ -331,7 +350,9 @@ class SearchEngine:
         if newspapers is not None:
             if mode != "semantic" or newspaper is not None:
                 raise ValueError("newspapers is supported only for semantic search without newspaper.")
-            if not 1 <= len(newspapers) <= 100 or any(not isinstance(name, str) or not name.strip() or len(name) > 200 for name in newspapers):
+            if not 1 <= len(newspapers) <= 100 or any(
+                not isinstance(name, str) or not name.strip() or len(name) > 200 for name in newspapers
+            ):
                 raise ValueError("Select between 1 and 100 nonblank newspaper titles.")
         if limit < 1 or offset < 0 or before < 0 or after < 0 or context_lines < 0:
             raise ValueError("limit must be positive; offset and context values must be non-negative.")
@@ -385,7 +406,9 @@ class SearchEngine:
                 date_to=date_to,
             )
         elif mode == "semantic":
-            matches = self._search_semantic(query, limit, newspapers if newspapers is not None else newspaper, date_from, date_to, offset)
+            matches = self._search_semantic(
+                query, limit, newspapers if newspapers is not None else newspaper, date_from, date_to, offset
+            )
         else:
             raise ValueError(f"Unknown search mode: {mode}")
         self._record_profile_time("retrieval", retrieval_started)

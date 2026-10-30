@@ -105,6 +105,9 @@ checkpoints also advance a matching corpus/dictionary token; this detects a
 restored older corpus even when its logical UUID is unchanged. Stop existing
 readers and legacy writers, take a consistent backup, then use `--publish` and
 restart the gateway. Previously deployed readers do not understand this gate.
+After restart, reader health reports the audited publication ID and current
+published article totals for BM25 and lemma; legacy pre-publication counters
+are no longer used as the active coverage count.
 
 ## Manifest contract
 
