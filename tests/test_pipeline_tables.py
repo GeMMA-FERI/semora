@@ -56,3 +56,13 @@ def test_repair_only_table_article_and_resume(tmp_path):
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert dict(before)[plain_id] == dict(after)[plain_id]
     assert index_batch_lexical(database, "batch-a")["added_articles"] == 0
+
+    fresh = tmp_path / "fresh.sqlite"
+    run_batch(manifest, root, fresh, tokenizer=WordTokenizer())
+    index_batch_lexical(fresh, "batch-a")
+    with closing(sqlite3.connect(fresh)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunks WHERE text LIKE '%secretcell%'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM article_fts WHERE article_fts MATCH 'secretcell'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT policy,state FROM pipeline_batch_table_policies WHERE batch_id='batch-a'"
+        ).fetchone() == ("exclude_html_tables_v1", "active")
