@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
@@ -24,6 +25,10 @@ _WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
 
 def _initialize_lemma_worker(config: dict) -> None:
     global _WORKER_LEMMATIZER
+    # The tokenizer prints OCR warnings containing Slovene text. Windows worker
+    # consoles may use a legacy encoding; logging must not abort inference.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="backslashreplace")
     _WORKER_LEMMATIZER = ClasslaLemmatizer(**config)
 
 

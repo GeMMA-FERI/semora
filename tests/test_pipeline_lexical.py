@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from pathlib import Path
 
@@ -67,6 +69,18 @@ def snapshot(database: Path, table: str) -> list[tuple]:
     assert table in {"article_fts_map", "article_lemmas", "pipeline_lexical_state"}
     with closing(sqlite3.connect(database)) as connection:
         return connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
+
+
+def test_lemma_worker_warning_does_not_fail_on_windows_encoding(monkeypatch) -> None:
+    raw = io.BytesIO()
+    output = io.TextIOWrapper(raw, encoding="cp1252", write_through=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(sys, "stdout", output)
+        patch.setattr(lexical, "ClasslaLemmatizer", lambda **_: object())
+        patch.setattr(lexical, "_WORKER_LEMMATIZER", None)
+        lexical._initialize_lemma_worker({})
+        output.write("č")
+    assert raw.getvalue() == b"\\u010d"
 
 
 def test_pending_pages_follow_article_index_without_resorting_batch(tmp_path: Path) -> None:
