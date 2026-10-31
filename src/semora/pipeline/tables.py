@@ -76,15 +76,20 @@ def table_repair_plan(
         ).fetchone() if connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_batch_table_policies'"
         ).fetchone() else None
-        candidates = _candidates(connection, batch_id)
-        semantic_root = Path(semantic_dir) if semantic_dir is not None else Path(database_path).parent / "semantic"
-        _guard_downstream(connection, batch_id, semantic_root / "mapping.sqlite", candidates)
         has_receipts = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_article_table_repairs'"
         ).fetchone()
         repaired = connection.execute(
             "SELECT COUNT(*) FROM pipeline_article_table_repairs WHERE batch_id=?", (batch_id,),
         ).fetchone()[0] if has_receipts else 0
+        if policy_row and policy_row["state"] == "active":
+            return {
+                "batch_id": batch_id, "policy": policy_row["policy"], "table_articles": repaired,
+                "already_repaired": repaired, "remaining_articles": 0,
+            }
+        candidates = _candidates(connection, batch_id)
+        semantic_root = Path(semantic_dir) if semantic_dir is not None else Path(database_path).parent / "semantic"
+        _guard_downstream(connection, batch_id, semantic_root / "mapping.sqlite", candidates)
         return {
             "batch_id": batch_id, "policy": policy_row["state"] if policy_row else "legacy",
             "table_articles": len(candidates),

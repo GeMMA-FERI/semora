@@ -45,6 +45,7 @@ def test_repair_only_table_article_and_resume(tmp_path):
     assert table_repair_plan(database, "batch-a")["table_articles"] == 1
     result = repair_batch_tables(database, "batch-a", tokenizer=WordTokenizer())
     assert result["repaired_articles"] == 1
+    assert table_repair_plan(database, "batch-a")["remaining_articles"] == 0
     with closing(sqlite3.connect(database)) as conn:
         after = conn.execute(
             "SELECT article_id,COUNT(*) FROM chunks GROUP BY article_id ORDER BY article_id"
