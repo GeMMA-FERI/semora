@@ -184,6 +184,21 @@ def test_table_repair_replaces_surface_and_requeues_lemma(tmp_path: Path) -> Non
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+def test_trusted_retry_uses_ledger_counts_without_completed_text_scan(tmp_path: Path, monkeypatch) -> None:
+    database = tmp_path / "semora.sqlite"
+    ingest(tmp_path, database, "batch-a", "Straza/one.md")
+    index_batch_lexical(database, "batch-a")
+
+    def no_full_scan(*_args, **_kwargs):
+        raise AssertionError("full completed text scan was used")
+
+    monkeypatch.setattr(lexical, "_validate_existing", no_full_scan)
+    result = index_batch_lexical(
+        database, "batch-a", stage="lemma", lemmatizer=CountingLemmatizer(), trust_completed_state=True,
+    )
+    assert result["complete"] and result["added_articles"] == 1
+
+
 def test_overlapping_batch_does_not_repeat_existing_lemma_processing(tmp_path: Path) -> None:
     database = tmp_path / "semora.sqlite"
     ingest(tmp_path, database, "batch-a", "Straza/a.md")

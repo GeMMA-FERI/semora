@@ -285,6 +285,37 @@ def _validate_existing(
     return eligible, completed
 
 
+def _trusted_coverage(connection: sqlite3.Connection, batch_id: str, stage: str, config: dict) -> tuple[int, int]:
+    """Count ledger coverage without rereading every completed article's text.
+
+    This is only for an explicit maintenance retry whose completed outputs are
+    trusted. Pending inputs are still checked again in each write transaction.
+    """
+    registered = connection.execute(
+        "SELECT config_json FROM pipeline_lexical_configs WHERE stage=?", (stage,),
+    ).fetchone()
+    if registered is not None and registered["config_json"] != _json(config):
+        raise ValueError("Existing lexical configuration differs; explicit reindexing is required.")
+    eligible = connection.execute(
+        "SELECT COUNT(*) FROM articles a JOIN pipeline_batch_issues b ON b.newspaper_id=a.newspaper_id "
+        "WHERE b.batch_id=? AND a.is_valid=1", (batch_id,),
+    ).fetchone()[0]
+
+    def completed_count(selected_stage: str) -> int:
+        return connection.execute(
+            "SELECT COUNT(*) FROM pipeline_lexical_state s JOIN articles a USING(article_id) "
+            "JOIN pipeline_batch_issues b ON b.newspaper_id=a.newspaper_id "
+            "WHERE s.stage=? AND b.batch_id=? AND a.is_valid=1", (selected_stage, batch_id),
+        ).fetchone()[0]
+
+    if stage == "lemma" and completed_count("surface") != eligible:
+        raise ValueError("Finish surface indexing before lemma indexing.")
+    completed = completed_count(stage)
+    if completed > eligible:
+        raise ValueError("Lexical completion count exceeds eligible articles.")
+    return eligible, completed
+
+
 def _validate_stage_preflight(connection: sqlite3.Connection, stage: str) -> None:
     if not lexical_schema_compatible(connection, stage):
         raise ValueError("Unsupported lexical FTS schema/tokenizer; explicit schema migration is required.")
@@ -414,6 +445,7 @@ def index_batch_lexical(
     pos_batch_size: int | None = None, lemma_batch_size: int | None = None,
     classla_workers: int = 1, worker_batch_articles: int = 50,
     profile: bool = False,
+    trust_completed_state: bool = False,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """Index only pending eligible articles in an ingested batch during maintenance."""
@@ -440,7 +472,10 @@ def index_batch_lexical(
         try:
             database.initialize()
             connection = database.conn
-            eligible, initial = _validate_existing(connection, batch_id, stage, config, policy)
+            eligible, initial = (
+                _trusted_coverage(connection, batch_id, stage, config)
+                if trust_completed_state else _validate_existing(connection, batch_id, stage, config, policy)
+            )
             if eligible > initial:
                 invalidate_publication(path)
             added = 0
@@ -543,7 +578,10 @@ def index_batch_lexical(
                             "commit_seconds": commit_finished - write_finished,
                             "total_seconds": commit_finished - checkpoint_started,
                         })
-            _, completed = _validate_existing(connection, batch_id, stage, config, policy)
+            _, completed = (
+                _trusted_coverage(connection, batch_id, stage, config)
+                if trust_completed_state else _validate_existing(connection, batch_id, stage, config, policy)
+            )
             return {
                 "batch_id": batch_id, "stage": stage, "eligible_articles": eligible,
                 "completed_articles": completed, "added_articles": added, "skipped_articles": initial,

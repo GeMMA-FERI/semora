@@ -74,6 +74,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         "--profile", action="store_true", help="Emit per-checkpoint phase timings to stderr."
     )
     lexical.add_argument(
+        "--trust-completed-state", action="store_true",
+        help="Skip full content revalidation of committed lexical rows during maintenance retry.",
+    )
+    lexical.add_argument(
         "--lemma-model-fingerprint",
         help="Operator-supplied model identity (not computed here); omitted means unknown.",
     )
@@ -461,6 +465,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             classla_workers=args.classla_workers,
             worker_batch_articles=args.classla_worker_batch_articles,
             profile=args.profile,
+            trust_completed_state=args.trust_completed_state,
             model_fingerprint=args.lemma_model_fingerprint,
             progress=_progress,
         )
