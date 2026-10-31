@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from semora.corpus import indexer
-from semora.corpus.spans import LineMap, SourceArticle, split_articles
+from semora.corpus.spans import LineMap, SourceArticle, exclude_html_tables, split_articles
 from semora.pipeline.identities import identity_owners, metadata_identifiers, register_identity
 from semora.pipeline.manifest import BatchIssue, BatchManifest, read_issue
 from semora.pipeline.publication_state import invalidate_publication
+from semora.pipeline.table_policy import EXCLUDE_HTML_TABLES, table_policy
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
@@ -223,6 +224,7 @@ def run_batch(
     token_count: int = indexer.DEFAULT_TOKEN_COUNT,
     token_overlap: int = indexer.DEFAULT_TOKEN_OVERLAP,
     tokenizer_revision: str | None = None,
+    exclude_tables: bool | None = None,
     tokenizer: Any = None,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
@@ -289,6 +291,11 @@ def run_batch(
             ).fetchone()
             if saved and saved[0] != encoded:
                 raise ValueError("Batch processing configuration changed; resume with the original configuration.")
+            existing_policy = table_policy(conn, manifest.batch_id) if saved else None
+            if exclude_tables is None:
+                exclude_tables = existing_policy == EXCLUDE_HTML_TABLES if saved else True
+            elif saved and exclude_tables != (existing_policy == EXCLUDE_HTML_TABLES):
+                raise ValueError("Existing batch table policy differs; use explicit table repair.")
             invalidate_publication(target)
             with conn:
                 conn.execute(
@@ -297,6 +304,11 @@ def run_batch(
                     "ON CONFLICT(batch_id) DO UPDATE SET state='running', error=NULL, updated_at=CURRENT_TIMESTAMP",
                     (manifest.batch_id, manifest.fingerprint, encoded, len(manifest.issues)),
                 )
+                if exclude_tables:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO pipeline_batch_table_policies(batch_id,policy,state) "
+                        "VALUES (?,?,'active')", (manifest.batch_id, EXCLUDE_HTML_TABLES),
+                    )
             try:
                 paths = _paths(conn)
                 owners = identity_owners(conn)
@@ -308,6 +320,22 @@ def run_batch(
                         if action == "conflict":
                             raise ValueError(reason)
                         newspaper_id = indexer._stable_id("newspaper", issue.relative_path)
+                        if exclude_tables and action == "unchanged" and exclude_html_tables(content) != content:
+                            old_chunks = conn.execute(
+                                "SELECT 1 FROM chunks c JOIN articles a USING(article_id) "
+                                "WHERE a.newspaper_id=? LIMIT 1", (newspaper_id,),
+                            ).fetchone()
+                            compatible = conn.execute(
+                                "SELECT 1 FROM pipeline_batch_issues b "
+                                "JOIN pipeline_batch_table_policies p ON p.batch_id=b.batch_id "
+                                "WHERE b.newspaper_id=? AND p.policy=? AND p.state='active' LIMIT 1",
+                                (newspaper_id, EXCLUDE_HTML_TABLES),
+                            ).fetchone()
+                            if old_chunks and not compatible:
+                                raise ValueError(
+                                    "Overlapping table-bearing issue has legacy chunks; "
+                                    "repair its original batch first."
+                                )
                         if "newspapers" in stages:
                             _store_issue(conn, manifest.batch_id, issue, content, metadata, action)
                         elif not conn.execute(
@@ -325,7 +353,7 @@ def run_batch(
                                     if tokenizer_revision is not None
                                     else indexer._load_tokenizer(model_id)
                                 )
-                            _chunks(conn, newspaper_id, config, tokenizer)
+                            _chunks(conn, newspaper_id, config, tokenizer, exclude_tables=exclude_tables)
                     paths.setdefault(issue.relative_path.casefold(), set()).add(issue.relative_path)
                     identifier = _source_identifier(issue, metadata)
                     if identifier:
@@ -465,7 +493,9 @@ def _articles(conn: sqlite3.Connection, newspaper_id: str, config: dict) -> None
     _done(conn, newspaper_id, "articles", row["content"], settings, len(records))
 
 
-def _chunks(conn: sqlite3.Connection, newspaper_id: str, config: dict, tokenizer: Any) -> None:
+def _chunks(
+    conn: sqlite3.Connection, newspaper_id: str, config: dict, tokenizer: Any, *, exclude_tables: bool = False
+) -> None:
     newspaper = conn.execute("SELECT * FROM newspapers WHERE newspaper_id=?", (newspaper_id,)).fetchone()
     settings = config["chunking"]
     if not _pending(conn, newspaper_id, "chunks", newspaper["content"], settings):
@@ -506,6 +536,7 @@ def _chunks(conn: sqlite3.Connection, newspaper_id: str, config: dict, tokenizer
             token_count=settings["token_count"],
             token_overlap=settings["token_overlap"],
             line_map=line_map,
+            exclude_tables=exclude_tables,
         )
         conn.executemany(
             "INSERT INTO chunks(chunk_id,run_id,article_id,chunking_run_id,chunk_index,method,text,char_start,"

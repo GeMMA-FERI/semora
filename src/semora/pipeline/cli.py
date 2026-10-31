@@ -30,6 +30,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         if name == "run":
             _add_maintenance(command)
             command.add_argument("--through", choices=("newspapers", "articles", "chunks"), default="chunks")
+            command.add_argument(
+                "--include-tables", action="store_true",
+                help="Retain HTML tables in derived chunks for a new legacy-policy batch.",
+            )
             command.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Chunk tokenizer model identity.")
             command.add_argument("--tokenizer-revision", help="Pin an immutable tokenizer revision.")
             command.add_argument("--token-count", type=int, default=DEFAULT_TOKEN_COUNT)
@@ -73,6 +77,16 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         "--lemma-model-fingerprint",
         help="Operator-supplied model identity (not computed here); omitted means unknown.",
     )
+
+    tables = operations.add_parser("tables", help="Plan or repair table-bearing articles in one ingested batch.")
+    table_operations = tables.add_subparsers(dest="tables_command", required=True)
+    for name in ("plan", "repair"):
+        command = table_operations.add_parser(name)
+        _add_io(command)
+        command.add_argument("--batch", required=True)
+        command.add_argument("--semantic-dir", help="Semantic mapping directory; defaults beside the database.")
+        if name == "repair":
+            _add_maintenance(command)
 
     semantic = operations.add_parser("semantic", help="Audit/adopt vectors and build additive semantic outputs.")
     semantic_operations = semantic.add_subparsers(dest="semantic_command", required=True)
@@ -213,6 +227,9 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
                 semantic_dir / "index.faiss",
             )
         )
+    if args.pipeline_command == "tables":
+        semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
+        protected.append(semantic_dir / "mapping.sqlite")
     if args.pipeline_command == "entities":
         entity_dir = Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities"
         protected.extend((entity_dir, entity_dir / "manifest.json"))
@@ -228,6 +245,7 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
     operation = args.pipeline_command
     mutates = (
         operation in ("run", "index")
+        or (operation == "tables" and args.tables_command == "repair")
         or (operation == "baseline" and args.baseline_command == "adopt")
         or (operation == "semantic" and args.semantic_command != "audit")
         or (operation == "ner" and args.ner_command != "audit")
@@ -257,6 +275,15 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
     success = True
     if operation == "status":
         report = batch_status(database, args.batch)
+    elif operation == "tables":
+        from semora.pipeline.tables import repair_batch_tables, table_repair_plan
+
+        semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
+        report = (
+            table_repair_plan(database, args.batch, semantic_dir=semantic_dir)
+            if args.tables_command == "plan"
+            else repair_batch_tables(database, args.batch, semantic_dir=semantic_dir, progress=_progress)
+        )
     elif operation in ("plan", "run"):
         manifest = load_manifest(args.manifest)
         input_root = Path(args.input_root).resolve()
@@ -274,6 +301,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 token_count=args.token_count,
                 token_overlap=args.token_overlap,
                 tokenizer_revision=args.tokenizer_revision,
+                exclude_tables=False if args.include_tables else None,
                 progress=_progress,
             )
     elif operation == "baseline":

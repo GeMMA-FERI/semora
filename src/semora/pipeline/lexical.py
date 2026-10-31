@@ -68,6 +68,16 @@ def lexical_input_sha256(title: str | None, content: str) -> str:
     return hashlib.sha256(_json([title or "", content]).encode("utf-8")).hexdigest()
 
 
+def _policy_content(content: str, policy: str) -> str:
+    if policy == "legacy":
+        return content
+    if policy == "exclude_html_tables_v1":
+        from semora.corpus.spans import exclude_html_tables
+
+        return exclude_html_tables(content)
+    raise ValueError(f"Unsupported table policy: {policy}")
+
+
 def surface_config() -> dict:
     return {"format": "semora.surface.v1", "tokenizer": "unicode61 remove_diacritics 2"}
 
@@ -237,7 +247,9 @@ def _validate_batch(connection: sqlite3.Connection, batch_id: str) -> None:
         raise ValueError("Finish batch article extraction before lexical indexing.")
 
 
-def _validate_existing(connection: sqlite3.Connection, batch_id: str, stage: str, config: dict) -> tuple[int, int]:
+def _validate_existing(
+    connection: sqlite3.Connection, batch_id: str, stage: str, config: dict, policy: str = "legacy",
+) -> tuple[int, int]:
     encoded = _json(config)
     registered = connection.execute(
         "SELECT config_json FROM pipeline_lexical_configs WHERE stage=?", (stage,)
@@ -247,12 +259,13 @@ def _validate_existing(connection: sqlite3.Connection, batch_id: str, stage: str
     eligible = completed = 0
     for row in connection.execute(_BATCH_ROWS, (stage, batch_id)):
         eligible += 1
+        expected_digest = lexical_input_sha256(row["title"], _policy_content(row["content"], policy))
         output_exists = row["fts_id"] is not None if stage == "surface" else row["lemma_article_id"] is not None
         if stage == "lemma":
             if row["surface_input_sha256"] is None or row["fts_id"] is None or row["surface_fts_id"] is None:
                 raise ValueError("Finish/adopt surface indexing before lemma indexing.")
             if (
-                row["surface_input_sha256"] != lexical_input_sha256(row["title"], row["content"])
+                row["surface_input_sha256"] != expected_digest
                 or row["surface_config_json"] != _json(surface_config())
             ):
                 raise ValueError("Surface input/configuration differs; explicit reindexing is required.")
@@ -260,7 +273,7 @@ def _validate_existing(connection: sqlite3.Connection, batch_id: str, stage: str
             if output_exists:
                 raise ValueError("Existing lexical outputs require audited baseline adoption before indexing.")
             continue
-        if row["input_sha256"] != lexical_input_sha256(row["title"], row["content"]) or row["config_json"] != encoded:
+        if row["input_sha256"] != expected_digest or row["config_json"] != encoded:
             raise ValueError("Existing lexical input/configuration differs; explicit reindexing is required.")
         if not output_exists:
             raise ValueError("Completed lexical output is missing; explicit repair is required.")
@@ -325,6 +338,75 @@ def _write_lemma(
         _record_completion(connection, "lemma", row, config)
 
 
+def repair_table_lexical(connection: sqlite3.Connection, article_id: str) -> None:
+    """Replace only a table-bearing article's derived lexical rows in a repair transaction.
+
+    The raw article and stable FTS mapping stay intact. A previous lemma output
+    is removed so the normal CLASSLA stage can regenerate it from filtered text.
+    """
+    if not connection.in_transaction:
+        raise ValueError("Table lexical repair requires an active transaction.")
+    row = connection.execute(
+        "SELECT article_id,title,content,is_valid FROM articles WHERE article_id=?", (article_id,)
+    ).fetchone()
+    if row is None or row["is_valid"] != 1:
+        raise ValueError("Table lexical repair requires a valid article.")
+    filtered = _policy_content(row["content"], "exclude_html_tables_v1")
+    if filtered == row["content"]:
+        raise ValueError("Article has no complete HTML table to repair.")
+    mapping = connection.execute(
+        "SELECT fts_id FROM article_fts_map WHERE article_id=?", (article_id,)
+    ).fetchone()
+    surface = connection.execute(
+        "SELECT input_sha256,config_json FROM pipeline_lexical_state WHERE article_id=? AND stage='surface'",
+        (article_id,),
+    ).fetchone()
+    if (mapping is None) != (surface is None):
+        raise ValueError("Incomplete surface index mapping; repair requires investigation.")
+    if mapping is None:
+        return
+    fts_id = mapping["fts_id"]
+    if connection.execute("SELECT 1 FROM article_fts WHERE rowid=?", (fts_id,)).fetchone() is None:
+        raise ValueError("Surface FTS row is missing; table repair requires investigation.")
+    if surface["config_json"] != _json(surface_config()):
+        raise ValueError("Unsupported surface configuration for table repair.")
+    raw_digest = lexical_input_sha256(row["title"], row["content"])
+    filtered_digest = lexical_input_sha256(row["title"], filtered)
+    if surface["input_sha256"] == filtered_digest:
+        return
+    if surface["input_sha256"] != raw_digest:
+        raise ValueError("Surface input changed; table repair requires investigation.")
+    lemma = connection.execute(
+        "SELECT title,content FROM article_lemmas WHERE article_id=?", (article_id,)
+    ).fetchone()
+    lemma_state = connection.execute(
+        "SELECT 1 FROM pipeline_lexical_state WHERE article_id=? AND stage='lemma'", (article_id,)
+    ).fetchone()
+    if (lemma is None) != (lemma_state is None):
+        raise ValueError("Incomplete lemma index state; repair requires investigation.")
+    if lemma is not None:
+        if connection.execute("SELECT 1 FROM article_lemma_fts WHERE rowid=?", (fts_id,)).fetchone() is None:
+            raise ValueError("Lemma FTS row is missing; table repair requires investigation.")
+        connection.execute(
+            "INSERT INTO article_lemma_fts(article_lemma_fts,rowid,title,text) VALUES ('delete',?,?,?)",
+            (fts_id, lemma["title"], lemma["content"]),
+        )
+        connection.execute("DELETE FROM pipeline_lexical_state WHERE article_id=? AND stage='lemma'", (article_id,))
+        connection.execute("DELETE FROM article_lemmas WHERE article_id=?", (article_id,))
+    connection.execute(
+        "INSERT INTO article_fts(article_fts,rowid,title,text) VALUES ('delete',?,?,?)",
+        (fts_id, row["title"] or "", row["content"]),
+    )
+    connection.execute(
+        "INSERT INTO article_fts(rowid,title,text) VALUES (?,?,?)",
+        (fts_id, row["title"] or "", filtered),
+    )
+    connection.execute(
+        "UPDATE pipeline_lexical_state SET input_sha256=? WHERE article_id=? AND stage='surface'",
+        (filtered_digest, article_id),
+    )
+
+
 def index_batch_lexical(
     database_path: str | Path, batch_id: str, *, stage: str = "surface", batch_size: int = 1000,
     lemmatizer: Lemmatizer | None = None, pipeline_type: str = "default", model_fingerprint: str | None = None,
@@ -351,11 +433,14 @@ def index_batch_lexical(
         with closing(open_connection(path, read_only=True)) as reader:
             _validate_batch(reader, batch_id)
             _validate_stage_preflight(reader, stage)
+            from .table_policy import table_policy
+
+            policy = table_policy(reader, batch_id) or "legacy"
         database = Database(path)
         try:
             database.initialize()
             connection = database.conn
-            eligible, initial = _validate_existing(connection, batch_id, stage, config)
+            eligible, initial = _validate_existing(connection, batch_id, stage, config, policy)
             if eligible > initial:
                 invalidate_publication(path)
             added = 0
@@ -371,6 +456,7 @@ def index_batch_lexical(
                 ).fetchall()
                 if not rows:
                     break
+                rows = [dict(row, content=_policy_content(row["content"], policy)) for row in rows]
                 fetch_finished = time.perf_counter()
                 annotations = []
                 checkpoint_warnings = 0
@@ -421,7 +507,7 @@ def index_batch_lexical(
                             "SELECT title,content,is_valid FROM articles WHERE article_id=?", (row["article_id"],)
                         ).fetchone()
                         if current is None or current["is_valid"] != 1 or lexical_input_sha256(
-                            current["title"], current["content"]
+                            current["title"], _policy_content(current["content"], policy)
                         ) != lexical_input_sha256(row["title"], row["content"]):
                             raise ValueError("Article changed during lexical processing; explicit repair is required.")
                     validation_finished = time.perf_counter()
@@ -457,7 +543,7 @@ def index_batch_lexical(
                             "commit_seconds": commit_finished - write_finished,
                             "total_seconds": commit_finished - checkpoint_started,
                         })
-            _, completed = _validate_existing(connection, batch_id, stage, config)
+            _, completed = _validate_existing(connection, batch_id, stage, config, policy)
             return {
                 "batch_id": batch_id, "stage": stage, "eligible_articles": eligible,
                 "completed_articles": completed, "added_articles": added, "skipped_articles": initial,

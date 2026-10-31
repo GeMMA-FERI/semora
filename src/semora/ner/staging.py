@@ -40,7 +40,7 @@ def iter_predictions(
             return None
         read_seconds = time.perf_counter() - tick
         tick = time.perf_counter()
-        texts = [row["content"] for row in rows]
+        texts = [row.get("inference_content", row["content"]) for row in rows]
         prepared = model.prepare(texts) if staged else texts
         return rows, prepared, read_seconds, time.perf_counter() - tick
 

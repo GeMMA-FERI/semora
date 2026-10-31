@@ -132,6 +132,52 @@ def test_invalid_entity_span_commits_neither_mentions_nor_completion(tmp_path):
     assert state(database) == ([], [])
 
 
+def test_table_policy_hides_tables_from_ner_without_changing_source_offsets(tmp_path):
+    content = "Ana outside. <table><tr><td>Ana inside</td></tr></table> Ana after."
+    database = ingest(tmp_path, "tables", {"Paper/a.md": content})
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "INSERT INTO pipeline_batch_table_policies(batch_id,policy,state) "
+            "VALUES ('tables','exclude_html_tables_v1','active') "
+            "ON CONFLICT(batch_id) DO UPDATE SET policy=excluded.policy,state=excluded.state"
+        )
+
+    class AllNames(Model):
+        def predict_prepared(self, texts, _batch_size):
+            self.texts.extend(texts)
+            return Prediction([
+                [Entity(match, match + 3, "PER", "Ana") for match in (
+                    offset for offset in range(len(text)) if text.startswith("Ana", offset)
+                )]
+                for text in texts
+            ])
+
+    model = AllNames()
+    report = index_batch_ner(database, "tables", model=model)
+    with closing(sqlite3.connect(database)) as connection:
+        source = connection.execute("SELECT content FROM articles").fetchone()[0]
+        mentions = connection.execute("SELECT char_start,text FROM article_entities ORDER BY char_start").fetchall()
+
+    assert report["added_entities"] == 2
+    assert source == content
+    assert [source[start:start + 3] for start, _ in mentions] == ["Ana", "Ana"]
+    assert all("Ana inside" not in text for text in model.texts)
+
+
+def test_ner_refuses_partially_repaired_table_batch(tmp_path):
+    database = ingest(tmp_path, "tables", {"Paper/a.md": "Ana <table><td>hidden</td></table>"})
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            "INSERT INTO pipeline_batch_table_policies(batch_id,policy,state) "
+            "VALUES ('tables','exclude_html_tables_v1','repairing') "
+            "ON CONFLICT(batch_id) DO UPDATE SET state=excluded.state"
+        )
+    model = Model()
+    with pytest.raises(ValueError, match="table repair is incomplete"):
+        index_batch_ner(database, "tables", model=model)
+    assert model.calls == 0
+
+
 def test_relocation_and_runtime_tuning_do_not_change_model_identity(tmp_path):
     database = ingest(tmp_path, "first", {"Paper/a.md": "Ana Novak."})
     original = Model()

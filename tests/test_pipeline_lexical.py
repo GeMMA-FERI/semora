@@ -148,6 +148,42 @@ def test_two_batches_append_retry_and_old_hash_checkpoint_is_irrelevant(tmp_path
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
+def test_table_repair_replaces_surface_and_requeues_lemma(tmp_path: Path) -> None:
+    database = tmp_path / "semora.sqlite"
+    article_id = ingest(tmp_path, database, "batch-a", "Straza/one.md")[0]
+    raw = "Before. <table><tr><td>secretcell</td></tr></table> After."
+    with closing(open_connection(database)) as connection, connection:
+        connection.execute("DELETE FROM pipeline_batch_table_policies WHERE batch_id='batch-a'")
+        connection.execute("UPDATE articles SET content=? WHERE article_id=?", (raw, article_id))
+    index_batch_lexical(database, "batch-a")
+    index_batch_lexical(database, "batch-a", stage="lemma", lemmatizer=CountingLemmatizer())
+    with closing(open_connection(database)) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        lexical.repair_table_lexical(connection, article_id)
+        connection.execute(
+            "INSERT INTO pipeline_batch_table_policies(batch_id,policy,state) VALUES (?,?,?)",
+            ("batch-a", "exclude_html_tables_v1", "active"),
+        )
+    with closing(open_connection(database, read_only=True)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM article_fts WHERE article_fts MATCH 'secretcell'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM article_lemma_fts WHERE article_lemma_fts MATCH 'secretcell'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM article_fts WHERE article_fts MATCH 'Before'"
+        ).fetchone()[0] == 1
+    assert index_batch_lexical(database, "batch-a")["added_articles"] == 0
+    result = index_batch_lexical(database, "batch-a", stage="lemma", lemmatizer=CountingLemmatizer())
+    assert result["added_articles"] == 1
+    with closing(open_connection(database, read_only=True)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM article_lemma_fts WHERE article_lemma_fts MATCH 'secretcell'"
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
 def test_overlapping_batch_does_not_repeat_existing_lemma_processing(tmp_path: Path) -> None:
     database = tmp_path / "semora.sqlite"
     ingest(tmp_path, database, "batch-a", "Straza/a.md")

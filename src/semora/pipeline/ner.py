@@ -11,10 +11,12 @@ from contextlib import ExitStack, closing
 from pathlib import Path
 from typing import Any
 
+from semora.corpus.spans import mask_html_tables
 from semora.ner.adapters import load_adapter
 from semora.ner.staging import iter_predictions
 from semora.ner.storage import save_batch
 from semora.pipeline.publication_state import invalidate_publication
+from semora.pipeline.table_policy import EXCLUDE_HTML_TABLES, table_policy
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage.connection import open_connection
 
@@ -212,6 +214,7 @@ def index_batch_ner(
         locks.enter_context(SemanticBuildLock(path.with_name(path.name + ".ner.lock"), "NER"))
         with closing(open_connection(path)) as connection:
             _validate_batch(connection, batch_id)
+            policy = table_policy(connection, batch_id)
             _config, recorded = _recorded_identity(connection, run_id)
             if model is not None:
                 requested = model_identity(model.metadata)
@@ -238,6 +241,9 @@ def index_batch_ner(
                         _ROWS + " AND s.article_id IS NULL AND a.article_id>? AND a.article_id<=? "
                         "ORDER BY a.article_id LIMIT ?", (run_id, batch_id, cursor, upper, batch_articles),
                     )]
+                if policy == EXCLUDE_HTML_TABLES:
+                    for row in rows:
+                        row["inference_content"] = mask_html_tables(row["content"])
                 if rows:
                     cursor = rows[-1]["article_id"]
                 return rows
@@ -254,6 +260,14 @@ def index_batch_ner(
                     _register(connection, run_id, model.metadata, identity)
                     with closing(iter_predictions(model, read_batch, batch_size, pipeline_depth)) as batches:
                         for batch in batches:
+                            if policy == EXCLUDE_HTML_TABLES:
+                                for row, entities in zip(batch.rows, batch.prediction.entities, strict=True):
+                                    masked = row["inference_content"]
+                                    if any(
+                                        masked[entity.start:entity.end] != row["content"][entity.start:entity.end]
+                                        for entity in entities
+                                    ):
+                                        raise ValueError("NER prediction overlaps an excluded HTML table.")
                             # save_batch rechecks current content/validity inside
                             # its write transaction, then commits mentions and
                             # completion together, including zero-entity articles.
