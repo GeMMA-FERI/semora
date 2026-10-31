@@ -11,7 +11,7 @@ from typing import Any
 
 from tqdm import tqdm
 
-from semora.corpus.spans import LineMap, SourceArticle, split_articles
+from semora.corpus.spans import LineMap, SourceArticle, outside_html_table_spans, split_articles
 from semora.storage import Article, Chunk, ChunkingRun, Database, Newspaper, Run
 
 DEFAULT_MODEL_ID = "google/embeddinggemma-300m"
@@ -299,50 +299,54 @@ def _token_chunks(
     token_count: int,
     token_overlap: int,
     line_map: LineMap,
+    exclude_tables: bool = False,
 ) -> list[Chunk]:
-    encoded = tokenizer(
-        source.content,
-        add_special_tokens=False,
-        return_offsets_mapping=True,
-        verbose=False,
-    )
-    offsets = [tuple(pair) for pair in encoded["offset_mapping"]]
     step = token_count - token_overlap
     result: list[Chunk] = []
-    for token_start in range(0, len(offsets), step):
-        window = [pair for pair in offsets[token_start : token_start + token_count] if pair[1] > pair[0]]
-        if not window:
-            continue
-        local_start, local_end = window[0][0], window[-1][1]
-        text = source.content[local_start:local_end]
-        left_trim = len(text) - len(text.lstrip())
-        right_trim = len(text.rstrip())
-        local_start += left_trim
-        local_end = local_start + max(0, right_trim - left_trim)
-        text = source.content[local_start:local_end]
-        if not text:
-            continue
-        char_start = source.content_char_start + local_start
-        char_end = source.content_char_start + local_end
-        line_start, line_end = line_map.span(char_start, char_end)
-        chunk_index = len(result)
-        result.append(
-            Chunk(
-                chunk_id=_stable_id("chunk", article_id, str(chunk_index), str(char_start), str(char_end)),
-                run_id=run_id,
-                article_id=article_id,
-                chunking_run_id=chunking_run_id,
-                chunk_index=chunk_index,
-                method="token",
-                text=text,
-                char_start=char_start,
-                char_end=char_end,
-                line_start=line_start,
-                line_end=line_end,
-            )
+    spans = outside_html_table_spans(source.content) if exclude_tables else [(0, len(source.content))]
+    for segment_start, segment_end in spans:
+        segment = source.content[segment_start:segment_end]
+        encoded = tokenizer(
+            segment,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            verbose=False,
         )
-        if token_start + token_count >= len(offsets):
-            break
+        offsets = [tuple(pair) for pair in encoded["offset_mapping"]]
+        for token_start in range(0, len(offsets), step):
+            window = [pair for pair in offsets[token_start : token_start + token_count] if pair[1] > pair[0]]
+            if not window:
+                continue
+            local_start, local_end = segment_start + window[0][0], segment_start + window[-1][1]
+            text = source.content[local_start:local_end]
+            left_trim = len(text) - len(text.lstrip())
+            right_trim = len(text.rstrip())
+            local_start += left_trim
+            local_end = local_start + max(0, right_trim - left_trim)
+            text = source.content[local_start:local_end]
+            if not text:
+                continue
+            char_start = source.content_char_start + local_start
+            char_end = source.content_char_start + local_end
+            line_start, line_end = line_map.span(char_start, char_end)
+            chunk_index = len(result)
+            result.append(
+                Chunk(
+                    chunk_id=_stable_id("chunk", article_id, str(chunk_index), str(char_start), str(char_end)),
+                    run_id=run_id,
+                    article_id=article_id,
+                    chunking_run_id=chunking_run_id,
+                    chunk_index=chunk_index,
+                    method="token",
+                    text=text,
+                    char_start=char_start,
+                    char_end=char_end,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+            )
+            if token_start + token_count >= len(offsets):
+                break
     return result
 
 

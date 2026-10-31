@@ -13,6 +13,13 @@ import pytest
 
 from semora.cli.main import _configure_console_encoding, _parser
 from semora.corpus import indexer
+from semora.corpus.spans import (
+    LineMap,
+    SourceArticle,
+    exclude_html_tables,
+    mask_html_tables,
+    outside_html_table_spans,
+)
 from semora.retrieval import SearchEngine
 from semora.retrieval.indexing import build_bm25_index, build_lemma_index, build_semantic_index
 from semora.retrieval.semantic_faiss import FaissBuildConfig
@@ -25,6 +32,58 @@ class WordTokenizer:
 
     def __call__(self, text: str, **_kwargs) -> dict:
         return {"offset_mapping": [match.span() for match in re.finditer(r"\S+", text)]}
+
+
+def test_table_exclusion_preserves_non_table_source_offsets() -> None:
+    content = (
+        "Before one.\n<TABLE class='ocr'><tr><td>Noise</td></tr>"
+        "<table><td>Nested</td></table></TABLE>\nAfter two."
+    )
+    assert exclude_html_tables(content) == "Before one.\n\n\nAfter two."
+    spans = outside_html_table_spans(content)
+    assert [content[start:end] for start, end in spans] == ["Before one.\n", "\nAfter two."]
+    masked = mask_html_tables(content)
+    assert len(masked) == len(content)
+    assert masked.count("\n") == content.count("\n")
+    assert "Noise" not in masked and "After two." in masked
+    source = SourceArticle(None, content, 0, 0, len(content), 0, 1, 3)
+
+    chunks = indexer._token_chunks(
+        source,
+        article_id="article",
+        run_id="run",
+        chunking_run_id="chunking",
+        tokenizer=WordTokenizer(),
+        token_count=3,
+        token_overlap=1,
+        line_map=LineMap(content),
+        exclude_tables=True,
+    )
+
+    assert [chunk.text for chunk in chunks] == ["Before one.", "After two."]
+    assert all(content[chunk.char_start:chunk.char_end] == chunk.text for chunk in chunks)
+    assert all("<table" not in chunk.text.lower() and "Noise" not in chunk.text for chunk in chunks)
+
+
+def test_table_exclusion_leaves_plain_text_and_legacy_chunks_unchanged() -> None:
+    content = "Alpha beta gamma delta."
+    assert exclude_html_tables(content) == content
+    source = SourceArticle(None, content, 0, 0, len(content), 0, 1, 1)
+    options = dict(
+        article_id="article", run_id="run", chunking_run_id="chunking",
+        tokenizer=WordTokenizer(), token_count=3, token_overlap=1,
+        line_map=LineMap(content),
+    )
+    legacy = indexer._token_chunks(source, **options)
+    filtered = indexer._token_chunks(source, exclude_tables=True, **options)
+    assert filtered == legacy
+
+
+def test_table_exclusion_keeps_unclosed_markup() -> None:
+    content = "Before <table><td>Incomplete\nAfter"
+    assert outside_html_table_spans(content) == [(0, len(content))]
+    assert exclude_html_tables(content) == content
+    assert mask_html_tables(content) == content
 
 
 class FakeSloveneLemmatizer:

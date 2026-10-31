@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 HEADING_RE = re.compile(r"^[ \t]{0,3}#[ \t]*(.*?)[ \t]*$", re.MULTILINE)
+TABLE_TAG_RE = re.compile(r"<\s*(/?)\s*table\b[^>]*>", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -87,3 +88,49 @@ def _trimmed_bounds(text: str, start: int, end: int) -> tuple[int, int]:
     while end > start and text[end - 1].isspace():
         end -= 1
     return start, end
+
+
+def outside_html_table_spans(text: str) -> list[tuple[int, int]]:
+    """Return source offsets outside HTML table blocks, including nested tables."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    depth = 0
+    table_start = 0
+    for tag in TABLE_TAG_RE.finditer(text):
+        if tag.group(1):
+            if depth:
+                depth -= 1
+                if depth == 0:
+                    cursor = tag.end()
+        elif not tag.group().endswith("/>"):
+            if depth == 0 and cursor < tag.start():
+                spans.append((cursor, tag.start()))
+            if depth == 0:
+                table_start = tag.start()
+            depth += 1
+    if depth:
+        if spans and spans[-1][1] == table_start:
+            table_start, _ = spans.pop()
+        spans.append((table_start, len(text)))
+    elif cursor < len(text):
+        spans.append((cursor, len(text)))
+    return spans
+
+
+def exclude_html_tables(text: str) -> str:
+    """Remove table blocks from derived search text while retaining other text."""
+    spans = outside_html_table_spans(text)
+    if spans == [(0, len(text))]:
+        return text
+    return "\n".join(text[start:end] for start, end in spans)
+
+
+def mask_html_tables(text: str) -> str:
+    """Hide table blocks without changing source offsets or line positions."""
+    spans = outside_html_table_spans(text)
+    if spans == [(0, len(text))]:
+        return text
+    characters = ["\n" if char == "\n" else " " for char in text]
+    for start, end in spans:
+        characters[start:end] = text[start:end]
+    return "".join(characters)
