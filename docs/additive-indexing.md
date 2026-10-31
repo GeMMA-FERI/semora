@@ -258,6 +258,10 @@ and commits only after every worker result and its FTS rows are ready. Supply a
 verified model fingerprint when known; this argument records an operator
 assertion and does not compute or verify model weights. Adoption does not
 invent one for historical outputs.
+`pipeline index --profile` additionally emits a `lexical_checkpoint_timing`
+event to stderr after each committed page. Its fetch, inference, validation,
+write and commit times are measured in the coordinator; the first inference
+interval also includes lazy model/worker startup. The JSON result is unchanged.
 
 `pipeline status` reports eligible articles and recorded/pending surface/lemma
 completion for the selected batch. These are bookkeeping counts, not an audit

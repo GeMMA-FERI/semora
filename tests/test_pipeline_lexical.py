@@ -321,6 +321,27 @@ def test_progress_reports_only_committed_checkpoints(tmp_path: Path) -> None:
     ]
 
 
+def test_profile_reports_committed_checkpoint_phase_times(tmp_path: Path) -> None:
+    database = tmp_path / "semora.sqlite"
+    ingest(tmp_path, database, "batch-a", "Straza/a.md", "Straza/b.md")
+    events = []
+
+    index_batch_lexical(database, "batch-a", batch_size=1, profile=True, progress=events.append)
+
+    assert [event["event"] for event in events] == [
+        "lexical_checkpoint", "lexical_checkpoint_timing",
+        "lexical_checkpoint", "lexical_checkpoint_timing",
+    ]
+    for timing in events[1::2]:
+        assert timing["articles"] == 1
+        assert timing["completed_articles"] in {1, 2}
+        phases = [timing[f"{name}_seconds"] for name in (
+            "fetch", "inference", "validation", "write", "commit",
+        )]
+        assert all(seconds >= 0 for seconds in phases)
+        assert abs(sum(phases) - timing["total_seconds"]) < 0.001
+
+
 def test_zero_eligible_articles_do_not_load_model(tmp_path: Path, monkeypatch) -> None:
     database = tmp_path / "semora.sqlite"
     ingest(tmp_path, database, "batch-a", "Straza/a.md")

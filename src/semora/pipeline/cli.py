@@ -67,6 +67,9 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     )
     lexical.add_argument("--classla-worker-batch-articles", type=int, default=50)
     lexical.add_argument(
+        "--profile", action="store_true", help="Emit per-checkpoint phase timings to stderr."
+    )
+    lexical.add_argument(
         "--lemma-model-fingerprint",
         help="Operator-supplied model identity (not computed here); omitted means unknown.",
     )
@@ -429,6 +432,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             lemma_batch_size=args.classla_lemma_batch_size,
             classla_workers=args.classla_workers,
             worker_batch_articles=args.classla_worker_batch_articles,
+            profile=args.profile,
             model_fingerprint=args.lemma_model_fingerprint,
             progress=_progress,
         )

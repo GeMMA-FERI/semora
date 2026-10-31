@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
@@ -313,6 +314,7 @@ def index_batch_lexical(
     device: str = "cpu", resources_dir: str | Path | None = None,
     pos_batch_size: int | None = None, lemma_batch_size: int | None = None,
     classla_workers: int = 1, worker_batch_articles: int = 50,
+    profile: bool = False,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """Index only pending eligible articles in an ingested batch during maintenance."""
@@ -345,11 +347,13 @@ def index_batch_lexical(
             while True:
                 # This cursor only pages the frozen explicit membership for this
                 # attempt. It is reset on every retry; completion is per article.
+                checkpoint_started = time.perf_counter()
                 rows = connection.execute(
                     _pending_rows_query(stage), (stage, cursor, batch_id, batch_size),
                 ).fetchall()
                 if not rows:
                     break
+                fetch_finished = time.perf_counter()
                 annotations = []
                 if stage == "lemma":
                     texts = [text for row in rows for text in (row["title"] or "", row["content"])]
@@ -382,6 +386,7 @@ def index_batch_lexical(
                             )
                             lemmatizer = owned_model
                         annotations = lemmatizer.lemmatize_many(texts)
+                inference_finished = time.perf_counter()
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
                     if not registered:
@@ -396,10 +401,13 @@ def index_batch_lexical(
                             current["title"], current["content"]
                         ) != lexical_input_sha256(row["title"], row["content"]):
                             raise ValueError("Article changed during lexical processing; explicit repair is required.")
+                    validation_finished = time.perf_counter()
                     if stage == "surface":
                         _write_surface(connection, rows, config)
                     else:
                         _write_lemma(connection, rows, config, annotations)
+                    write_finished = time.perf_counter()
+                commit_finished = time.perf_counter()
                 added += len(rows)
                 registered = True
                 cursor = rows[-1]["article_id"]
@@ -408,6 +416,17 @@ def index_batch_lexical(
                         "event": "lexical_checkpoint", "batch_id": batch_id, "stage": stage,
                         "completed_articles": initial + added, "total": eligible,
                     })
+                    if profile:
+                        progress({
+                            "event": "lexical_checkpoint_timing", "batch_id": batch_id, "stage": stage,
+                            "completed_articles": initial + added, "articles": len(rows),
+                            "fetch_seconds": fetch_finished - checkpoint_started,
+                            "inference_seconds": inference_finished - fetch_finished,
+                            "validation_seconds": validation_finished - inference_finished,
+                            "write_seconds": write_finished - validation_finished,
+                            "commit_seconds": commit_finished - write_finished,
+                            "total_seconds": commit_finished - checkpoint_started,
+                        })
             _, completed = _validate_existing(connection, batch_id, stage, config)
             return {
                 "batch_id": batch_id, "stage": stage, "eligible_articles": eligible,
