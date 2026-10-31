@@ -303,9 +303,11 @@ def _trusted_coverage(connection: sqlite3.Connection, batch_id: str, stage: str,
 
     def completed_count(selected_stage: str) -> int:
         return connection.execute(
-            "SELECT COUNT(*) FROM pipeline_lexical_state s JOIN articles a USING(article_id) "
-            "JOIN pipeline_batch_issues b ON b.newspaper_id=a.newspaper_id "
-            "WHERE s.stage=? AND b.batch_id=? AND a.is_valid=1", (selected_stage, batch_id),
+            "SELECT COUNT(*) FROM pipeline_batch_issues b "
+            "CROSS JOIN articles a INDEXED BY idx_articles_newspaper_id "
+            "CROSS JOIN pipeline_lexical_state s "
+            "WHERE b.batch_id=? AND a.newspaper_id=b.newspaper_id AND a.is_valid=1 "
+            "AND s.stage=? AND s.article_id=a.article_id", (batch_id, selected_stage),
         ).fetchone()[0]
 
     if stage == "lemma" and completed_count("surface") != eligible:
@@ -578,10 +580,9 @@ def index_batch_lexical(
                             "commit_seconds": commit_finished - write_finished,
                             "total_seconds": commit_finished - checkpoint_started,
                         })
-            _, completed = (
-                _trusted_coverage(connection, batch_id, stage, config)
-                if trust_completed_state else _validate_existing(connection, batch_id, stage, config, policy)
-            )
+            completed = initial + added if trust_completed_state else _validate_existing(
+                connection, batch_id, stage, config, policy,
+            )[1]
             return {
                 "batch_id": batch_id, "stage": stage, "eligible_articles": eligible,
                 "completed_articles": completed, "added_articles": added, "skipped_articles": initial,
