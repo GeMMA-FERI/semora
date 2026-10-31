@@ -158,6 +158,23 @@ _BATCH_ROWS = (
 )
 
 
+def _pending_rows_query(stage: str) -> str:
+    # Drive each page from the ordered article index. Starting from batch issues
+    # makes SQLite sort the entire remaining batch for every LIMIT page.
+    mapping = "JOIN article_fts_map m ON m.article_id=a.article_id " if stage == "lemma" else ""
+    fts_id = ",m.fts_id" if stage == "lemma" else ""
+    return (
+        f"SELECT a.article_id,a.title,a.content{fts_id} "
+        "FROM articles a INDEXED BY idx_articles_valid_article_id "
+        f"{mapping}"
+        "LEFT JOIN pipeline_lexical_state s ON s.article_id=a.article_id AND s.stage=? "
+        "WHERE a.is_valid=1 AND a.article_id>? AND s.article_id IS NULL "
+        "AND EXISTS (SELECT 1 FROM pipeline_batch_issues b "
+        "WHERE b.batch_id=? AND b.newspaper_id=a.newspaper_id) "
+        "ORDER BY a.article_id LIMIT ?"
+    )
+
+
 def _validate_batch(connection: sqlite3.Connection, batch_id: str) -> None:
     if connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pipeline_batches'"
@@ -300,8 +317,7 @@ def index_batch_lexical(
                 # This cursor only pages the frozen explicit membership for this
                 # attempt. It is reset on every retry; completion is per article.
                 rows = connection.execute(
-                    _BATCH_ROWS + " AND s.article_id IS NULL AND a.article_id>? ORDER BY a.article_id LIMIT ?",
-                    (stage, batch_id, cursor, batch_size),
+                    _pending_rows_query(stage), (stage, cursor, batch_id, batch_size),
                 ).fetchall()
                 if not rows:
                     break

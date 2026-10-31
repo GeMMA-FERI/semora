@@ -69,6 +69,19 @@ def snapshot(database: Path, table: str) -> list[tuple]:
         return connection.execute(f"SELECT * FROM {table} ORDER BY 1,2").fetchall()
 
 
+def test_pending_pages_follow_article_index_without_resorting_batch(tmp_path: Path) -> None:
+    database = tmp_path / "semora.sqlite"
+    ingest(tmp_path, database, "batch-a", "Straza/one.md", "Straza/two.md")
+    with closing(sqlite3.connect(database)) as connection:
+        for stage in ("surface", "lemma"):
+            plan = [row[3] for row in connection.execute(
+                "EXPLAIN QUERY PLAN " + lexical._pending_rows_query(stage),
+                (stage, "", "batch-a", 1000),
+            )]
+            assert any("SEARCH a USING INDEX idx_articles_valid_article_id" in step for step in plan)
+            assert not any("TEMP B-TREE" in step for step in plan)
+
+
 def test_two_batches_append_retry_and_old_hash_checkpoint_is_irrelevant(tmp_path: Path) -> None:
     database = tmp_path / "semora.sqlite"
     # Find names whose stable article IDs have the opposite lexical path order.
