@@ -63,6 +63,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     lexical.add_argument("--classla-pos-batch-size", type=int)
     lexical.add_argument("--classla-lemma-batch-size", type=int)
     lexical.add_argument(
+        "--classla-workers", type=int, default=1, help="Parallel CLASSLA processes for lemma indexing."
+    )
+    lexical.add_argument("--classla-worker-batch-articles", type=int, default=50)
+    lexical.add_argument(
         "--lemma-model-fingerprint",
         help="Operator-supplied model identity (not computed here); omitted means unknown.",
     )
@@ -423,6 +427,8 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             resources_dir=args.classla_resources_dir,
             pos_batch_size=args.classla_pos_batch_size,
             lemma_batch_size=args.classla_lemma_batch_size,
+            classla_workers=args.classla_workers,
+            worker_batch_articles=args.classla_worker_batch_articles,
             model_fingerprint=args.lemma_model_fingerprint,
             progress=_progress,
         )

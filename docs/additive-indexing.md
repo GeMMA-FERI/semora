@@ -247,12 +247,17 @@ unknown historical revisions remain unknown. The runner rejects incompatible
 completed stage settings instead of silently rechunking historical text.
 
 Lexical `--stage` is `surface` or `lemma`; `--batch-size` controls the bounded
-write/inference batch. Lemma options include `--classla-type`,
+write/inference checkpoint. Install `semora[classla]` and the Slovene CLASSLA
+resources before lemma indexing. Lemma options include `--classla-type`,
 `--classla-device`, `--classla-resources-dir`, `--classla-pos-batch-size`,
-`--classla-lemma-batch-size` and optional `--lemma-model-fingerprint`. Throughput
-settings do not identify model compatibility. Supply a verified model fingerprint
-when known; this argument records an operator assertion and does not compute or
-verify model weights. Adoption does not invent one for historical outputs.
+`--classla-lemma-batch-size`, `--classla-workers` (parallel model processes),
+`--classla-worker-batch-articles` (articles per model job, default 50) and
+optional `--lemma-model-fingerprint`. Worker count and job size affect memory
+and throughput, not model compatibility. Each checkpoint preserves article order
+and commits only after every worker result and its FTS rows are ready. Supply a
+verified model fingerprint when known; this argument records an operator
+assertion and does not compute or verify model weights. Adoption does not
+invent one for historical outputs.
 
 `pipeline status` reports eligible articles and recorded/pending surface/lemma
 completion for the selected batch. These are bookkeeping counts, not an audit

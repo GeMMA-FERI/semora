@@ -7,7 +7,9 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import closing
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,22 @@ from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
 from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
+
+_WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
+
+
+def _initialize_lemma_worker(config: dict) -> None:
+    global _WORKER_LEMMATIZER
+    _WORKER_LEMMATIZER = ClasslaLemmatizer(**config)
+
+
+def _lemmatize_worker(texts: list[str]) -> list[str]:
+    if _WORKER_LEMMATIZER is None:
+        raise RuntimeError("CLASSLA lemma worker was not initialized.")
+    try:
+        return _WORKER_LEMMATIZER.lemmatize_many(texts)
+    finally:
+        _WORKER_LEMMATIZER.release_cuda_cache()
 
 
 def _json(value: Any) -> str:
@@ -289,16 +307,22 @@ def index_batch_lexical(
     lemmatizer: Lemmatizer | None = None, pipeline_type: str = "default", model_fingerprint: str | None = None,
     device: str = "cpu", resources_dir: str | Path | None = None,
     pos_batch_size: int | None = None, lemma_batch_size: int | None = None,
+    classla_workers: int = 1, worker_batch_articles: int = 50,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
     """Index only pending eligible articles in an ingested batch during maintenance."""
     if stage not in {"surface", "lemma"} or batch_size <= 0:
         raise ValueError("Select surface/lemma and a positive batch size.")
+    if classla_workers <= 0 or worker_batch_articles <= 0:
+        raise ValueError("CLASSLA worker counts and batch size must be positive.")
+    if classla_workers > 1 and lemmatizer is not None:
+        raise ValueError("A custom lemmatizer can only be used with one worker.")
     if not isinstance(batch_id, str) or not batch_id.strip():
         raise ValueError("Batch ID must be nonempty.")
     config = surface_config() if stage == "surface" else lemma_config(pipeline_type, model_fingerprint)
     path = Path(database_path).resolve(strict=True)
     owned_model: ClasslaLemmatizer | None = None
+    worker_pool: ProcessPoolExecutor | None = None
     with SemanticBuildLock(path.with_name(path.name + ".pipeline.lock"), "pipeline"):
         with closing(open_connection(path, read_only=True)) as reader:
             _validate_batch(reader, batch_id)
@@ -323,15 +347,36 @@ def index_batch_lexical(
                     break
                 annotations = []
                 if stage == "lemma":
-                    if lemmatizer is None:
-                        owned_model = ClasslaLemmatizer(
-                            pipeline_type=pipeline_type, device=device, resources_dir=resources_dir,
-                            pos_batch_size=pos_batch_size, lemma_batch_size=lemma_batch_size,
-                        )
-                        lemmatizer = owned_model
-                    annotations = lemmatizer.lemmatize_many(
-                        [text for row in rows for text in (row["title"] or "", row["content"])]
-                    )
+                    texts = [text for row in rows for text in (row["title"] or "", row["content"])]
+                    if classla_workers > 1:
+                        if worker_pool is None:
+                            worker_pool = ProcessPoolExecutor(
+                                max_workers=classla_workers, mp_context=get_context("spawn"),
+                                initializer=_initialize_lemma_worker,
+                                initargs=({
+                                    "pipeline_type": pipeline_type, "device": device,
+                                    "resources_dir": resources_dir,
+                                    "pos_batch_size": pos_batch_size,
+                                    "lemma_batch_size": lemma_batch_size,
+                                },),
+                            )
+                        group_size = worker_batch_articles * 2
+                        annotations = [
+                            annotation
+                            for group in worker_pool.map(
+                                _lemmatize_worker,
+                                (texts[offset:offset + group_size] for offset in range(0, len(texts), group_size)),
+                            )
+                            for annotation in group
+                        ]
+                    else:
+                        if lemmatizer is None:
+                            owned_model = ClasslaLemmatizer(
+                                pipeline_type=pipeline_type, device=device, resources_dir=resources_dir,
+                                pos_batch_size=pos_batch_size, lemma_batch_size=lemma_batch_size,
+                            )
+                            lemmatizer = owned_model
+                        annotations = lemmatizer.lemmatize_many(texts)
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
                     if not registered:
@@ -366,6 +411,8 @@ def index_batch_lexical(
                 "retrieval_ready": False, "publication_ready": False,
             }
         finally:
+            if worker_pool is not None:
+                worker_pool.shutdown(wait=True, cancel_futures=True)
             if owned_model is not None:
                 owned_model.close()
             database.close()
