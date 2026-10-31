@@ -83,6 +83,20 @@ def test_lemma_worker_warning_does_not_fail_on_windows_encoding(monkeypatch) -> 
     assert raw.getvalue() == b"\\u010d"
 
 
+def test_lemma_worker_discards_unbounded_tokenizer_stdout(monkeypatch, capsys) -> None:
+    class NoisyLemmatizer:
+        def lemmatize_many(self, texts):
+            print("Warning: Cannot compute token index. " + "č" * 1000)
+            return list(texts)
+
+        def release_cuda_cache(self):
+            pass
+
+    monkeypatch.setattr(lexical, "_WORKER_LEMMATIZER", NoisyLemmatizer())
+    assert lexical._lemmatize_worker(["text"]) == (["text"], 1)
+    assert capsys.readouterr().out == ""
+
+
 def test_pending_pages_follow_article_index_without_resorting_batch(tmp_path: Path) -> None:
     database = tmp_path / "semora.sqlite"
     ingest(tmp_path, database, "batch-a", "Straza/one.md", "Straza/two.md")

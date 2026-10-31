@@ -261,7 +261,10 @@ invent one for historical outputs.
 `pipeline index --profile` additionally emits a `lexical_checkpoint_timing`
 event to stderr after each committed page. Its fetch, inference, validation,
 write and commit times are measured in the coordinator; the first inference
-interval also includes lazy model/worker startup. The JSON result is unchanged.
+interval also includes lazy model/worker startup.
+Obeliks token-alignment warnings are counted per committed checkpoint without
+printing the raw OCR paragraph. The result includes the warning count for this
+attempt; a warning means token character offsets could not be matched exactly.
 
 `pipeline status` reports eligible articles and recorded/pending surface/lemma
 completion for the selected batch. These are bookkeeping counts, not an audit

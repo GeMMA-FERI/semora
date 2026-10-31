@@ -10,7 +10,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,18 @@ from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 _WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
 
 
+class _TokenAlignmentCounter:
+    def __init__(self) -> None:
+        self.count = 0
+
+    def write(self, message: str) -> int:
+        self.count += message.count("Warning: Cannot compute token index.")
+        return len(message)
+
+    def flush(self) -> None:
+        pass
+
+
 def _initialize_lemma_worker(config: dict) -> None:
     global _WORKER_LEMMATIZER
     # The tokenizer prints OCR warnings containing Slovene text. Windows worker
@@ -33,11 +45,16 @@ def _initialize_lemma_worker(config: dict) -> None:
     _WORKER_LEMMATIZER = ClasslaLemmatizer(**config)
 
 
-def _lemmatize_worker(texts: list[str]) -> list[str]:
+def _lemmatize_worker(texts: list[str]) -> tuple[list[str], int]:
     if _WORKER_LEMMATIZER is None:
         raise RuntimeError("CLASSLA lemma worker was not initialized.")
     try:
-        return _WORKER_LEMMATIZER.lemmatize_many(texts)
+        # Obeliks prints whole OCR paragraphs on token-alignment warnings.
+        # Retain a count without transporting unbounded source text over stdout.
+        warnings = _TokenAlignmentCounter()
+        with redirect_stdout(warnings):
+            annotations = _WORKER_LEMMATIZER.lemmatize_many(texts)
+        return annotations, warnings.count
     finally:
         _WORKER_LEMMATIZER.release_cuda_cache()
 
@@ -342,6 +359,7 @@ def index_batch_lexical(
             if eligible > initial:
                 invalidate_publication(path)
             added = 0
+            token_alignment_warnings = 0
             cursor = ""
             registered = False
             while True:
@@ -355,6 +373,7 @@ def index_batch_lexical(
                     break
                 fetch_finished = time.perf_counter()
                 annotations = []
+                checkpoint_warnings = 0
                 if stage == "lemma":
                     texts = [text for row in rows for text in (row["title"] or "", row["content"])]
                     if classla_workers > 1:
@@ -370,14 +389,12 @@ def index_batch_lexical(
                                 },),
                             )
                         group_size = worker_batch_articles * 2
-                        annotations = [
-                            annotation
-                            for group in worker_pool.map(
-                                _lemmatize_worker,
-                                (texts[offset:offset + group_size] for offset in range(0, len(texts), group_size)),
-                            )
-                            for annotation in group
-                        ]
+                        for group, warning_count in worker_pool.map(
+                            _lemmatize_worker,
+                            (texts[offset:offset + group_size] for offset in range(0, len(texts), group_size)),
+                        ):
+                            annotations.extend(group)
+                            checkpoint_warnings += warning_count
                     else:
                         if lemmatizer is None:
                             owned_model = ClasslaLemmatizer(
@@ -385,7 +402,13 @@ def index_batch_lexical(
                                 pos_batch_size=pos_batch_size, lemma_batch_size=lemma_batch_size,
                             )
                             lemmatizer = owned_model
-                        annotations = lemmatizer.lemmatize_many(texts)
+                        if owned_model is not None:
+                            alignment_output = _TokenAlignmentCounter()
+                            with redirect_stdout(alignment_output):
+                                annotations = lemmatizer.lemmatize_many(texts)
+                            checkpoint_warnings = alignment_output.count
+                        else:
+                            annotations = lemmatizer.lemmatize_many(texts)
                 inference_finished = time.perf_counter()
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
@@ -409,6 +432,7 @@ def index_batch_lexical(
                     write_finished = time.perf_counter()
                 commit_finished = time.perf_counter()
                 added += len(rows)
+                token_alignment_warnings += checkpoint_warnings
                 registered = True
                 cursor = rows[-1]["article_id"]
                 if progress is not None:
@@ -416,10 +440,16 @@ def index_batch_lexical(
                         "event": "lexical_checkpoint", "batch_id": batch_id, "stage": stage,
                         "completed_articles": initial + added, "total": eligible,
                     })
+                    if checkpoint_warnings:
+                        progress({
+                            "event": "lexical_token_alignment_warnings", "batch_id": batch_id,
+                            "completed_articles": initial + added, "count": checkpoint_warnings,
+                        })
                     if profile:
                         progress({
                             "event": "lexical_checkpoint_timing", "batch_id": batch_id, "stage": stage,
                             "completed_articles": initial + added, "articles": len(rows),
+                            "token_alignment_warnings": checkpoint_warnings,
                             "fetch_seconds": fetch_finished - checkpoint_started,
                             "inference_seconds": inference_finished - fetch_finished,
                             "validation_seconds": validation_finished - inference_finished,
@@ -433,6 +463,7 @@ def index_batch_lexical(
                 "completed_articles": completed, "added_articles": added, "skipped_articles": initial,
                 "pending_articles": eligible - completed, "complete": completed == eligible,
                 "retrieval_ready": False, "publication_ready": False,
+                "attempt_token_alignment_warnings": token_alignment_warnings,
             }
         finally:
             if worker_pool is not None:
