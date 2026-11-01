@@ -206,6 +206,12 @@ IVFPQ (16,384 lists, 32 PQ subvectors, 8 bits, one million training samples,
 defaults to 10. Completed private generations live under
 `<semantic-dir>/generations/<fingerprint>/`; serving root files remain untouched.
 
+`pipeline semantic vectors --progress-file <path>` atomically replaces a
+`pebble.progress.v1` JSON snapshot after initial coverage is counted, each
+committed shard, and completion. Its counts are chunks in the selected batch.
+The file is a live progress snapshot; `--output` remains a separate final,
+write-once report.
+
 NER `--run-id` selects the extraction profile (default `classla-sl`). The
 historical audit checks the producer's valid nonblank article membership,
 current content hashes, mention counts, indices, spans and text, including

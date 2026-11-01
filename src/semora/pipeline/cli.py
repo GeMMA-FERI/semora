@@ -109,6 +109,9 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             _add_audit_report(command)
         if name == "vectors":
             command.add_argument("--batch", required=True)
+            command.add_argument(
+                "--progress-file", help="Replace this JSON snapshot after each committed vector shard."
+            )
             command.add_argument("--model-id", default=DEFAULT_MODEL_ID)
             command.add_argument("--model-revision", help="Optional immutable model revision; omitted means unknown.")
             command.add_argument("--dimensions", type=int, default=256)
@@ -237,6 +240,17 @@ def _write_progress_file(path: Path, snapshot: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _snapshot_progress(path: Path | None, snapshot: dict, events: tuple[str, ...], count_key: str):
+    def progress(event: dict) -> None:
+        _progress(event)
+        if path is not None and event.get("event") in events:
+            snapshot["completed"] = event[count_key]
+            snapshot["total"] = event["total"]
+            _write_progress_file(path, snapshot)
+
+    return progress
+
+
 def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> None:
     """Execute one operation and keep machine-readable stdout separate from progress."""
     database = Path(args.database).resolve() if args.database else default_database
@@ -360,6 +374,12 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
         elif args.semantic_command == "vectors":
             from semora.pipeline.semantic import index_batch_vectors
 
+            progress_file = Path(args.progress_file).resolve() if args.progress_file else None
+            snapshot = {
+                "format": "pebble.progress.v1", "title": "Newspaper semantic vectors",
+                "state": "running", "completed": 0, "total": 0,
+                "unit": "chunks", "message": "",
+            }
             report = index_batch_vectors(
                 database,
                 args.batch,
@@ -370,8 +390,15 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 batch_size=args.batch_size,
                 shard_size=args.shard_size,
                 device=args.device,
-                progress=_progress,
+                progress=_snapshot_progress(
+                    progress_file, snapshot, ("semantic_start", "semantic_checkpoint"), "completed_chunks"
+                ),
             )
+            if progress_file is not None:
+                snapshot["completed"] = report["completed_chunks"]
+                snapshot["total"] = report["eligible_chunks"]
+                snapshot["state"] = "completed" if report["complete"] else "paused"
+                _write_progress_file(progress_file, snapshot)
         else:
             from semora.pipeline.semantic_faiss import build_semantic_generation
             from semora.retrieval.semantic_faiss import FaissBuildConfig
@@ -491,13 +518,6 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             "message": "",
         }
 
-        def lexical_progress(event: dict) -> None:
-            _progress(event)
-            if progress_file is not None and event.get("event") in ("lexical_start", "lexical_checkpoint"):
-                snapshot["completed"] = event["completed_articles"]
-                snapshot["total"] = event["total"]
-                _write_progress_file(progress_file, snapshot)
-
         report = index_batch_lexical(
             database,
             args.batch,
@@ -513,7 +533,9 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             profile=args.profile,
             trust_completed_state=args.trust_completed_state,
             model_fingerprint=args.lemma_model_fingerprint,
-            progress=lexical_progress,
+            progress=_snapshot_progress(
+                progress_file, snapshot, ("lexical_start", "lexical_checkpoint"), "completed_articles"
+            ),
         )
         if progress_file is not None:
             snapshot["completed"] = report["completed_articles"]

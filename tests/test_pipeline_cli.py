@@ -286,6 +286,33 @@ def test_lexical_progress_file_tracks_committed_checkpoints(tmp_path: Path, monk
     }
 
 
+def test_semantic_progress_file_tracks_committed_shards(tmp_path: Path, monkeypatch, capsys) -> None:
+    from semora.pipeline import semantic
+
+    progress_file = tmp_path / "tasks" / "semantic.json"
+
+    def fake_index(database, batch, semantic_dir, *, progress, **options):
+        progress({"event": "semantic_start", "batch_id": batch, "completed_chunks": 3, "total": 10})
+        assert json.loads(progress_file.read_text(encoding="utf-8"))["completed"] == 3
+        progress({"event": "semantic_checkpoint", "batch_id": batch, "completed_chunks": 7, "total": 10})
+        assert json.loads(progress_file.read_text(encoding="utf-8"))["completed"] == 7
+        return {"completed_chunks": 10, "eligible_chunks": 10, "complete": True}
+
+    monkeypatch.setattr(semantic, "index_batch_vectors", fake_index)
+    monkeypatch.setattr(sys, "argv", [
+        "semora", "pipeline", "semantic", "vectors",
+        "--database", str(tmp_path / "semora.sqlite"),
+        "--batch", "newspapers", "--maintenance",
+        "--progress-file", str(progress_file),
+    ])
+    main()
+    assert json.loads(progress_file.read_text(encoding="utf-8")) == {
+        "format": "pebble.progress.v1", "title": "Newspaper semantic vectors",
+        "state": "completed", "completed": 10, "total": 10,
+        "unit": "chunks", "message": "",
+    }
+
+
 @pytest.mark.parametrize("output_kind", ["existing", "database"])
 def test_cli_invalid_output_prevents_run_mutation(tmp_path: Path, monkeypatch, output_kind: str) -> None:
     manifest, source = prepare_manifest(tmp_path)

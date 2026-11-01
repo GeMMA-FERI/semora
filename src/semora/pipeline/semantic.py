@@ -549,6 +549,11 @@ def index_batch_vectors(
             removed_temporaries = _cleanup_unjournaled_temporaries(connection, vectors)
             recovered = _recover_pending(connection, vectors, config)
             eligible, initial = _coverage(connection, batch_id, vectors, config)
+            if progress is not None:
+                progress({
+                    "event": "semantic_start", "batch_id": batch_id,
+                    "completed_chunks": initial, "total": eligible,
+                })
             added = 0
             cursor = ""
             while True:

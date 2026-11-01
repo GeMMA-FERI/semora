@@ -66,6 +66,21 @@ def mapping(directory: Path) -> list[tuple]:
         return connection.execute("SELECT * FROM semantic_chunks ORDER BY vector_id").fetchall()
 
 
+def test_progress_reports_durable_vector_checkpoints(tmp_path: Path) -> None:
+    database = ingest(tmp_path, "batch-a", "Straza/a.md")
+    events: list[dict] = []
+    report = build(database, "batch-a", tmp_path / "semantic", model=Model(), progress=events.append)
+
+    assert events[0] == {
+        "event": "semantic_start", "batch_id": "batch-a",
+        "completed_chunks": 0, "total": report["eligible_chunks"],
+    }
+    assert events[-1] == {
+        "event": "semantic_checkpoint", "batch_id": "batch-a",
+        "completed_chunks": report["completed_chunks"], "total": report["eligible_chunks"],
+    }
+
+
 def test_append_two_batches_keeps_old_ids_bytes_and_uses_declared_defaults(tmp_path: Path) -> None:
     database = ingest(tmp_path, "batch-a", "Straza/a.md")
     directory = tmp_path / "indexes" / "semantic"
