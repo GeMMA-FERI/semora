@@ -207,9 +207,10 @@ defaults to 10. Completed private generations live under
 `<semantic-dir>/generations/<fingerprint>/`; serving root files remain untouched.
 
 Routine vector resumes compare the stored configuration and corpus identity,
-recover any pending shard, and check the selected batch. They do not rescan all
-historical vector mappings; run the explicit semantic audit when historical
-corpus or mapping files may have been restored or changed outside the pipeline.
+require the selected batch's chunk-stage receipts, recover any pending shard,
+and count selected-batch coverage in SQLite. They trust committed vector shards
+without rehashing old text or shard bytes. Run an explicit audit if corpus or
+mapping files may have changed outside the pipeline.
 
 `pipeline semantic vectors --progress-file <path>` atomically replaces a
 `pebble.progress.v1` JSON snapshot after initial coverage is counted, each

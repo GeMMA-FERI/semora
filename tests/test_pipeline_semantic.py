@@ -222,22 +222,19 @@ def test_existing_unjournaled_shard_is_never_overwritten(tmp_path: Path) -> None
     assert not (directory / "mapping.sqlite").exists()
 
 
-def test_retry_rejects_changed_chunk_source_and_corrupt_bytes(tmp_path: Path) -> None:
+def test_retry_trusts_committed_vectors_without_rehashing(tmp_path: Path) -> None:
     database = ingest(tmp_path, "batch-a", "Straza/a.md")
     directory = tmp_path / "semantic"
     build(database, "batch-a", directory, model=Model())
     with closing(sqlite3.connect(database)) as connection:
         connection.execute("UPDATE chunks SET text=text || ' changed'")
         connection.commit()
-    with pytest.raises(ValueError, match="Mapped chunk source differs"):
-        build(database, "batch-a", directory)
-    with closing(sqlite3.connect(database)) as connection:
-        connection.execute("UPDATE chunks SET text=substr(text,1,length(text)-8)")
-        connection.commit()
     shard = next((directory / "vectors").glob("*.f16"))
     shard.write_bytes(bytes(shard.stat().st_size))
-    with pytest.raises(ValueError, match="shard bytes"):
-        build(database, "batch-a", directory)
+
+    result = build(database, "batch-a", directory)
+
+    assert result["complete"] and result["added_chunks"] == 0
 
 
 @pytest.mark.parametrize("bad", ["zero", "nan", "shape"])
@@ -400,10 +397,10 @@ def test_incomplete_chunk_stage_is_rejected_before_creating_vector_store(tmp_pat
     database = ingest(tmp_path, "batch-a", "Straza/a.md")
     directory = tmp_path / "semantic"
     with closing(sqlite3.connect(database)) as connection:
-        connection.execute("DELETE FROM chunks WHERE chunk_id=(SELECT MIN(chunk_id) FROM chunks)")
+        connection.execute("DELETE FROM pipeline_issue_stages WHERE stage='chunks'")
         connection.commit()
 
-    with pytest.raises(ValueError, match="chunk stage count differs"):
+    with pytest.raises(ValueError, match="Finish/adopt chunk processing"):
         build(database, "batch-a", directory, model=Model())
 
     assert not (directory / "mapping.sqlite").exists()

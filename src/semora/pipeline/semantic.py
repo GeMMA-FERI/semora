@@ -186,22 +186,14 @@ def _batch_config(connection: sqlite3.Connection, batch_id: str) -> dict:
         (batch_id,),
     ).fetchone():
         raise ValueError("Finish/adopt chunk processing for every batch issue before embedding.")
-    if connection.execute(
-        "SELECT 1 FROM pipeline_batch_issues b JOIN pipeline_issue_stages s USING(newspaper_id) "
-        "WHERE b.batch_id=? AND s.stage='chunks' AND s.output_count<>(SELECT COUNT(*) FROM chunks c "
-        "JOIN articles a USING(article_id) WHERE a.newspaper_id=b.newspaper_id) LIMIT 1",
-        (batch_id,),
-    ).fetchone():
-        raise ValueError("Batch chunk stage count differs from stored outputs; audit/repair is required.")
     settings = canonical_chunking_config(json.loads(row["config_json"])["chunking"])
-    for run in connection.execute(
-        "SELECT DISTINCT r.method,r.config_json FROM chunking_runs r JOIN chunks c USING(chunking_run_id) "
-        "JOIN articles a USING(article_id) JOIN pipeline_batch_issues b USING(newspaper_id) "
-        "WHERE b.batch_id=? AND a.is_valid=1",
-        (batch_id,),
+    run = connection.execute(
+        "SELECT method,config_json FROM chunking_runs WHERE run_id=?", (f"batch_{batch_id}",)
+    ).fetchone()
+    if run is not None and (
+        run["method"] != "token" or canonical_chunking_config(json.loads(run["config_json"])) != settings
     ):
-        if run["method"] != "token" or canonical_chunking_config(json.loads(run["config_json"])) != settings:
-            raise ValueError("Batch chunks have incompatible tokenization configurations.")
+        raise ValueError("Batch chunking run has incompatible tokenization configuration.")
     return settings
 
 
@@ -246,14 +238,6 @@ def _store_preflight(path: Path, config: dict, corpus_identity: str) -> None:
             raise ValueError("Semantic mapping belongs to a different corpus identity.")
 
 
-_BATCH_ROWS = (
-    "SELECT c.chunk_id,c.text,m.vector_id,m.shard_offset,i.input_sha256,s.* FROM corpus.chunks c "
-    "JOIN corpus.articles a USING(article_id) JOIN corpus.pipeline_batch_issues b USING(newspaper_id) "
-    "LEFT JOIN semantic_chunks m ON m.chunk_id=c.chunk_id "
-    "LEFT JOIN semantic_shards s ON s.shard_index=m.shard_index "
-    "LEFT JOIN pipeline_semantic_inputs i ON i.chunk_id=c.chunk_id WHERE b.batch_id=? AND a.is_valid=1"
-)
-
 _PENDING_PAGE = (
     "SELECT c.chunk_id,c.text FROM corpus.chunks c INDEXED BY sqlite_autoindex_chunks_1 "
     "CROSS JOIN corpus.articles a ON a.article_id=c.article_id "
@@ -264,28 +248,16 @@ _PENDING_PAGE = (
 )
 
 
-def _coverage(connection: sqlite3.Connection, batch_id: str, vectors: Path, config: dict) -> tuple[int, int]:
-    eligible = completed = 0
-    checked = set()
-    for row in connection.execute(_BATCH_ROWS, (batch_id,)):
-        eligible += 1
-        if row["vector_id"] is not None:
-            if row["input_sha256"] is None or row["input_sha256"] != chunk_input_sha256(row["text"]):
-                raise ValueError("Mapped chunk source differs or lacks audited input evidence; repair is required.")
-            if (
-                row["shard_index"] is None
-                or row["dimensions"] != config["dimensions"]
-                or row["dtype"] != "float16"
-                or not 0 <= row["shard_offset"] < row["vector_count"]
-                or row["vector_id"] != row["first_vector_id"] + row["shard_offset"]
-                or row["byte_size"] != row["vector_count"] * config["dimensions"] * 2
-            ):
-                raise ValueError("Mapped chunk/shard layout is inconsistent; explicit repair is required.")
-            if row["shard_index"] not in checked:
-                _check_file(_safe_file(vectors, row["file_name"]), row["byte_size"], row["sha256"])
-                checked.add(row["shard_index"])
-            completed += 1
-    return eligible, completed
+def _coverage(connection: sqlite3.Connection, batch_id: str) -> tuple[int, int]:
+    row = connection.execute(
+        "SELECT COUNT(*),COUNT(m.chunk_id) FROM corpus.pipeline_batch_issues b "
+        "JOIN corpus.articles a ON a.newspaper_id=b.newspaper_id "
+        "JOIN corpus.chunks c ON c.article_id=a.article_id "
+        "LEFT JOIN semantic_chunks m ON m.chunk_id=c.chunk_id "
+        "WHERE b.batch_id=? AND a.is_valid=1",
+        (batch_id,),
+    ).fetchone()
+    return row[0], row[1]
 
 
 def _safe_file(directory: Path, name: str) -> Path:
@@ -555,7 +527,7 @@ def index_batch_vectors(
                 initialize_store(connection, config, corpus_identity=corpus_identity)
             removed_temporaries = _cleanup_unjournaled_temporaries(connection, vectors)
             recovered = _recover_pending(connection, vectors, config)
-            eligible, initial = _coverage(connection, batch_id, vectors, config)
+            eligible, initial = _coverage(connection, batch_id)
             if progress is not None:
                 progress({
                     "event": "semantic_start", "batch_id": batch_id,
@@ -588,7 +560,7 @@ def index_batch_vectors(
                             "total": eligible,
                         }
                     )
-            _, completed = _coverage(connection, batch_id, vectors, config)
+            completed = initial + added
             return {
                 "batch_id": batch_id,
                 "stage": "vectors",
