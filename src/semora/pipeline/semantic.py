@@ -222,7 +222,7 @@ def validate_corpus_membership(connection: sqlite3.Connection) -> None:
         raise ValueError("Mapped historical chunks or their input evidence are missing/invalid; audit required.")
 
 
-def _store_preflight(path: Path, config: dict, corpus_identity: str, source: Path) -> None:
+def _store_preflight(path: Path, config: dict, corpus_identity: str) -> None:
     if not path.is_file():
         if path.exists():
             raise ValueError("Semantic mapping path is not a file.")
@@ -244,8 +244,6 @@ def _store_preflight(path: Path, config: dict, corpus_identity: str, source: Pat
             raise ValueError("Semantic model/revision/dimensions/chunking changed; use an explicit new generation.")
         if store_corpus_identity(connection) != corpus_identity:
             raise ValueError("Semantic mapping belongs to a different corpus identity.")
-        connection.execute("ATTACH DATABASE ? AS corpus", (source.as_uri() + "?mode=ro",))
-        validate_corpus_membership(connection)
 
 
 _BATCH_ROWS = (
@@ -539,7 +537,7 @@ def index_batch_vectors(
             chunking = _batch_config(corpus, batch_id)
             corpus_identity = _corpus_identity(corpus)
         config = vector_config(model_id, model_revision, dimensions, chunking)
-        _store_preflight(mapping, config, corpus_identity, source)
+        _store_preflight(mapping, config, corpus_identity)
         invalidate_publication(source)
         directory.mkdir(parents=True, exist_ok=True)
         vectors = directory / "vectors"

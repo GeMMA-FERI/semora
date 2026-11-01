@@ -376,7 +376,7 @@ def test_startup_cleans_only_reserved_unjournaled_temporary_namespace(tmp_path: 
     assert before == {path.name: path.read_bytes() for path in (directory / "vectors").glob("*.f16")}
 
 
-def test_older_copy_with_same_corpus_identity_cannot_drop_mapped_chunks(tmp_path: Path) -> None:
+def test_historical_membership_check_detects_older_corpus_copy(tmp_path: Path) -> None:
     database = ingest(tmp_path, "batch-a", "Straza/a.md")
     directory = tmp_path / "semantic"
     build(database, "batch-a", directory, model=Model())
@@ -386,8 +386,12 @@ def test_older_copy_with_same_corpus_identity_cannot_drop_mapped_chunks(tmp_path
     build(database, "batch-b", directory, model=Model())
     before = mapping(directory)
 
-    with pytest.raises(ValueError, match="Mapped historical chunks"):
-        build(fork, "batch-a", directory, model=Model())
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        connection.execute("ATTACH DATABASE ? AS corpus", (str(fork),))
+        with pytest.raises(ValueError, match="Mapped historical chunks"):
+            semantic.validate_corpus_membership(connection)
+
+    assert build(fork, "batch-a", directory, model=Model())["complete"]
 
     assert mapping(directory) == before
 

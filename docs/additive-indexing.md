@@ -206,6 +206,11 @@ IVFPQ (16,384 lists, 32 PQ subvectors, 8 bits, one million training samples,
 defaults to 10. Completed private generations live under
 `<semantic-dir>/generations/<fingerprint>/`; serving root files remain untouched.
 
+Routine vector resumes compare the stored configuration and corpus identity,
+recover any pending shard, and check the selected batch. They do not rescan all
+historical vector mappings; run the explicit semantic audit when historical
+corpus or mapping files may have been restored or changed outside the pipeline.
+
 `pipeline semantic vectors --progress-file <path>` atomically replaces a
 `pebble.progress.v1` JSON snapshot after initial coverage is counted, each
 committed shard, and completion. Its counts are chunks in the selected batch.
