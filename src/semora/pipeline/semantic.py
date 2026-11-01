@@ -256,6 +256,15 @@ _BATCH_ROWS = (
     "LEFT JOIN pipeline_semantic_inputs i ON i.chunk_id=c.chunk_id WHERE b.batch_id=? AND a.is_valid=1"
 )
 
+_PENDING_PAGE = (
+    "SELECT c.chunk_id,c.text FROM corpus.chunks c INDEXED BY sqlite_autoindex_chunks_1 "
+    "CROSS JOIN corpus.articles a ON a.article_id=c.article_id "
+    "CROSS JOIN corpus.pipeline_batch_issues b ON b.newspaper_id=a.newspaper_id "
+    "LEFT JOIN semantic_chunks m ON m.chunk_id=c.chunk_id "
+    "WHERE c.chunk_id>? AND b.batch_id=? AND a.is_valid=1 AND m.chunk_id IS NULL "
+    "ORDER BY c.chunk_id LIMIT ?"
+)
+
 
 def _coverage(connection: sqlite3.Connection, batch_id: str, vectors: Path, config: dict) -> tuple[int, int]:
     eligible = completed = 0
@@ -559,10 +568,7 @@ def index_batch_vectors(
             while True:
                 # Local paging only. Every retry restarts from explicit batch
                 # membership minus committed mappings; no global hash cursor.
-                rows = connection.execute(
-                    _BATCH_ROWS + " AND m.chunk_id IS NULL AND c.chunk_id>? ORDER BY c.chunk_id LIMIT ?",
-                    (batch_id, cursor, shard_size),
-                ).fetchall()
+                rows = connection.execute(_PENDING_PAGE, (cursor, batch_id, shard_size)).fetchall()
                 if not rows:
                     break
                 if model is None:

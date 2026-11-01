@@ -81,6 +81,23 @@ def test_progress_reports_durable_vector_checkpoints(tmp_path: Path) -> None:
     }
 
 
+def test_pending_page_uses_chunk_id_order_without_sorting_batch(tmp_path: Path) -> None:
+    database = ingest(tmp_path, "batch-a", "Straza/a.md")
+    directory = tmp_path / "semantic"
+    build(database, "batch-a", directory, model=Model())
+
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        connection.execute("ATTACH DATABASE ? AS corpus", (str(database),))
+        plan = [
+            row[3] for row in connection.execute(
+                "EXPLAIN QUERY PLAN " + semantic._PENDING_PAGE, ("", "batch-a", 2)
+            )
+        ]
+
+    assert any("SEARCH c USING INDEX sqlite_autoindex_chunks_1 (chunk_id>?)" in step for step in plan)
+    assert not any("USE TEMP B-TREE" in step for step in plan)
+
+
 def test_append_two_batches_keeps_old_ids_bytes_and_uses_declared_defaults(tmp_path: Path) -> None:
     database = ingest(tmp_path, "batch-a", "Straza/a.md")
     directory = tmp_path / "indexes" / "semantic"
