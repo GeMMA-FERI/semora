@@ -379,6 +379,8 @@ def test_progress_reports_only_committed_checkpoints(tmp_path: Path) -> None:
     index_batch_lexical(database, "batch-a", batch_size=1, progress=events.append)
 
     assert events == [
+        {"event": "lexical_start", "batch_id": "batch-a", "stage": "surface",
+         "completed_articles": 0, "total": 2},
         {"event": "lexical_checkpoint", "batch_id": "batch-a", "stage": "surface",
          "completed_articles": 1, "total": 2},
         {"event": "lexical_checkpoint", "batch_id": "batch-a", "stage": "surface",
@@ -394,10 +396,11 @@ def test_profile_reports_committed_checkpoint_phase_times(tmp_path: Path) -> Non
     index_batch_lexical(database, "batch-a", batch_size=1, profile=True, progress=events.append)
 
     assert [event["event"] for event in events] == [
+        "lexical_start",
         "lexical_checkpoint", "lexical_checkpoint_timing",
         "lexical_checkpoint", "lexical_checkpoint_timing",
     ]
-    for timing in events[1::2]:
+    for timing in events[2::2]:
         assert timing["articles"] == 1
         assert timing["completed_articles"] in {1, 2}
         phases = [timing[f"{name}_seconds"] for name in (

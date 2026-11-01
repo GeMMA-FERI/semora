@@ -478,6 +478,11 @@ def index_batch_lexical(
                 _trusted_coverage(connection, batch_id, stage, config)
                 if trust_completed_state else _validate_existing(connection, batch_id, stage, config, policy)
             )
+            if progress is not None:
+                progress({
+                    "event": "lexical_start", "batch_id": batch_id, "stage": stage,
+                    "completed_articles": initial, "total": eligible,
+                })
             if eligible > initial:
                 invalidate_publication(path)
             added = 0

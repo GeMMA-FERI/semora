@@ -259,6 +259,33 @@ def test_cli_run_and_status_reports_use_receipts_and_separate_progress(tmp_path:
     assert json.loads(status_file.read_text(encoding="utf-8"))["manifest_fingerprint"] == report["manifest_fingerprint"]
 
 
+def test_lexical_progress_file_tracks_committed_checkpoints(tmp_path: Path, monkeypatch, capsys) -> None:
+    progress_file = tmp_path / "tasks" / "newspaper-lemma.json"
+
+    def fake_index(database, batch, *, progress, **options):
+        progress({"event": "lexical_checkpoint", "batch_id": batch, "stage": "lemma",
+                  "completed_articles": 7, "total": 10})
+        snapshot = json.loads(progress_file.read_text(encoding="utf-8"))
+        assert snapshot["completed"] == 7
+        assert snapshot["total"] == 10
+        assert snapshot["state"] == "running"
+        return {"completed_articles": 10, "eligible_articles": 10, "complete": True}
+
+    monkeypatch.setattr(lexical, "index_batch_lexical", fake_index)
+    monkeypatch.setattr(sys, "argv", [
+        "semora", "pipeline", "index", "--database", str(tmp_path / "semora.sqlite"),
+        "--batch", "newspapers", "--stage", "lemma", "--maintenance",
+        "--progress-file", str(progress_file),
+    ])
+    main()
+    snapshot = json.loads(progress_file.read_text(encoding="utf-8"))
+    assert snapshot == {
+        "format": "pebble.progress.v1", "title": "Newspaper lemma indexing",
+        "state": "completed", "completed": 10, "total": 10,
+        "unit": "articles", "message": "",
+    }
+
+
 @pytest.mark.parametrize("output_kind", ["existing", "database"])
 def test_cli_invalid_output_prevents_run_mutation(tmp_path: Path, monkeypatch, output_kind: str) -> None:
     manifest, source = prepare_manifest(tmp_path)

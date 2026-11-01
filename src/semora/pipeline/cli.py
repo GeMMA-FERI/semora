@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -53,6 +55,9 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     _add_maintenance(lexical)
     lexical.add_argument("--batch", required=True)
     lexical.add_argument("--stage", required=True, choices=("surface", "lemma"))
+    lexical.add_argument(
+        "--progress-file", help="Replace this JSON snapshot after each committed lexical checkpoint."
+    )
     lexical.add_argument("--batch-size", type=int, default=1000, help="Articles per committed checkpoint.")
     lexical.add_argument("--classla-type", default="default")
     lexical.add_argument(
@@ -213,6 +218,25 @@ def _progress(event: dict) -> None:
     print(json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
+def _write_progress_file(path: Path, snapshot: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(snapshot, stream, ensure_ascii=False, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> None:
     """Execute one operation and keep machine-readable stdout separate from progress."""
     database = Path(args.database).resolve() if args.database else default_database
@@ -246,6 +270,10 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         if args.spellfix_path:
             protected.append(Path(args.spellfix_path))
     output = report_path(args.output, protected=protected) if args.output else None
+    if getattr(args, "progress_file", None):
+        progress_file = Path(args.progress_file).resolve()
+        if progress_file in {Path(item).resolve() for item in protected} or progress_file == output:
+            raise ValueError("Progress file conflicts with an input, database or report.")
     operation = args.pipeline_command
     mutates = (
         operation in ("run", "index")
@@ -452,6 +480,24 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
     else:
         from semora.pipeline.lexical import index_batch_lexical
 
+        progress_file = Path(args.progress_file).resolve() if args.progress_file else None
+        snapshot = {
+            "format": "pebble.progress.v1",
+            "title": f"Newspaper {args.stage} indexing",
+            "state": "running",
+            "completed": 0,
+            "total": 0,
+            "unit": "articles",
+            "message": "",
+        }
+
+        def lexical_progress(event: dict) -> None:
+            _progress(event)
+            if progress_file is not None and event.get("event") in ("lexical_start", "lexical_checkpoint"):
+                snapshot["completed"] = event["completed_articles"]
+                snapshot["total"] = event["total"]
+                _write_progress_file(progress_file, snapshot)
+
         report = index_batch_lexical(
             database,
             args.batch,
@@ -467,7 +513,12 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             profile=args.profile,
             trust_completed_state=args.trust_completed_state,
             model_fingerprint=args.lemma_model_fingerprint,
-            progress=_progress,
+            progress=lexical_progress,
         )
+        if progress_file is not None:
+            snapshot["completed"] = report["completed_articles"]
+            snapshot["total"] = report["eligible_articles"]
+            snapshot["state"] = "completed" if report["complete"] else "paused"
+            _write_progress_file(progress_file, snapshot)
 
     return report, success

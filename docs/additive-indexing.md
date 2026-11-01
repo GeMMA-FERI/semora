@@ -258,6 +258,16 @@ and commits only after every worker result and its FTS rows are ready. Supply a
 verified model fingerprint when known; this argument records an operator
 assertion and does not compute or verify model weights. Adoption does not
 invent one for historical outputs.
+
+For a live desktop monitor, `pipeline index --progress-file <path>` atomically
+replaces a flat `pebble.progress.v1` JSON snapshot at stage start, after each
+committed checkpoint, and at completion. It contains `title`, `state`,
+`completed`, `total`, `unit`, and `message`. Put the file in a directory that
+Pebble can read, such as a `tasks` folder beside `Pebble.exe`. This is separate
+from `--output`, whose immutable final JSON report is written only when the
+command finishes. On a retry, the stage-start snapshot uses the durable
+completion count already recorded in the database.
+
 `pipeline index --profile` additionally emits a `lexical_checkpoint_timing`
 event to stderr after each committed page. Its fetch, inference, validation,
 write and commit times are measured in the coordinator; the first inference
