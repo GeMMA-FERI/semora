@@ -118,7 +118,7 @@ def audit_publication(
                 if config is None or store_corpus_identity(mapping) != identity[0]:
                     raise ValueError("Semantic mapping is not adopted for this corpus.")
                 validate_corpus_membership(mapping)
-                eligible, completed = vector_coverage(mapping, batch_id, semantic / "vectors", config)
+                eligible, completed = vector_coverage(mapping, batch_id)
                 if eligible != completed:
                     raise ValueError(f"Semantic vectors are incomplete for the batch: {completed}/{eligible}.")
                 shards = _shards(mapping, semantic, config)
