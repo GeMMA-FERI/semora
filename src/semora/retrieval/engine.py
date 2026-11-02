@@ -159,6 +159,11 @@ class SearchEngine:
                 publication_id=revision,
             )
             status["semantic"]["publication_id"] = revision
+            scope = self.publication.get("entity_scope", "complete")
+            status["entities"] = {
+                "available": True, "complete": scope == "complete",
+                "scope": scope, "publication_id": revision,
+            }
         return status
 
     def load_semantic(self) -> None:

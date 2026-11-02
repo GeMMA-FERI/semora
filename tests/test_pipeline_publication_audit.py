@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from tests.test_pipeline_lexical import CountingLemmatizer
-from tests.test_pipeline_semantic import ingest
 
+from semora.pipeline import publication_audit
 from semora.pipeline.lexical import index_batch_lexical
 from semora.pipeline.publication_audit import audit_publication
+from tests.test_pipeline_lexical import CountingLemmatizer
+from tests.test_pipeline_semantic import ingest
 
 
 def test_audit_reports_incomplete_stages_without_publishing(tmp_path: Path) -> None:
@@ -72,3 +75,66 @@ def test_audit_rejects_an_unfinished_other_batch(tmp_path: Path) -> None:
 
     assert report["stages"]["ingestion"]["complete"] is False
     assert any("batch-a" in item["reason"] for item in report["errors"])
+
+
+def test_historical_ner_mode_does_not_require_new_batch_outputs(tmp_path: Path, monkeypatch) -> None:
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    with sqlite3.connect(source) as corpus:
+        corpus.execute(
+            "CREATE TABLE IF NOT EXISTS pipeline_ner_adoptions "
+            "(ner_run_id TEXT PRIMARY KEY,evidence_json TEXT,model_identity_json TEXT)"
+        )
+        corpus.execute(
+            "INSERT INTO pipeline_ner_adoptions(ner_run_id,evidence_json,model_identity_json) "
+            "VALUES ('classla-sl','{}','{}')"
+        )
+    monkeypatch.setattr(publication_audit, "_recorded_identity", lambda *_args: ({}, {"adapter": "classla"}))
+    monkeypatch.setattr(publication_audit, "ner_coverage", lambda *_args: (1, 0))
+    with sqlite3.connect(source) as corpus:
+        assert publication_audit._historical_ner(corpus, "classla-sl")["historical_only"]
+        with pytest.raises(ValueError, match="NER is incomplete"):
+            publication_audit._ner(corpus, "batch-a", "classla-sl")
+
+
+def test_partial_publication_requires_explicit_opt_in(tmp_path: Path, monkeypatch) -> None:
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    index_batch_lexical(source, "batch-a")
+    index_batch_lexical(source, "batch-a", stage="lemma", lemmatizer=CountingLemmatizer())
+    with sqlite3.connect(source) as corpus:
+        chunks = corpus.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        corpus_id = corpus.execute("SELECT corpus_id FROM pipeline_corpus_identity").fetchone()[0]
+    semantic = tmp_path / "indexes" / "semantic"
+    generation = "a" * 64
+    private = semantic / "generations" / generation
+    private.mkdir(parents=True)
+    (semantic / "mapping.sqlite").touch()
+    (private / "manifest.json").write_text(json.dumps({"faiss": {"index_type": "flat"}}), encoding="utf-8")
+    monkeypatch.setattr(publication_audit, "read_store_config", lambda *_args: {"dimensions": 2, "model_id": "test"})
+    monkeypatch.setattr(publication_audit, "store_corpus_identity", lambda *_args: corpus_id)
+    monkeypatch.setattr(publication_audit, "validate_corpus_membership", lambda *_args: None)
+    monkeypatch.setattr(publication_audit, "vector_coverage", lambda *_args: (chunks, chunks))
+    monkeypatch.setattr(publication_audit, "_shards", lambda *_args: [SimpleNamespace(vector_count=chunks)])
+    monkeypatch.setattr(
+        publication_audit, "_load_generation",
+        lambda *_args: (None, {"chunks": chunks, "index_sha256": "b" * 64}),
+    )
+    monkeypatch.setattr(
+        publication_audit, "_historical_ner",
+        lambda *_args: {"complete": False, "historical_only": True},
+    )
+
+    def historical_entities(_corpus, _root, _run_id, _identity, report):
+        report["entity_generation"] = "c" * 32
+        report["entity_manifest_sha256"] = "d" * 64
+        return {"complete": False, "historical_only": True}
+
+    monkeypatch.setattr(publication_audit, "_historical_entities", historical_entities)
+    entity = tmp_path / "indexes" / "entities"
+    strict = audit_publication(source, "batch-a", semantic, generation, entity, faiss_module=object())
+    partial = audit_publication(
+        source, "batch-a", semantic, generation, entity,
+        allow_historical_entities=True, faiss_module=object(),
+    )
+
+    assert not strict["eligible"] and strict["candidate"] is None
+    assert partial["eligible"] and partial["candidate"]["entity_scope"] == "historical_only"

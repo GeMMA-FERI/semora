@@ -97,8 +97,16 @@ NER/entity dictionary consistency. `pipeline publication` accepts `--database`, 
 `--entity-dir`, `--run-id` (default `classla-sl`), and optional trusted
 `--spellfix-path`. Without `--publish` it is read-only and does not require
 `--maintenance`. It can take substantial time: it streams the full 15.7 GB
-legacy dictionary and validates every vector shard and FAISS ID. The audit
-returns `candidate` only when all six stage checks pass. `--publish` returns
+legacy dictionary and validates every vector shard and FAISS ID. The default
+audit returns `candidate` only when all six stage checks pass.
+`--allow-historical-entities` is an explicit partial mode: it requires adopted
+NER identity and a matching historical entity manifest, profile and corpus
+binding, but does not require new-batch NER or entity outputs. Entity search
+remains available for previously indexed articles; the pointer and reader
+status mark its scope as `historical_only`. Later NER and entity indexing
+invalidates this pointer and requires a new publication. The partial gate still
+checks complete ingestion, both lexical paths and the full semantic generation.
+`--publish` returns
 `published=true`, `publication_id` and `restart_readers=true` on success; an
 idempotent retry preserves the same publication ID. It does not restart NORA.
 

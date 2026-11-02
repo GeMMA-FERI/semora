@@ -46,6 +46,7 @@ def audit_publication(
     entity_dir: str | Path,
     *,
     run_id: str = "classla-sl",
+    allow_historical_entities: bool = False,
     spellfix_path: str | Path | None = None,
     faiss_module=None,
     progress=None,
@@ -64,6 +65,7 @@ def audit_publication(
         "epoch": None,
         "entity_generation": None,
         "entity_manifest_sha256": None,
+        "entity_scope": "historical_only" if allow_historical_entities else "complete",
         "candidate": None,
         "stages": {},
         "errors": [],
@@ -108,7 +110,10 @@ def audit_publication(
             report["errors"].append({"stage": "publication_state", "reason": str(exc)})
         for stage in ("surface", "lemma"):
             check(stage, lambda stage=stage: _lexical(corpus, batch_id, stage))
-        check("ner", lambda: _ner(corpus, batch_id, run_id))
+        if allow_historical_entities:
+            check("ner", lambda: _historical_ner(corpus, run_id))
+        else:
+            check("ner", lambda: _ner(corpus, batch_id, run_id))
 
         def semantic_stage() -> dict:
             with closing(open_connection(semantic / "mapping.sqlite", read_only=True)) as mapping:
@@ -227,10 +232,18 @@ def audit_publication(
                         "baseline_manifest_names": manifest["names"],
                         "generation": manifest["generation"]}
 
-        check("entities", entity_stage)
-    report["eligible"] = not report["errors"] and all(
-        stage.get("complete") is True for stage in report["stages"].values()
-    ) and len(report["stages"]) == 6
+        if allow_historical_entities:
+            check("entities", lambda: _historical_entities(corpus, entity, run_id, identity[0], report))
+        else:
+            check("entities", entity_stage)
+    required = {"ingestion", "surface", "lemma", "semantic"}
+    report["eligible"] = not report["errors"] and len(report["stages"]) == 6 and all(
+        report["stages"][name].get("complete") is True for name in required
+    ) and all(
+        report["stages"][name].get("historical_only") is True if allow_historical_entities
+        else report["stages"][name].get("complete") is True
+        for name in ("ner", "entities")
+    )
     if report["eligible"]:
         report["candidate"] = {
             "format": "semora.pipeline.publication.v1",
@@ -247,7 +260,49 @@ def audit_publication(
                 "manifest_sha256": report["entity_manifest_sha256"],
             },
         }
+        if allow_historical_entities:
+            report["candidate"]["entity_scope"] = "historical_only"
     return report
+
+
+def _historical_ner(corpus: sqlite3.Connection, run_id: str) -> dict:
+    config, identity = _recorded_identity(corpus, run_id)
+    if config is None or identity is None:
+        raise ValueError("Historical NER run has no supported recorded identity.")
+    adoption = corpus.execute(
+        "SELECT 1 FROM pipeline_ner_adoptions WHERE ner_run_id=?", (run_id,)
+    ).fetchone()
+    if adoption is None:
+        raise ValueError("Historical NER run has no adoption receipt.")
+    return {"complete": False, "historical_only": True, "ner_run_id": run_id}
+
+
+def _historical_entities(
+    corpus: sqlite3.Connection, root: Path, run_id: str, corpus_id: str, report: dict
+) -> dict:
+    manifest, dictionary, manifest_hash = _manifest(root, run_id)
+    report["entity_generation"] = manifest["generation"]
+    report["entity_manifest_sha256"] = manifest_hash
+    with closing(open_connection(dictionary, read_only=True)) as names:
+        profile = names.execute(
+            "SELECT corpus_id,ner_run_id,normalization,advancement_token,evidence_json "
+            "FROM pipeline_entity_profile WHERE profile_id=1"
+        ).fetchone()
+        if profile is None or tuple(profile[:3]) != (corpus_id, run_id, NORMALIZATION):
+            raise ValueError("Historical entity dictionary has no matching adopted profile.")
+        evidence = json.loads(profile["evidence_json"])
+        if evidence.get("manifest_sha256") != manifest_hash:
+            raise ValueError("Historical entity manifest changed after adoption.")
+        binding = corpus.execute(
+            "SELECT corpus_id,generation,advancement_token,pending_token "
+            "FROM pipeline_entity_bindings WHERE ner_run_id=?", (run_id,)
+        ).fetchone()
+        if binding is None or tuple(binding) != (
+            corpus_id, manifest["generation"], profile["advancement_token"], None
+        ):
+            raise ValueError("Historical entity dictionary advancement is unfinished or mismatched.")
+        _schemas(names)
+    return {"complete": False, "historical_only": True, "generation": manifest["generation"]}
 
 
 def _ingestion(corpus: sqlite3.Connection, status: dict) -> dict:

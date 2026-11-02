@@ -11,8 +11,6 @@ import types
 from pathlib import Path
 
 import pytest
-from tests.test_pipeline_entity_baseline import Model as NerModel
-from tests.test_pipeline_semantic_baseline import TinyEmbedding
 
 from semora.corpus import indexer
 from semora.ner.indexing import build_ner_index
@@ -36,6 +34,8 @@ from semora.retrieval.indexing import build_bm25_index, build_lemma_index
 from semora.retrieval.semantic_faiss import FaissBuildConfig
 from semora.retrieval.semantic_store import read_semantic_build_spec
 from semora.retrieval.semantic_vectors import build_semantic_vectors
+from tests.test_pipeline_entity_baseline import Model as NerModel
+from tests.test_pipeline_semantic_baseline import TinyEmbedding
 
 np = pytest.importorskip("numpy")
 
@@ -98,11 +98,32 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
     index_batch_lexical(database, "new-batch")
     index_batch_lexical(database, "new-batch", stage="lemma", lemmatizer=Lemmatizer())
     index_batch_vectors(database, "new-batch", semantic, dimensions=4, shard_size=2, model=TinyEmbedding())
-    index_batch_ner(database, "new-batch", model=NerModel())
-    index_batch_entities(database, "new-batch", entity)
     generation = build_semantic_generation(
         database, semantic, config=FaissBuildConfig(index_type="flat"), faiss_module=faiss
     )["generation"]
+    strict = audit_publication(database, "new-batch", semantic, generation, entity, faiss_module=faiss)
+    assert not strict["eligible"] and strict["stages"]["ner"]["complete"] is False
+    partial = audit_publication(
+        database, "new-batch", semantic, generation, entity,
+        allow_historical_entities=True, faiss_module=faiss,
+    )
+    assert partial["eligible"], partial["errors"]
+    assert partial["candidate"]["entity_scope"] == "historical_only"
+    first_publication = publish_batch(
+        database, "new-batch", semantic, generation, entity,
+        allow_historical_entities=True, faiss_module=faiss,
+    )
+    assert first_publication["published"] and first_publication["entity_scope"] == "historical_only"
+    historical_engine = SearchEngine(database, semantic)
+    try:
+        assert historical_engine.publication["entity_scope"] == "historical_only"
+        assert historical_engine.index_status()["entities"]["scope"] == "historical_only"
+        old_hits = historical_engine.search_entity_articles("Ana")["hits"]
+        assert len(old_hits) == 1
+    finally:
+        historical_engine.close()
+    index_batch_ner(database, "new-batch", model=NerModel())
+    index_batch_entities(database, "new-batch", entity)
     checked = audit_publication(database, "new-batch", semantic, generation, entity, faiss_module=faiss)
     assert checked["eligible"], checked["errors"]
     published = publish_batch(database, "new-batch", semantic, generation, entity, faiss_module=faiss)

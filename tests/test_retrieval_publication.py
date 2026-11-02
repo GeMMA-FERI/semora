@@ -61,3 +61,20 @@ def test_reader_rejects_pointer_for_another_corpus(tmp_path):
     (path.parent / "publication.json").write_text(json.dumps(pointer), encoding="utf-8")
     with pytest.raises(ValueError, match="different corpus"):
         SearchEngine(path)
+
+
+def test_reader_accepts_explicit_historical_entity_scope(tmp_path):
+    path = _corpus(tmp_path)
+    pointer = {**_pointer(), "entity_scope": "historical_only"}
+    (path.parent / "publication.json").write_text(json.dumps(pointer), encoding="utf-8")
+    engine = SearchEngine(path)
+    try:
+        assert engine.publication["entity_scope"] == "historical_only"
+    finally:
+        engine.close()
+
+    for invalid in ("all_articles", []):
+        pointer["entity_scope"] = invalid
+        (path.parent / "publication.json").write_text(json.dumps(pointer), encoding="utf-8")
+        with pytest.raises(ValueError, match="invalid format"):
+            SearchEngine(path)

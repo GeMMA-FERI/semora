@@ -48,9 +48,10 @@ def read_publication(connection: sqlite3.Connection, database_path: Path) -> dic
     if epoch is None or not pointer.is_file() or pointer.stat().st_size > 1024 * 1024:
         raise ValueError("Serving publication requires a migrated corpus and bounded pointer file.")
     value = json.loads(pointer.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
-    if not isinstance(value, dict) or set(value) != {
-        "format", "publication_id", "corpus_id", "epoch", "semantic", "entities"
-    } or value["format"] != FORMAT or not _hex(value["publication_id"], 32) or not _hex(value["corpus_id"], 32):
+    required = {"format", "publication_id", "corpus_id", "epoch", "semantic", "entities"}
+    if not isinstance(value, dict) or set(value) not in (required, required | {"entity_scope"}) or (
+        value.get("entity_scope", "complete") not in ("complete", "historical_only")
+    ) or value["format"] != FORMAT or not _hex(value["publication_id"], 32) or not _hex(value["corpus_id"], 32):
         raise ValueError("Serving publication has an invalid format or identity.")
     if type(value["epoch"]) is not int or value["epoch"] != epoch:
         raise ValueError("Serving publication is stale for the corpus epoch.")

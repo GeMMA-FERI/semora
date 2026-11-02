@@ -168,7 +168,7 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--batch", required=True)
             command.add_argument("--batch-articles", type=int, default=1000)
 
-    publication = operations.add_parser("publication", help="Audit a complete private serving revision.")
+    publication = operations.add_parser("publication", help="Audit a private serving revision.")
     _add_io(publication)
     publication.add_argument("--batch", required=True, help="Registered ingested batch ID to certify.")
     publication.add_argument("--semantic-dir", help="Semantic artifact root; default: <database parent>/semantic.")
@@ -177,6 +177,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     )
     publication.add_argument("--entity-dir", help="Entity dictionary root; default: <database parent>/entities.")
     publication.add_argument("--run-id", default="classla-sl", help="NER run associated with the dictionary.")
+    publication.add_argument(
+        "--allow-historical-entities", action="store_true",
+        help="Publish new lexical/semantic coverage while entity search keeps its adopted historical scope.",
+    )
     publication.add_argument("--spellfix-path", help="Trusted local spellfix DLL/SO; default: <root>/extensions.")
     publication.add_argument(
         "--publish", action="store_true", help="Repeat the audit and atomically select this revision."
@@ -517,6 +521,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             args.semantic_generation,
             Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities",
             run_id=args.run_id,
+            allow_historical_entities=args.allow_historical_entities,
             spellfix_path=Path(args.spellfix_path).resolve() if args.spellfix_path else None,
             progress=_progress,
         )
