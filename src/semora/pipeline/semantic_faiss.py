@@ -206,6 +206,50 @@ def _new_index(faiss, root, store, shards, config):
     return index
 
 
+def _legacy_prefix_index(faiss, root, store, shards, config):
+    """Reuse the previously served index only when it matches an adopted shard prefix."""
+    manifest_path = root / "manifest.json"
+    index_path = root / "index.faiss"
+    if not manifest_path.is_file() or not index_path.is_file():
+        return None
+    try:
+        manifest = json.loads(_child(root, "manifest.json").read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None  # Unrelated legacy files do not prevent a fresh private build.
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("chunking"), dict) or not isinstance(
+        manifest.get("faiss"), dict
+    ):
+        return None
+    expected_chunking = {"method": "token", **manifest.get("chunking", {})}
+    expected_chunking.setdefault("tokenizer_revision", None)
+    recorded = dict(manifest.get("faiss", {}))
+    requested = config.as_dict()
+    recorded.pop("nprobe", None)
+    requested.pop("nprobe", None)
+    count = manifest.get("chunks")
+    if (
+        manifest.get("format") != "semora.semantic.v2"
+        or manifest.get("vectors_complete") is not True
+        or manifest.get("index_complete") is not True
+        or manifest.get("normalized") is not True
+        or manifest.get("metric") != "cosine_via_inner_product"
+        or manifest.get("model_id") != store["model_id"]
+        or manifest.get("model_revision") != store["model_revision"]
+        or manifest.get("dimensions") != store["dimensions"]
+        or expected_chunking != store["chunking"]
+        or recorded != requested
+        or type(count) is not int
+        or count <= 0
+        or count >= sum(shard.vector_count for shard in shards)
+    ):
+        return None
+    prefix = _prefix(shards, count)
+    index = faiss.read_index(str(_child(root, "index.faiss")))
+    validate_faiss_ids(faiss, index, count, store["dimensions"])
+    _validate_index_kind(faiss, index, config)
+    return index, len(prefix)
+
+
 def _checkpoint(faiss, index, build: Path, fingerprint: str, shard_count: int) -> None:
     name = f"checkpoint-{int(index.ntotal)}-{uuid.uuid4().hex}.faiss"
     target = _child(build, name)
@@ -390,7 +434,11 @@ def build_semantic_generation(
                 index, manifest = _load_generation(faiss, previous, store, shards, active, corpus_id)
                 start = len(_prefix(shards, manifest["chunks"]))
             else:
-                index = _new_index(faiss, root, store, shards, active)
+                legacy = _legacy_prefix_index(faiss, root, store, shards, active)
+                if legacy is None:
+                    index = _new_index(faiss, root, store, shards, active)
+                else:
+                    index, start = legacy
         initial = int(index.ntotal)
         if progress:
             progress({"event": "faiss_generation_start", "indexed_vectors": initial, "total": vectors})

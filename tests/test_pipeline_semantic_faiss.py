@@ -96,6 +96,56 @@ def ids(index) -> list[int]:
     return sorted(faiss.vector_to_array(index.id_map).tolist())
 
 
+def legacy_prefix(directory: Path, count: int, *, forged_id: bool = False) -> bytes:
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        store = json.loads(connection.execute("SELECT config_json FROM pipeline_semantic_store").fetchone()[0])
+    index = faiss.IndexIDMap2(faiss.IndexFlatIP(store["dimensions"]))
+    identifiers = np.arange(count, dtype="int64")
+    if forged_id:
+        identifiers[-1] = count + 5
+    index.add_with_ids(np.ones((count, store["dimensions"]), dtype="float32"), identifiers)
+    target = directory / "index.faiss"
+    faiss.write_index(index, str(target))
+    chunking = dict(store["chunking"])
+    chunking.pop("method")
+    chunking.pop("tokenizer_revision")
+    manifest = {
+        "format": "semora.semantic.v2", "model_id": store["model_id"],
+        "model_revision": store["model_revision"], "dimensions": store["dimensions"],
+        "chunking": chunking, "chunks": count, "vectors_complete": True,
+        "index_complete": True, "normalized": True, "metric": "cosine_via_inner_product",
+        "faiss": FaissBuildConfig(index_type="flat").as_dict(),
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return target.read_bytes()
+
+
+def test_legacy_serving_index_is_verified_and_extended_without_retraining(tmp_path: Path, monkeypatch) -> None:
+    database, directory = vectors(tmp_path)
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        old_count = connection.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0]
+    original = legacy_prefix(directory, old_count)
+    vectors(tmp_path, "batch-b", ("Straza/b.md",))
+    monkeypatch.setattr(semantic_faiss, "_new_index", lambda *_args: pytest.fail("Reuse legacy prefix"))
+
+    result = build(database, directory)
+
+    assert result["added_vectors"] == result["chunks"] - old_count
+    assert ids(read_index(result)) == list(range(result["chunks"]))
+    assert (directory / "index.faiss").read_bytes() == original
+
+
+def test_legacy_prefix_with_forged_ids_is_rejected(tmp_path: Path) -> None:
+    database, directory = vectors(tmp_path)
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        old_count = connection.execute("SELECT COUNT(*) FROM semantic_chunks").fetchone()[0]
+    legacy_prefix(directory, old_count, forged_id=True)
+    vectors(tmp_path, "batch-b", ("Straza/b.md",))
+
+    with pytest.raises(ValueError, match="duplicate or unknown"):
+        build(database, directory)
+
+
 def test_two_batches_reuse_private_generation_without_reembedding_or_retraining(tmp_path: Path, monkeypatch) -> None:
     model = Model()
     database, directory = vectors(tmp_path, model=model)
