@@ -16,7 +16,6 @@ from typing import Any
 from semora.pipeline.semantic import (
     read_store_config,
     store_corpus_identity,
-    validate_corpus_membership,
 )
 from semora.retrieval.semantic_faiss import (
     FaissBuildConfig,
@@ -303,7 +302,6 @@ def build_semantic_generation(
             ).fetchone()
             if identity is None or identity[0] != store_corpus_identity(connection):
                 raise ValueError("Semantic vectors belong to a different logical corpus.")
-            validate_corpus_membership(connection)
             shards = _shards(connection, root, store)
             corpus_id = identity[0]
         active = config or FaissBuildConfig()
