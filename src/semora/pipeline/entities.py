@@ -23,6 +23,15 @@ from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage.connection import open_connection
 
+# Keep the ordered article range as the outer scan to avoid sorting the batch
+# for each page; membership and NER state remain indexed lookups.
+_ARTICLE_PAGE = (
+    "SELECT a.article_id,a.content,s.content_sha256,s.entity_count FROM articles a "
+    "CROSS JOIN pipeline_batch_issues b USING(newspaper_id) "
+    "LEFT JOIN article_ner_state s ON s.article_id=a.article_id AND s.ner_run_id=? "
+    "WHERE b.batch_id=? AND a.is_valid=1 AND TRIM(a.content)<>'' AND a.article_id>? "
+    "ORDER BY a.article_id LIMIT ?"
+)
 
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -248,11 +257,7 @@ def index_batch_entities(
                 while True:
                     corpus.execute("BEGIN IMMEDIATE")
                     rows = corpus.execute(
-                        "SELECT a.article_id,a.content,s.content_sha256,s.entity_count FROM articles a "
-                        "JOIN pipeline_batch_issues b USING(newspaper_id) "
-                        "LEFT JOIN article_ner_state s ON s.article_id=a.article_id AND s.ner_run_id=? "
-                        "WHERE b.batch_id=? AND a.is_valid=1 AND TRIM(a.content)<>'' AND a.article_id>? "
-                        "ORDER BY a.article_id LIMIT ?",
+                        _ARTICLE_PAGE,
                         (run_id, batch_id, cursor, batch_articles),
                     ).fetchall()
                     if not rows:

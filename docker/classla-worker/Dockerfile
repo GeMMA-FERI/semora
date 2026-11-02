@@ -1,0 +1,48 @@
+FROM python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d AS builder
+
+WORKDIR /build
+
+# The archive URL names the immutable commit; Docker verifies its known SHA-256.
+ADD --checksum=sha256:129e04bf6e0042e20c52ab543c23c69327d80e55fce38ef1491c0a77356bd5d8 \
+    https://codeload.github.com/mitkonikov/classla/tar.gz/61d2981e36c35585ba4e828b9fda373fe6606599 \
+    /tmp/classla.tar.gz
+RUN mkdir /build/classla && \
+    tar -xzf /tmp/classla.tar.gz --strip-components=1 -C /build/classla && \
+    rm /tmp/classla.tar.gz
+
+COPY pyproject.toml README.md MANIFEST.in ./semora/
+COPY src/ ./semora/src/
+COPY docker/classla-worker/requirements.lock ./requirements.lock
+
+RUN python -m pip install --no-cache-dir \
+      hatchling==1.27.0 packaging==25.0 pathspec==0.12.1 pluggy==1.6.0 \
+      setuptools==80.9.0 trove-classifiers==2025.5.9.12 wheel==0.45.1 && \
+    python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheels ./semora && \
+    python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheels ./classla
+
+FROM python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+WORKDIR /app
+RUN test "$(uname -m)" = x86_64
+
+COPY docker/classla-worker/requirements.lock /tmp/requirements.lock
+RUN python -m pip install --no-cache-dir --require-hashes \
+      --index-url https://pypi.org/simple \
+      --extra-index-url https://download.pytorch.org/whl/cpu \
+      -r /tmp/requirements.lock && \
+    groupadd --system --gid 10001 worker && \
+    useradd --system --uid 10001 --gid worker --home-dir /app --shell /usr/sbin/nologin worker && \
+    mkdir -p /models && chmod 0555 /models
+COPY --from=builder /wheels /wheels
+COPY --from=builder /build/classla/LICENSE /usr/share/licenses/classla/LICENSE
+RUN python -m pip install --no-cache-dir --no-deps /wheels/*.whl && \
+    python -m pip check && rm -rf /wheels /tmp/requirements.lock
+
+VOLUME ["/models"]
+EXPOSE 8000
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=3s --start-period=120s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2).read()"]
+ENTRYPOINT ["python", "-m", "semora.execution.worker", "--host", "0.0.0.0", "--resources", "/models", "--token-file", "/run/secrets/worker-token"]

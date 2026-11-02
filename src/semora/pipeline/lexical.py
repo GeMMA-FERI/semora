@@ -15,25 +15,15 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
+from semora.execution import ExecutionConfig
 from semora.pipeline.publication_state import invalidate_publication
 from semora.retrieval.semantic_lock import SemanticBuildLock
 from semora.storage import Database
 from semora.storage.connection import open_connection
+from semora.text.diagnostics import TokenAlignmentWarnings as _TokenAlignmentCounter
 from semora.text.lemmatization import ClasslaLemmatizer, Lemmatizer
 
 _WORKER_LEMMATIZER: ClasslaLemmatizer | None = None
-
-
-class _TokenAlignmentCounter:
-    def __init__(self) -> None:
-        self.count = 0
-
-    def write(self, message: str) -> int:
-        self.count += message.count("Warning: Cannot compute token index.")
-        return len(message)
-
-    def flush(self) -> None:
-        pass
 
 
 def _initialize_lemma_worker(config: dict) -> None:
@@ -449,10 +439,15 @@ def index_batch_lexical(
     profile: bool = False,
     trust_completed_state: bool = False,
     progress: Callable[[dict], None] | None = None,
+    execution: ExecutionConfig | None = None,
 ) -> dict:
     """Index only pending eligible articles in an ingested batch during maintenance."""
     if stage not in {"surface", "lemma"} or batch_size <= 0:
         raise ValueError("Select surface/lemma and a positive batch size.")
+    selected_execution = execution or ExecutionConfig()
+    if stage == "surface" and selected_execution.backend != "local":
+        raise ValueError("Execution backends apply to lemma indexing, not surface indexing.")
+    selected_execution.validate_for("lemma", injected=lemmatizer is not None, local_workers=classla_workers)
     if classla_workers <= 0 or worker_batch_articles <= 0:
         raise ValueError("CLASSLA worker counts and batch size must be positive.")
     if classla_workers > 1 and lemmatizer is not None:

@@ -1,0 +1,13 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# CPU-only CLASSLA worker runtime. Semora and CLASSLA are built as wheels separately.
+torch==2.13.0+cpu
+numpy==2.2.6
+fastapi==0.141.1
+uvicorn==0.52.4
+obeliks==1.1.7
+reldi-tokeniser==1.0.3
+protobuf==5.29.6
+requests==2.33.0
+tqdm==4.67.1

@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from semora.corpus.spans import mask_html_tables
+from semora.execution import ExecutionConfig
+from semora.execution.contracts import semantic_fingerprint
 from semora.ner.adapters import load_adapter
 from semora.ner.staging import iter_predictions
 from semora.ner.storage import save_batch
@@ -68,6 +70,17 @@ def model_identity(metadata: dict) -> dict:
         if not isinstance(metadata["ner_config"], dict):
             raise ValueError("NER processor configuration must be an object.")
         identity["ner_config"] = _without_runtime(metadata["ner_config"])
+    if "worker_identity" in metadata or "worker_fingerprint" in metadata:
+        worker_identity = metadata.get("worker_identity")
+        if not isinstance(worker_identity, dict):
+            raise ValueError("Remote NER identity must be an object.")
+        fingerprint = semantic_fingerprint(worker_identity)
+        if (
+            worker_identity.get("format") != "semora.classla-ner.identity.v1"
+            or metadata.get("worker_fingerprint") != fingerprint or metadata["adapter"] != "classla"
+        ):
+            raise ValueError("Remote NER identity or fingerprint is invalid.")
+        identity.update(worker_identity=worker_identity, worker_fingerprint=fingerprint)
     try:
         return json.loads(_json(identity))
     except (ValueError, TypeError) as exc:
@@ -139,7 +152,11 @@ _MEMBERSHIP = (
     "LEFT JOIN article_ner_state s ON s.article_id=a.article_id AND s.ner_run_id=? "
     "WHERE b.batch_id=? AND a.is_valid=1 AND TRIM(a.content)<>''"
 )
-_ROWS = "SELECT a.article_id,a.content,s.content_sha256,s.entity_count " + _MEMBERSHIP
+# Keep article_id as the driving range scan: reordering this join by batch
+# membership forces SQLite to sort the entire batch for every small page.
+_ROWS = "SELECT a.article_id,a.content,s.content_sha256,s.entity_count " + _MEMBERSHIP.replace(
+    "JOIN pipeline_batch_issues", "CROSS JOIN pipeline_batch_issues",
+)
 
 
 def _coverage(connection: sqlite3.Connection, batch_id: str, run_id: str) -> tuple[int, int]:
@@ -169,8 +186,10 @@ def _register(connection: sqlite3.Connection, run_id: str, metadata: dict, ident
     previous, recorded = _recorded_identity(connection, run_id)
     if previous is not None:
         if recorded != identity:
-            raise ValueError("NER model identity changed; use a different run ID for incompatible models.")
-        if previous.get("format") != NER_FORMAT and not connection.execute(
+            from semora.pipeline.ner_compatibility import compatible
+            if not compatible(connection, run_id, recorded, identity, metadata):
+                raise ValueError("NER model identity changed; use a different run ID for incompatible models.")
+        if recorded == identity and previous.get("format") != NER_FORMAT and not connection.execute(
             "SELECT 1 FROM article_ner_state WHERE ner_run_id=? LIMIT 1", (run_id,),
         ).fetchone() and not connection.execute(
             "SELECT 1 FROM article_entities WHERE ner_run_id=? LIMIT 1", (run_id,),
@@ -194,12 +213,17 @@ def index_batch_ner(
     device: str = "cpu", batch_articles: int = 32, batch_size: int = 16, pipeline_depth: int = 1,
     tokenizer_workers: int = 0, ner_pipeline_depth: int = 1, ner_decoder: str = "numpy",
     resources: str | Path | None = None, model: Any = None, progress: Callable[[dict], None] | None = None,
+    execution: ExecutionConfig | None = None,
 ) -> dict:
     """Extract only pending articles in one frozen batch, with atomic article outputs.
 
     Retrieval readers and older writers must be stopped by the caller. Injected
     adapters remain caller-owned; adapters loaded here are closed on every exit.
     """
+    execution = execution or ExecutionConfig()
+    execution.validate_for("ner", injected=model is not None)
+    if execution.backend == "remote" and adapter != "classla":
+        raise ValueError("Remote NER currently supports only the CLASSLA adapter.")
     identifiers = (batch_id, run_id, adapter, device, ner_decoder)
     if any(not isinstance(value, str) or not value.strip() for value in identifiers):
         raise ValueError("NER batch, run, adapter, device and decoder must be nonempty strings.")
@@ -223,8 +247,9 @@ def index_batch_ner(
             elif recorded is not None and adapter in {"classla", "transformers"} and recorded["adapter"] != adapter:
                 raise ValueError("NER adapter changed; use the matching adapter or a different run ID.")
             eligible, initial = _coverage(connection, batch_id, run_id)
-            if eligible > initial:
-                invalidate_publication(path)
+            if progress is not None:
+                progress({"event": "ner_start", "batch_id": batch_id, "ner_run_id": run_id,
+                          "completed_articles": initial, "total": eligible})
             added = mentions = 0
             cursor = ""
             upper = connection.execute(
@@ -250,15 +275,35 @@ def index_batch_ner(
 
             try:
                 if eligible > initial:
-                    if model is None:
+                    if execution.backend == "remote":
+                        from semora.execution.client import RemoteNERPool
+
+                        model = RemoteNERPool(execution)
+                        model.metadata["execution"].update(
+                            batch_articles=batch_articles, connect_timeout=execution.connect_timeout,
+                            read_timeout=execution.read_timeout, max_attempts=execution.max_attempts,
+                            retry_delay=execution.retry_delay,
+                        )
+                    elif model is None:
                         owned_model = load_adapter(
                             adapter, device=device, resources=resources, tokenizer_workers=tokenizer_workers,
                             ner_pipeline_depth=ner_pipeline_depth, ner_decoder=ner_decoder, sentence_order="input",
                         )
                         model = owned_model
                     identity = model_identity(model.metadata)
+                    if recorded is not None and identity != recorded:
+                        from semora.pipeline.ner_compatibility import compatible
+                        if not compatible(connection, run_id, recorded, identity, model.metadata):
+                            raise ValueError(
+                                "NER model identity changed; use a different run ID for incompatible models."
+                            )
+                    invalidate_publication(path)
                     _register(connection, run_id, model.metadata, identity)
-                    with closing(iter_predictions(model, read_batch, batch_size, pipeline_depth)) as batches:
+                    predictions = (
+                        model.iter_predictions(read_batch) if execution.backend == "remote"
+                        else iter_predictions(model, read_batch, batch_size, pipeline_depth)
+                    )
+                    with closing(predictions) as batches:
                         for batch in batches:
                             if policy == EXCLUDE_HTML_TABLES:
                                 for row, entities in zip(batch.rows, batch.prediction.entities, strict=True):
@@ -271,12 +316,15 @@ def index_batch_ner(
                             # save_batch rechecks current content/validity inside
                             # its write transaction, then commits mentions and
                             # completion together, including zero-entity articles.
-                            save_batch(connection, run_id, batch)
-                            added += len(batch.rows)
-                            mentions += sum(len(entities) for entities in batch.prediction.entities)
+                            saved_articles, saved_mentions = save_batch(
+                                connection, run_id, batch, batch_id=batch_id, table_policy=policy
+                            )
+                            added += saved_articles
+                            mentions += saved_mentions
                             if progress is not None:
                                 progress({"event": "ner_checkpoint", "batch_id": batch_id, "ner_run_id": run_id,
-                                          "completed_articles": initial + added, "total": eligible})
+                                          "completed_articles": initial + added, "total": eligible,
+                                          **({"remote": model.diagnostics} if execution.backend == "remote" else {})})
                 current_eligible, completed = _coverage(connection, batch_id, run_id)
                 if current_eligible != eligible or completed != eligible:
                     raise ValueError("Batch NER membership changed or has pending articles; audit/retry the batch.")
@@ -285,6 +333,7 @@ def index_batch_ner(
                     "completed_articles": completed, "added_articles": added, "skipped_articles": initial,
                     "added_entities": mentions, "pending_articles": eligible - completed, "complete": True,
                     "exhausted_snapshot": True, "retrieval_ready": False, "publication_ready": False,
+                    **({"remote": model.diagnostics} if execution.backend == "remote" and model is not None else {}),
                 }
             finally:
                 if owned_model is not None and hasattr(owned_model, "close"):

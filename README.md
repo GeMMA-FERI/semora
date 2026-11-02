@@ -111,6 +111,8 @@ examples.
 | Choose dependencies and set up models                         | [Installation](docs/installation.md)                |
 | Build indexes, filter results, or connect an agent over stdio | [Corpus indexing and search](docs/corpus-search.md) |
 | Add batches to an existing archive                            | [Additive indexing](docs/additive-indexing.md)      |
+| Optional local/remote CLASSLA NER execution                   | [Execution backends](docs/execution-backends.md)    |
+| Run the optional CLASSLA NER API worker                       | [CLASSLA worker](docs/classla-worker.md)            |
 | Extract named entities                                        | [NER indexing](docs/ner-indexing.md)                |
 | Find names and their articles                                 | [Entity search](docs/entity-search.md)              |
 | Compare entity extraction models                              | [NER benchmarks](docs/ner-benchmark.md)             |

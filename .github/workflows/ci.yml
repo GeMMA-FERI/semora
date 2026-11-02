@@ -93,3 +93,30 @@ jobs:
           name: test-results-python-${{ matrix.python-version }}
           path: test-results.xml
           if-no-files-found: ignore
+
+  worker-api:
+    name: Optional worker API without model dependencies
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: distributions
+          path: dist
+      - name: Install API test dependencies and built wheel
+        run: python -m pip install 'pytest>=8.0' fastapi==0.141.1 httpx==0.28.1 dist/*.whl
+      - name: Verify optional model dependencies are absent
+        run: python -c "import importlib.util; assert all(importlib.util.find_spec(name) is None for name in ('classla', 'torch', 'faiss'))"
+      - name: Test execution contracts, identity and API
+        run: >-
+          python -m pytest -o pythonpath= --import-mode=importlib
+          tests/test_execution_config.py tests/test_execution_contracts.py
+          tests/test_execution_identity.py tests/test_execution_worker.py
+          tests/test_execution_client.py tests/test_pipeline_remote_ner.py tests/test_ner_storage_retries.py

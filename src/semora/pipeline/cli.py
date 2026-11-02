@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from semora.corpus import DEFAULT_MODEL_ID, DEFAULT_TOKEN_COUNT, DEFAULT_TOKEN_OVERLAP
+from semora.execution import ExecutionConfig
 from semora.pipeline.reports import report_path, write_report
 
 
@@ -55,6 +56,7 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
     _add_maintenance(lexical)
     lexical.add_argument("--batch", required=True)
     lexical.add_argument("--stage", required=True, choices=("surface", "lemma"))
+    _add_execution(lexical)
     lexical.add_argument(
         "--progress-file", help="Replace this JSON snapshot after each committed lexical checkpoint."
     )
@@ -132,7 +134,7 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
 
     ner = operations.add_parser("ner", help="Audit/adopt historical NER and extend a selected batch.")
     ner_operations = ner.add_subparsers(dest="ner_command", required=True)
-    for name in ("audit", "adopt", "index"):
+    for name in ("audit", "adopt", "index", "qualify"):
         command = ner_operations.add_parser(name)
         _add_io(command)
         command.add_argument("--run-id", default="classla-sl")
@@ -140,8 +142,17 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             _add_maintenance(command)
         if name == "adopt":
             _add_audit_report(command)
+        if name == "qualify":
+            _add_execution(command)
+            command.add_argument(
+                "--reference", required=True, help="Reference adapter metadata and full identity JSON."
+            )
+            command.add_argument("--comparison", required=True, help="Operator-supplied comparison evidence JSON.")
+            command.add_argument("--evidence", required=True, help="Comparison artifact matching its SHA-256 digest.")
         if name == "index":
             command.add_argument("--batch", required=True)
+            _add_execution(command)
+            command.add_argument("--progress-file", help="Atomic Pebble progress JSON path.")
             command.add_argument("--adapter", default="classla")
             command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
             command.add_argument("--batch-articles", type=int, default=32)
@@ -186,6 +197,32 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         "--publish", action="store_true", help="Repeat the audit and atomically select this revision."
     )
     _add_maintenance(publication)
+
+
+def _add_execution(command: argparse.ArgumentParser) -> None:
+    command.add_argument(
+        "--backend", choices=("local", "remote"), default="local",
+        help="Execution backend (default: local). Remote supports additive CLASSLA NER.",
+    )
+    command.add_argument(
+        "--worker-url", action="append", default=[],
+        help="Worker HTTP(S) origin; repeat for a pool. Requires --backend remote.",
+    )
+    command.add_argument("--worker-token-file", type=Path, help="Private bearer-token file shared by the worker pool.")
+    command.add_argument("--worker-connect-timeout", type=float, default=5.0)
+    command.add_argument("--worker-read-timeout", type=float, default=300.0)
+    command.add_argument(
+        "--worker-attempts", type=int, default=3,
+        help="Total attempts per request, including retries (1–10).",
+    )
+
+
+def _execution(args: argparse.Namespace) -> ExecutionConfig:
+    return ExecutionConfig(
+        backend=args.backend, worker_urls=tuple(args.worker_url), token_file=args.worker_token_file,
+        connect_timeout=args.worker_connect_timeout, read_timeout=args.worker_read_timeout,
+        max_attempts=args.worker_attempts,
+    )
 
 
 def _add_io(command: argparse.ArgumentParser) -> None:
@@ -266,6 +303,8 @@ def run_pipeline_command(args: argparse.Namespace, default_database: Path) -> No
         protected.append(Path(args.manifest))
     if getattr(args, "audit_report", None):
         protected.append(Path(args.audit_report))
+    if getattr(args, "worker_token_file", None):
+        protected.append(args.worker_token_file)
     if args.pipeline_command == "semantic":
         semantic_dir = Path(args.semantic_dir).resolve() if args.semantic_dir else database.parent / "semantic"
         protected.extend(
@@ -451,24 +490,62 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             report = adopt_ner_baseline(
                 database, run_id=args.run_id, progress=_progress, audit_report=_read_audit_report(args)
             )
+        elif args.ner_command == "qualify":
+            from semora.pipeline.ner_compatibility import qualify_ner_continuation
+
+            with Path(args.reference).open(encoding="utf-8") as stream:
+                reference = json.load(stream)
+            with Path(args.comparison).open(encoding="utf-8") as stream:
+                comparison = json.load(stream)
+            report = qualify_ner_continuation(database, run_id=args.run_id, execution=_execution(args),
+                                              reference=reference, comparison=comparison,
+                                              evidence_path=args.evidence)
         else:
             from semora.pipeline.ner import index_batch_ner
 
-            report = index_batch_ner(
-                database,
-                args.batch,
-                run_id=args.run_id,
-                adapter=args.adapter,
-                device=args.device,
-                batch_articles=args.batch_articles,
-                batch_size=args.batch_size,
-                pipeline_depth=args.pipeline_depth,
-                tokenizer_workers=args.tokenizer_workers,
-                ner_pipeline_depth=args.ner_pipeline_depth,
-                ner_decoder=args.ner_decoder,
-                resources=args.resources,
-                progress=_progress,
+            progress_file = Path(args.progress_file).resolve() if args.progress_file else None
+            snapshot = {
+                "format": "pebble.progress.v1", "title": "Newspaper NER",
+                "state": "running", "completed": 0, "total": 0,
+                "unit": "articles", "message": "",
+            }
+            snapshot_progress = _snapshot_progress(
+                progress_file, snapshot, ("ner_start", "ner_checkpoint"), "completed_articles"
             )
+            started = False
+
+            def ner_progress(event: dict) -> None:
+                nonlocal started
+                started = True
+                snapshot_progress(event)
+
+            try:
+                report = index_batch_ner(
+                    database,
+                    args.batch,
+                    run_id=args.run_id,
+                    adapter=args.adapter,
+                    device=args.device,
+                    batch_articles=args.batch_articles,
+                    batch_size=args.batch_size,
+                    pipeline_depth=args.pipeline_depth,
+                    tokenizer_workers=args.tokenizer_workers,
+                    ner_pipeline_depth=args.ner_pipeline_depth,
+                    ner_decoder=args.ner_decoder,
+                    resources=args.resources,
+                    progress=ner_progress,
+                    execution=_execution(args),
+                )
+            except BaseException:
+                if progress_file is not None and started:
+                    snapshot["state"] = "failed"
+                    _write_progress_file(progress_file, snapshot)
+                raise
+            if progress_file is not None:
+                snapshot["completed"] = report["completed_articles"]
+                snapshot["total"] = report["eligible_articles"]
+                snapshot["state"] = "completed" if report["complete"] else "paused"
+                _write_progress_file(progress_file, snapshot)
     elif operation == "entities":
         entity_dir = Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities"
         spellfix = Path(args.spellfix_path).resolve() if args.spellfix_path else None
@@ -555,6 +632,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             profile=args.profile,
             trust_completed_state=args.trust_completed_state,
             model_fingerprint=args.lemma_model_fingerprint,
+            execution=_execution(args),
             progress=_snapshot_progress(
                 progress_file, snapshot, ("lexical_start", "lexical_checkpoint"), "completed_articles"
             ),

@@ -32,6 +32,11 @@ dependencies = [
 classla = [
     "classla",
 ]
+classla-worker = [
+    "classla",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 ner = [
     "torch>=2.2",
     "transformers>=5.17",
@@ -93,6 +98,7 @@ semora = "semora.cli.main:main"
 semora-project-embeddings = "semora.projection.projector:main"
 semora-query = "semora.retrieval.search:main"
 semora-serve = "semora.retrieval.server:main"
+semora-classla-worker = "semora.execution.worker:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

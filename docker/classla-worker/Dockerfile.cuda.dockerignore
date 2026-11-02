@@ -1,0 +1,14 @@
+**
+!src/
+!src/**
+!pyproject.toml
+!README.md
+!MANIFEST.in
+!docker/
+!docker/classla-worker/
+!docker/classla-worker/requirements-cuda.lock
+!docker/classla-worker/requirements-cuda.in
+!docker/classla-worker/Dockerfile.cuda
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info

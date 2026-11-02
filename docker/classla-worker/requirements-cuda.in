@@ -1,0 +1,13 @@
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Match the qualified 2.6 CPU image; CUDA-specific dependencies differ.
+torch==2.6.0+cu124
+numpy==2.2.6
+fastapi==0.141.1
+uvicorn==0.52.4
+obeliks==1.1.7
+reldi-tokeniser==1.0.3
+protobuf==4.21.2
+requests==2.32.4
+tqdm==4.67.1
