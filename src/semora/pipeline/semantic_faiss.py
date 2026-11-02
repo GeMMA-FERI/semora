@@ -394,6 +394,8 @@ def build_semantic_generation(
             else:
                 index = _new_index(faiss, root, store, shards, active)
         initial = int(index.ntotal)
+        if progress:
+            progress({"event": "faiss_generation_start", "indexed_vectors": initial, "total": vectors})
         for number, shard in enumerate(shards[start:], start + 1):
             import numpy as np
 
@@ -403,8 +405,11 @@ def build_semantic_generation(
             )
             if number % checkpoint_shards == 0 or number == len(shards):
                 _checkpoint(faiss, index, build, fingerprint, number)
-            if progress:
-                progress({"event": "faiss_generation_progress", "indexed_vectors": int(index.ntotal), "total": vectors})
+                if progress:
+                    progress({
+                        "event": "faiss_generation_checkpoint", "indexed_vectors": int(index.ntotal),
+                        "total": vectors,
+                    })
         if hasattr(index, "nprobe"):
             index.nprobe = active.nprobe
         validate_faiss_ids(faiss, index, vectors, store["dimensions"])

@@ -119,6 +119,9 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--shard-size", type=int, default=10_000)
             command.add_argument("--device", help="SentenceTransformer device, such as cpu or cuda.")
         elif name == "faiss":
+            command.add_argument(
+                "--progress-file", help="Replace this JSON snapshot after each committed FAISS checkpoint."
+            )
             command.add_argument("--index-type", choices=("flat", "ivfpq"), default="ivfpq")
             command.add_argument("--nlist", type=int, default=16_384)
             command.add_argument("--pq-m", type=int, default=32)
@@ -403,6 +406,12 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             from semora.pipeline.semantic_faiss import build_semantic_generation
             from semora.retrieval.semantic_faiss import FaissBuildConfig
 
+            progress_file = Path(args.progress_file).resolve() if args.progress_file else None
+            snapshot = {
+                "format": "pebble.progress.v1", "title": "Newspaper FAISS indexing",
+                "state": "running", "completed": 0, "total": 0,
+                "unit": "vectors", "message": "",
+            }
             config = FaissBuildConfig(
                 index_type=args.index_type,
                 nlist=args.nlist,
@@ -416,8 +425,16 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                 semantic_dir,
                 config=config,
                 checkpoint_shards=args.checkpoint_shards,
-                progress=_progress,
+                progress=_snapshot_progress(
+                    progress_file, snapshot, ("faiss_generation_start", "faiss_generation_checkpoint"),
+                    "indexed_vectors",
+                ),
             )
+            if progress_file is not None:
+                snapshot["completed"] = report["chunks"]
+                snapshot["total"] = report["chunks"]
+                snapshot["state"] = "completed" if report["index_complete"] else "paused"
+                _write_progress_file(progress_file, snapshot)
     elif operation == "ner":
         if args.ner_command == "audit":
             from semora.pipeline.ner_baseline import audit_ner_baseline

@@ -313,6 +313,32 @@ def test_semantic_progress_file_tracks_committed_shards(tmp_path: Path, monkeypa
     }
 
 
+def test_faiss_progress_file_tracks_committed_checkpoints(tmp_path: Path, monkeypatch) -> None:
+    from semora.pipeline import semantic_faiss
+
+    progress_file = tmp_path / "tasks" / "faiss.json"
+
+    def fake_build(database, semantic_dir, *, progress, **options):
+        progress({"event": "faiss_generation_start", "indexed_vectors": 4, "total": 10})
+        assert json.loads(progress_file.read_text(encoding="utf-8"))["completed"] == 4
+        progress({"event": "faiss_generation_checkpoint", "indexed_vectors": 8, "total": 10})
+        assert json.loads(progress_file.read_text(encoding="utf-8"))["completed"] == 8
+        return {"chunks": 10, "index_complete": True}
+
+    monkeypatch.setattr(semantic_faiss, "build_semantic_generation", fake_build)
+    monkeypatch.setattr(sys, "argv", [
+        "semora", "pipeline", "semantic", "faiss",
+        "--database", str(tmp_path / "semora.sqlite"), "--maintenance",
+        "--progress-file", str(progress_file),
+    ])
+    main()
+    assert json.loads(progress_file.read_text(encoding="utf-8")) == {
+        "format": "pebble.progress.v1", "title": "Newspaper FAISS indexing",
+        "state": "completed", "completed": 10, "total": 10,
+        "unit": "vectors", "message": "",
+    }
+
+
 @pytest.mark.parametrize("output_kind", ["existing", "database"])
 def test_cli_invalid_output_prevents_run_mutation(tmp_path: Path, monkeypatch, output_kind: str) -> None:
     manifest, source = prepare_manifest(tmp_path)
