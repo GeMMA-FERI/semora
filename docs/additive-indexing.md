@@ -106,6 +106,9 @@ remains available for previously indexed articles; the pointer and reader
 status mark its scope as `historical_only`. Later NER and entity indexing
 invalidates this pointer and requires a new publication. The partial gate still
 checks complete ingestion, both lexical paths and the full semantic generation.
+It trusts committed lexical completion and the adopted historical vector mapping
+instead of rehashing their inputs on each publication attempt. The FAISS
+generation and its current vector-shard ledger are still verified.
 `--publish` returns
 `published=true`, `publication_id` and `restart_readers=true` on success; an
 idempotent retry preserves the same publication ID. It does not restart NORA.

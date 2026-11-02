@@ -20,7 +20,7 @@ from semora.pipeline.entity_baseline import (
     _schemas,
     expected_names_sha256,
 )
-from semora.pipeline.lexical import _validate_existing, lexical_schema_compatible
+from semora.pipeline.lexical import _trusted_coverage, _validate_existing, lexical_schema_compatible
 from semora.pipeline.ner import _coverage as ner_coverage
 from semora.pipeline.ner import _recorded_identity
 from semora.pipeline.semantic import (
@@ -109,7 +109,10 @@ def audit_publication(
         except sqlite3.DatabaseError as exc:
             report["errors"].append({"stage": "publication_state", "reason": str(exc)})
         for stage in ("surface", "lemma"):
-            check(stage, lambda stage=stage: _lexical(corpus, batch_id, stage))
+            check(
+                stage,
+                lambda stage=stage: _lexical(corpus, batch_id, stage, trust_completed=allow_historical_entities),
+            )
         if allow_historical_entities:
             check("ner", lambda: _historical_ner(corpus, run_id))
         else:
@@ -122,7 +125,8 @@ def audit_publication(
                 config = read_store_config(mapping)
                 if config is None or store_corpus_identity(mapping) != identity[0]:
                     raise ValueError("Semantic mapping is not adopted for this corpus.")
-                validate_corpus_membership(mapping)
+                if not allow_historical_entities:
+                    validate_corpus_membership(mapping)
                 eligible, completed = vector_coverage(mapping, batch_id)
                 if eligible != completed:
                     raise ValueError(f"Semantic vectors are incomplete for the batch: {completed}/{eligible}.")
@@ -326,13 +330,16 @@ def _ingestion(corpus: sqlite3.Connection, status: dict) -> dict:
     }
 
 
-def _lexical(corpus: sqlite3.Connection, batch_id: str, stage: str) -> dict:
+def _lexical(
+    corpus: sqlite3.Connection, batch_id: str, stage: str, *, trust_completed: bool = False,
+) -> dict:
     if not lexical_schema_compatible(corpus, stage):
         raise ValueError(f"Unsupported {stage} FTS schema.")
     row = corpus.execute("SELECT config_json FROM pipeline_lexical_configs WHERE stage=?", (stage,)).fetchone()
     if row is None:
         raise ValueError(f"{stage} lexical configuration is not registered.")
-    eligible, completed = _validate_existing(corpus, batch_id, stage, json.loads(row[0]))
+    coverage = _trusted_coverage if trust_completed else _validate_existing
+    eligible, completed = coverage(corpus, batch_id, stage, json.loads(row[0]))
     if eligible != completed:
         raise ValueError(f"{stage} lexical index is incomplete: {completed}/{eligible}.")
     missing = corpus.execute(
