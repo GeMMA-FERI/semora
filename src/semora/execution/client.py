@@ -183,27 +183,33 @@ class RemoteNERPool:
     def _subbatches(self, rows):
         current: list[Any] = []
         size = 0
-        # UUID length is fixed, so the measured payload is identical in size to the request.
+        # UUIDs have fixed ASCII length. Compact JSON list size is the empty
+        # request plus each encoded document and commas; encode each text once.
+        header = len(_encode(Request("0" * 36, "ner", self._fingerprint, ()).to_dict()))
+        raw_size = header
+
+        def fits(count, text_bytes, request_bytes):
+            return (
+                count <= self._limits["max_documents"]
+                and text_bytes <= self._limits["max_input_bytes"]
+                and request_bytes <= self._limits["max_request_bytes"]
+            )
+
         for row in rows:
             text = row.get("inference_content", row["content"])
             document = Document.create(str(row["article_id"]), text)
             nbytes = len(text.encode("utf-8"))
-
-            def fits(items, total):
-                request = Request("0" * 36, "ner", self._fingerprint, tuple(doc for _, doc in items))
-                return (
-                    len(items) <= self._limits["max_documents"]
-                    and total <= self._limits["max_input_bytes"]
-                    and len(_encode(request.to_dict())) <= self._limits["max_request_bytes"]
-                )
-
-            if current and not fits(current + [(row, document)], size + nbytes):
+            encoded_size = len(_encode(document.to_dict()))
+            proposed = raw_size + encoded_size + int(bool(current))
+            if current and not fits(len(current) + 1, size + nbytes, proposed):
                 yield current
-                current, size = [], 0
+                current, size, raw_size = [], 0, header
+                proposed = header + encoded_size
+            if not fits(len(current) + 1, size + nbytes, proposed):
+                raise RemoteExecutionError("A single document exceeds the worker input limits.")
             current.append((row, document))
             size += nbytes
-            if not fits(current, size):
-                raise RemoteExecutionError("A single document exceeds the worker input limits.")
+            raw_size = proposed
         if current:
             yield current
 
@@ -257,13 +263,13 @@ class RemoteNERPool:
 
     def iter_predictions(self, read_batch):
         executor = ThreadPoolExecutor(max_workers=len(self._urls), thread_name_prefix="remote-ner")
-        pending: set[Any] = set()
+        pending: dict[Any, int] = {}
         buffered: deque[Any] = deque()
         exhausted = False
-        next_endpoint = 0
+        available = deque(range(len(self._urls)))
         try:
             while pending or not exhausted or buffered:
-                while len(pending) < len(self._urls) and (buffered or not exhausted):
+                while available and (buffered or not exhausted):
                     if not buffered:
                         tick = time.monotonic()
                         rows = read_batch()
@@ -276,11 +282,14 @@ class RemoteNERPool:
                         )
                     if buffered:
                         items, elapsed = buffered.popleft()
-                        pending.add(executor.submit(self._infer, items, next_endpoint, elapsed))
-                        next_endpoint = (next_endpoint + 1) % len(self._urls)
+                        endpoint = available.popleft()
+                        pending[executor.submit(self._infer, items, endpoint, elapsed)] = endpoint
                 if pending:
-                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for future in done:
+                        # Reuse the worker that finished, rather than queueing behind
+                        # a slower endpoint while a faster model sits idle.
+                        available.append(pending.pop(future))
                         yield future.result()
         finally:
             for future in pending:

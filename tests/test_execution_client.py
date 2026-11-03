@@ -56,6 +56,8 @@ def worker(tmp_path):
             state["calls"].append(self.headers.get("Authorization"))
             request = Request.from_dict(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
             state["requests"].append(request.to_dict())
+            if state.get("before_post"):
+                state["before_post"]()
             mode = state["response_mode"]
             if isinstance(mode, int):
                 self.send_json(mode, {"secret": "do not expose"})
@@ -257,3 +259,67 @@ def test_endpoint_lock_serializes_concurrent_requests(worker, monkeypatch):
 
 
 worker_fixture = worker.__wrapped__
+
+
+def test_free_worker_continues_while_other_worker_is_busy(worker, tmp_path):
+    config, fast = worker
+    directory = tmp_path / "slow"
+    directory.mkdir()
+    fixture = worker_fixture(directory)
+    slow_config, slow = next(fixture)
+    release = threading.Event()
+    entered = threading.Event()
+    timed_out = []
+
+    def hold_slow():
+        entered.set()
+        if not release.wait(3):
+            timed_out.append(True)
+
+    def fast_request():
+        if len(fast["requests"]) >= 3:
+            assert entered.wait(3)
+            release.set()
+
+    slow["before_post"] = hold_slow
+    fast["before_post"] = fast_request
+    config = replace(config, worker_urls=config.worker_urls + slow_config.worker_urls, read_timeout=5)
+    pages = iter([[{"article_id": str(i), "content": "test"}] for i in range(7)] + [[]])
+    try:
+        results = list(RemoteNERPool(config).iter_predictions(lambda: next(pages)))
+        assert len(results) == 7
+        assert len(fast["requests"]) >= 3
+        assert not timed_out
+    finally:
+        release.set()
+        next(fixture, None)
+
+
+def test_batch_sizing_is_linear_and_exact_for_escaped_unicode(worker, monkeypatch):
+    from semora.execution import client
+    from semora.execution.contracts import Request
+
+    config, _ = worker
+    pool = RemoteNERPool(config)
+    rows = [{"article_id": str(i), "content": 'č😀\\"\n' * 100} for i in range(128)]
+    pool._limits.update(max_documents=128, max_input_bytes=1048576, max_request_bytes=2097152)
+    original = client._encode
+    encoded_total = []
+
+    def counted(value):
+        encoded = original(value)
+        encoded_total.append(len(encoded))
+        return encoded
+
+    monkeypatch.setattr(client, "_encode", counted)
+    batches = list(pool._subbatches(rows))
+    assert len(batches) == 1
+    request = Request("0" * 36, "ner", pool._fingerprint, tuple(doc for _row, doc in batches[0]))
+    exact_size = len(original(request.to_dict()))
+    assert sum(encoded_total) <= exact_size
+    pool._limits["max_request_bytes"] = exact_size - 1
+    split = list(pool._subbatches(rows))
+    assert len(split) == 2
+    for batch in split:
+        value = Request("0" * 36, "ner", pool._fingerprint, tuple(doc for _row, doc in batch))
+        assert len(original(value.to_dict())) <= exact_size - 1
