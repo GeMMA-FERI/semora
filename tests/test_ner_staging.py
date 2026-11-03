@@ -119,3 +119,30 @@ def test_metrics_replace_does_not_hide_permanent_failure(tmp_path, monkeypatch):
     monkeypatch.setattr("semora.diagnostics.ner.runner.time.sleep", lambda _: None)
     with pytest.raises(PermissionError):
         replace_metrics(tmp_path / "metrics.tmp", tmp_path / "metrics.json")
+
+
+def test_coalesced_writes_preserve_order_bounds_and_timings():
+    from semora.ner.base import Prediction
+    from semora.ner.staging import BatchResult, coalesce_batches
+    source = [BatchResult([{"article_id": i} for i in range(start, end)],
+                          Prediction([[] for _ in range(start, end)]), 1, 2)
+              for start, end in [(0, 2), (2, 7), (7, 8)]]
+    result = list(coalesce_batches(iter(source), 3))
+    assert [len(batch.rows) for batch in result] == [3, 3, 2]
+    assert [row["article_id"] for batch in result for row in batch.rows] == list(range(8))
+    assert sum(batch.read_seconds for batch in result) == 3
+    assert sum(batch.predict_seconds for batch in result) == 6
+    assert list(coalesce_batches(iter(source))) == source
+
+
+def test_coalesced_partial_batch_is_not_emitted_after_error():
+    from semora.ner.base import Prediction
+    from semora.ner.staging import BatchResult, coalesce_batches
+    def source():
+        yield BatchResult([{"article_id": 1}], Prediction([[]]), 0, 0)
+        raise RuntimeError("producer failed")
+    with pytest.raises(RuntimeError, match="producer failed"):
+        next(coalesce_batches(source(), 3))
+    malformed = BatchResult([{}], Prediction([]), 0, 0)
+    with pytest.raises(ValueError, match="differ in length"):
+        list(coalesce_batches([malformed], 3))

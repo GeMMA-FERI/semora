@@ -5,12 +5,14 @@ from __future__ import annotations
 import copy
 import http.client
 import json
+import queue
 import socket
 import threading
 import time
 import uuid
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import closing
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -262,6 +264,49 @@ class RemoteNERPool:
                 raise
 
     def iter_predictions(self, read_batch):
+        """Keep bounded dispatch running while the caller commits prior results.
+
+        The scheduler alone owns the reader callback. Results and in-flight
+        requests are independently bounded by endpoint count; a slow writer
+        applies backpressure instead of accumulating the corpus in memory.
+        """
+        results: queue.Queue[Any] = queue.Queue(maxsize=len(self._urls))
+        stopped = threading.Event()
+
+        def deliver(value):
+            while not stopped.is_set():
+                try:
+                    results.put(value, timeout=0.05)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def dispatch():
+            try:
+                with closing(self._iter_predictions(read_batch)) as predictions:
+                    for result in predictions:
+                        if not deliver((True, result)):
+                            return
+                deliver((True, None))
+            except BaseException as error:
+                deliver((False, error))
+
+        scheduler = threading.Thread(target=dispatch, name="remote-ner-dispatch")
+        scheduler.start()
+        try:
+            while True:
+                successful, value = results.get()
+                if not successful:
+                    raise value
+                if value is None:
+                    return
+                yield value
+        finally:
+            stopped.set()
+            scheduler.join()
+
+    def _iter_predictions(self, read_batch):
         executor = ThreadPoolExecutor(max_workers=len(self._urls), thread_name_prefix="remote-ner")
         pending: dict[Any, int] = {}
         buffered: deque[Any] = deque()

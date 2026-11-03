@@ -78,3 +78,36 @@ def iter_predictions(
             future.cancel()
         gpu.shutdown(wait=True, cancel_futures=True)
         cpu.shutdown(wait=True, cancel_futures=True)
+
+
+def coalesce_batches(batches, max_articles: int = 0):
+    """Group transport results into bounded writes without changing predictions.
+
+    Zero preserves transport commit boundaries. The caller retains ownership of
+    the input iterator and must close it on early exit. Partial final batches
+    are emitted only on successful exhaustion, never after a producer failure.
+    """
+    if type(max_articles) is not int or max_articles < 0:
+        raise ValueError("NER write batch size must be a nonnegative integer.")
+    if not max_articles:
+        yield from batches
+        return
+    rows, entities = [], []
+    read_seconds = predict_seconds = 0.0
+    for batch in batches:
+        if len(batch.rows) != len(batch.prediction.entities):
+            raise ValueError("NER batch rows and predictions differ in length.")
+        read_seconds += batch.read_seconds
+        predict_seconds += batch.predict_seconds
+        offset = 0
+        while offset < len(batch.rows):
+            count = min(max_articles - len(rows), len(batch.rows) - offset)
+            rows.extend(batch.rows[offset:offset + count])
+            entities.extend(batch.prediction.entities[offset:offset + count])
+            offset += count
+            if len(rows) == max_articles:
+                yield BatchResult(rows, Prediction(entities), read_seconds, predict_seconds)
+                rows, entities = [], []
+                read_seconds = predict_seconds = 0.0
+    if rows:
+        yield BatchResult(rows, Prediction(entities), read_seconds, predict_seconds)

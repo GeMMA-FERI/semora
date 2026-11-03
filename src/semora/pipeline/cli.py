@@ -166,6 +166,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--adapter", default="classla")
             command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
             command.add_argument("--batch-articles", type=int, default=32)
+            command.add_argument(
+                "--write-batch-articles", type=int, default=0,
+                help="Group up to this many article results per transaction (0 preserves request boundaries).",
+            )
             command.add_argument("--batch-size", type=int, default=16)
             command.add_argument("--pipeline-depth", type=int, default=1)
             command.add_argument("--tokenizer-workers", type=int, default=0)
@@ -223,7 +227,7 @@ def _add_execution(command: argparse.ArgumentParser) -> None:
     command.add_argument("--worker-read-timeout", type=float, default=300.0)
     command.add_argument(
         "--worker-attempts", type=int, default=3,
-        help="Total attempts per request, including retries (1–10).",
+        help="Total attempts per request, including retries (1â€“10).",
     )
 
 
@@ -555,6 +559,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                     trust_completed_state=args.trust_completed_state,
                     trusted_eligible_articles=args.trusted_eligible_articles,
                     trusted_completed_articles=args.trusted_completed_articles,
+                    write_batch_articles=args.write_batch_articles,
                     progress=ner_progress,
                     execution=_execution(args),
                 )

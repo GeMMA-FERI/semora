@@ -214,3 +214,25 @@ worker does not prevent a faster endpoint from receiving its next batch. Raw
 request sizing encodes each document once, accounts exactly for JSON commas and
 headers, and still rejects oversized inputs without truncation. Neither tuning
 changes the v1 request schema or permits per-request model settings.
+
+
+## Coordinator dispatch and write batching
+
+Remote dispatch runs independently of the caller's database writes. A single
+scheduler owns the reader callback (which must create its SQLite connections in
+that thread), maintains at most one submitted request per endpoint and delivers
+through a queue bounded by endpoint count, plus one result at the handoff. Slow
+writers apply backpressure. Closing the iterator stops dispatch, drains in-flight
+calls and joins its threads before releasing pipeline locks. No worker changes
+or additional model processes are needed.
+
+`pipeline ner index --write-batch-articles 512` optionally combines or splits
+validated result batches into transactions of at most 512 articles. The default
+zero retains each inference result's commit boundary. This limit is independent
+of HTTP document/byte limits and the `--batch-articles` reader page size. The
+maximum is 8192 articles. One writer still owns SQLite; source, membership,
+table-policy, span and retry-conflict checks remain in place. Completion and
+mentions commit atomically; progress counts advance only afterward. A failure
+discards the current uncommitted group; restart skips durable prior groups.
+Grouped transactions reduce commit frequency without weakening durability or
+changing stored predictions, model identity or worker qualification.

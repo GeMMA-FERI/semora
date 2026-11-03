@@ -15,7 +15,7 @@ from semora.corpus.spans import mask_html_tables
 from semora.execution import ExecutionConfig
 from semora.execution.contracts import semantic_fingerprint
 from semora.ner.adapters import load_adapter
-from semora.ner.staging import iter_predictions
+from semora.ner.staging import coalesce_batches, iter_predictions
 from semora.ner.storage import save_batch
 from semora.pipeline.publication_state import invalidate_publication
 from semora.pipeline.table_policy import EXCLUDE_HTML_TABLES, table_policy
@@ -226,7 +226,7 @@ def index_batch_ner(
     resources: str | Path | None = None, model: Any = None, progress: Callable[[dict], None] | None = None,
     execution: ExecutionConfig | None = None,
     trust_completed_state: bool = False, trusted_eligible_articles: int | None = None,
-    trusted_completed_articles: int | None = None,
+    trusted_completed_articles: int | None = None, write_batch_articles: int = 0,
 ) -> dict:
     """Extract only pending articles in one frozen batch, with atomic article outputs.
 
@@ -244,6 +244,8 @@ def index_batch_ner(
         batch_articles, batch_size, pipeline_depth, ner_pipeline_depth,
     )) or type(tokenizer_workers) is not int or tokenizer_workers < 0:
         raise ValueError("NER batch sizes/depths must be positive integers and tokenizer workers nonnegative.")
+    if type(write_batch_articles) is not int or not 0 <= write_batch_articles <= 8192:
+        raise ValueError("NER write batch size must be an integer between zero and 8192.")
     if type(trust_completed_state) is not bool:
         raise ValueError("trust_completed_state must be a boolean.")
     if trust_completed_state:
@@ -341,7 +343,7 @@ def index_batch_ner(
                         else iter_predictions(model, read_batch, batch_size, pipeline_depth)
                     )
                     with closing(predictions) as batches:
-                        for batch in batches:
+                        for batch in coalesce_batches(batches, write_batch_articles):
                             if policy == EXCLUDE_HTML_TABLES:
                                 for row, entities in zip(batch.rows, batch.prediction.entities, strict=True):
                                     masked = row["inference_content"]
@@ -378,6 +380,7 @@ def index_batch_ner(
                     "added_entities": mentions, "pending_articles": eligible - completed, "complete": True,
                     "exhausted_snapshot": True, "retrieval_ready": False, "publication_ready": False,
                     "trusted_completed_state": trust_completed_state,
+                    "write_batch_articles": write_batch_articles,
                     **({"remote": model.diagnostics} if execution.backend == "remote" and model is not None else {}),
                 }
             finally:

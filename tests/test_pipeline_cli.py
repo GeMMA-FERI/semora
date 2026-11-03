@@ -719,3 +719,16 @@ def test_progress_replace_permanent_lock_keeps_previous_snapshot(tmp_path, monke
         cli._write_progress_file(path, {"completed": 2})
     assert json.loads(path.read_text()) == {"completed": 1}
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_ner_cli_forwards_coordinator_write_batch(monkeypatch, capsys, tmp_path):
+    from semora.pipeline import ner
+    received = []
+    def index(*args, **kwargs):
+        received.append(kwargs)
+        return {"complete": True}
+    monkeypatch.setattr(ner, "index_batch_ner", index)
+    invoke(monkeypatch, capsys, "pipeline", "ner", "index", "--database",
+           str(tmp_path / "corpus.sqlite"), "--batch", "test", "--maintenance",
+           "--write-batch-articles", "512")
+    assert received[0]["write_batch_articles"] == 512

@@ -323,3 +323,34 @@ def test_batch_sizing_is_linear_and_exact_for_escaped_unicode(worker, monkeypatc
     for batch in split:
         value = Request("0" * 36, "ner", pool._fingerprint, tuple(doc for _row, doc in batch))
         assert len(original(value.to_dict())) <= exact_size - 1
+
+
+def test_dispatch_continues_during_slow_consumer_and_is_bounded(worker):
+    config, state = worker
+    second = threading.Event()
+    def posted():
+        if len(state["requests"]) >= 2:
+            second.set()
+    state["before_post"] = posted
+    pages = iter([[{"article_id": str(i), "content": "test"}] for i in range(30)] + [[]])
+    stream = RemoteNERPool(config).iter_predictions(lambda: next(pages))
+    next(stream)
+    try:
+        assert second.wait(2), "Writer must not block dispatch of the next request"
+        time.sleep(0.1)
+        assert 2 <= len(state["requests"]) <= 3
+    finally:
+        stream.close()
+    count = len(state["requests"])
+    time.sleep(0.05)
+    assert len(state["requests"]) == count
+    assert not any(t.name == "remote-ner-dispatch" for t in threading.enumerate())
+
+
+def test_reader_exception_propagates_and_dispatcher_joins(worker):
+    config, _ = worker
+    def read():
+        raise RuntimeError("reader failed")
+    with pytest.raises(RuntimeError, match="reader failed"):
+        list(RemoteNERPool(config).iter_predictions(read))
+    assert not any(t.name == "remote-ner-dispatch" for t in threading.enumerate())

@@ -210,3 +210,41 @@ def test_batch_mutation_during_remote_inference_rolls_back(tmp_path, change, err
         with pytest.raises(RuntimeError, match=error):
             index_batch_ner(database, 'batch', execution=config(tmp_path, url))
     assert counts(database) == (0, 0)
+
+
+def test_grouped_remote_writes_interrupt_and_resume_atomically(tmp_path):
+    database = ingest(tmp_path, {f"{i}.md": "Ana" for i in range(5)})
+    seen = []
+    def stop(event):
+        if event["event"] == "ner_checkpoint":
+            seen.append(event["completed_articles"])
+            raise RuntimeError("operator checkpoint")
+    with worker() as (url, calls):
+        execution = config(tmp_path, url)
+        with pytest.raises(RuntimeError, match="operator checkpoint"):
+            index_batch_ner(database, 'batch', batch_articles=1, write_batch_articles=3,
+                            execution=execution, progress=stop)
+        assert seen == [3]
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM article_ner_state").fetchone()[0] == 3
+        report = index_batch_ner(database, 'batch', batch_articles=1, write_batch_articles=3,
+                                 execution=execution)
+        assert report["complete"] and report["completed_articles"] == 5
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM article_entities").fetchone()[0] == 5
+
+
+def test_grouped_remote_source_change_rolls_back_whole_write(tmp_path):
+    database = ingest(tmp_path, {"1.md": "Ana", "2.md": "Ana"})
+    def change():
+        if len(calls) == 2:
+            with sqlite3.connect(database) as connection:
+                connection.execute("UPDATE articles SET content='Changed' "
+                                   "WHERE article_id = (SELECT MAX(article_id) FROM articles)")
+    with worker(before_response=change) as (url, calls):
+        with pytest.raises(RuntimeError, match="Article changed"):
+            index_batch_ner(database, 'batch', batch_articles=1, write_batch_articles=2,
+                            execution=config(tmp_path, url))
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM article_ner_state").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM article_entities").fetchone()[0] == 0
