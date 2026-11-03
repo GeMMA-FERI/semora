@@ -133,6 +133,10 @@ def main() -> None:
     parser.add_argument("--tokenizer-workers", type=int, default=0)
     parser.add_argument("--ner-pipeline-depth", type=int, default=1)
     parser.add_argument("--max-documents", type=int, default=32)
+    parser.add_argument(
+        "--prepare-batch-documents", type=int, default=0,
+        help="Overlap one CPU-prepared document chunk with GPU inference; zero disables overlap.",
+    )
     parser.add_argument("--max-input-bytes", type=int, default=1_048_576)
     parser.add_argument("--max-request-bytes", type=int, default=2_097_152)
     parser.add_argument("--max-response-bytes", type=int, default=4_194_304)
@@ -147,6 +151,7 @@ def main() -> None:
         resources=args.resources.resolve(strict=True), device=args.device, package=args.package,
         batch_size=args.batch_size, decoder=args.decoder, tokenizer_workers=args.tokenizer_workers,
         ner_pipeline_depth=args.ner_pipeline_depth, max_documents=args.max_documents,
+        prepare_batch_documents=args.prepare_batch_documents,
         max_input_bytes=args.max_input_bytes, max_request_bytes=args.max_request_bytes,
         max_response_bytes=args.max_response_bytes, body_timeout=args.body_timeout,
         expected_fingerprint=args.expected_fingerprint,

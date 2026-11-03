@@ -9,13 +9,14 @@ import logging
 import platform
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from semora.ner.base import Entity, Prediction
 from semora.text.diagnostics import TokenAlignmentWarnings
 
 from .contracts import DocumentResult, Request, Response, semantic_fingerprint
@@ -46,6 +47,7 @@ class WorkerSettings:
     max_response_bytes: int = 4_194_304
     body_timeout: float = 30.0
     expected_fingerprint: str | None = None
+    prepare_batch_documents: int = 0
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda") or self.decoder not in ("numpy", "numba"):
@@ -58,6 +60,11 @@ class WorkerSettings:
         ):
             if type(value) is not int or value <= 0:
                 raise ValueError("Worker batch sizes, depths and byte/document limits must be positive integers.")
+        if (
+            type(self.prepare_batch_documents) is not int
+            or not 0 <= self.prepare_batch_documents <= self.max_documents
+        ):
+            raise ValueError("Preparation chunk size must be zero or within the request document limit.")
         if type(self.tokenizer_workers) is not int or self.tokenizer_workers < 0:
             raise ValueError("Worker tokenizer count must be a nonnegative integer.")
         if type(self.body_timeout) not in (int, float) or not isfinite(self.body_timeout) or self.body_timeout <= 0:
@@ -127,9 +134,13 @@ class NERWorker:
                 and self.fingerprint != self.settings.expected_fingerprint
             ):
                 raise ValueError("Worker semantic fingerprint differs from the expected fingerprint.")
+            if self.settings.prepare_batch_documents and not all(
+                callable(getattr(self._model, name, None)) for name in ("prepare", "predict_prepared")
+            ):
+                raise ValueError("Preparation overlap requires a staged model adapter.")
             # Exercise tokenization/model/decoder initialization before readiness.
             with redirect_stdout(TokenAlignmentWarnings()):
-                self._model.predict(["Ana Novak je v Mariboru."], self.settings.batch_size)
+                self._prediction(["Ana Novak je v Mariboru."])
         except BaseException:
             self._close_model()
             raise
@@ -184,23 +195,51 @@ class NERWorker:
             "runtime": {"device": self.settings.device, "batch_size": self.settings.batch_size,
                         "decoder": self.settings.decoder, "sentence_order": "input",
                         "tokenizer_workers": self.settings.tokenizer_workers,
-                        "ner_pipeline_depth": self.settings.ner_pipeline_depth, "versions": self.versions},
+                        "ner_pipeline_depth": self.settings.ner_pipeline_depth,
+                        "prepare_batch_documents": self.settings.prepare_batch_documents, "versions": self.versions},
             "counters": {"completed_requests": self.completed_requests, "failed_requests": self.failed_requests,
                          "inferred_documents": self.inferred_documents,
                          "token_alignment_warnings": self.token_alignment_warnings},
         }
 
+    def _prediction(self, texts: list[str]) -> Prediction:
+        size = self.settings.prepare_batch_documents
+        if not size:
+            return cast(Prediction, self._model.predict(texts, self.settings.batch_size))
+        chunks = iter(texts[start:start + size] for start in range(0, len(texts), size))
+        first = next(chunks, None)
+        if first is None:
+            return Prediction([])
+        entities: list[list[Entity]] = []
+        timings: dict[str, float] = {}
+        # The request retains its single inference slot throughout. Only CPU
+        # preparation moves off the model owner, with one bounded chunk ahead.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="classla-prepare") as preparation:
+            pending: Future[Any] | None = preparation.submit(self._model.prepare, first)
+            while pending is not None:
+                prepared = pending.result()
+                following = next(chunks, None)
+                pending = preparation.submit(self._model.prepare, following) if following is not None else None
+                prediction = self._model.predict_prepared(prepared, self.settings.batch_size)
+                entities.extend(prediction.entities)
+                for name, value in prediction.timings.items():
+                    timings[name] = timings.get(name, 0.0) + value
+        return Prediction(entities, timings)
+
     def _predict(self, request: Request) -> bytes:
         try:
             texts = [document.text for document in request.documents]
             warnings = TokenAlignmentWarnings()
+            child_warnings_before = getattr(self._model, "token_alignment_warnings", 0)
             try:
                 # Obeliks/CLASSLA diagnostics can print whole source paragraphs.
                 # The dedicated service has one model owner; retain counts only.
                 with redirect_stdout(warnings):
-                    prediction = self._model.predict(texts, self.settings.batch_size)
+                    prediction = self._prediction(texts)
             finally:
-                self.token_alignment_warnings += warnings.count
+                self.token_alignment_warnings += (
+                    warnings.count + getattr(self._model, "token_alignment_warnings", 0) - child_warnings_before
+                )
             results = tuple(
                 DocumentResult(document.document_id, document.content_sha256, entities=tuple(entities))
                 for document, entities in zip(request.documents, prediction.entities, strict=True)

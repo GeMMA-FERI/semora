@@ -146,3 +146,36 @@ field is rejected with HTTP 400. Configure sentence batching with the worker's
 variable, then recreate the service. Authenticated capabilities report the actual
 value under `runtime.batch_size`. This is distinct from `limits.max_documents`,
 which remains 32 documents per API request by default.
+
+
+## Measured CPU preparation overlap
+
+For the 2026-11-03 OCR experiment, the selected profile is sentence batch64,
+four tokenizer processes, NumPy decoding, up to128 documents per HTTP request,
+and `--prepare-batch-documents 32`. The model-owner thread infers one32-document
+chunk while one preparation thread tokenizes the next. At most two prepared
+chunks are resident and one HTTP inference slot remains in use. This is separate
+from `--ner-pipeline-depth`, which stays1 in the selected profile. The default
+preparation chunk is0 (disabled), preserving ordinary operation.
+
+Warm repeated1,040-article tests with production sharing the test GPUs gave
+about10.2 versus4.6 seconds on the RTX4090 host, and10.6 versus5.7 seconds on the
+RTX4060 host. All compared outputs matched exactly. Eight tokenizer processes,
+Numba0.61.2 decoding and additional tensor-stage depth did not provide a useful
+consistent gain, so the selected profile keeps four processes and NumPy. No
+additional JIT dependency is required. Parallel tokenizer diagnostics are
+suppressed in child processes and their warning counts returned to the owner.
+
+NORA's optional GPU Compose exposes `CLASSLA_GPU_TOKENIZER_WORKERS`,
+`CLASSLA_GPU_DECODER`, `CLASSLA_GPU_PIPELINE_DEPTH`, `CLASSLA_GPU_MAX_DOCUMENTS`
+and `CLASSLA_GPU_PREPARE_DOCUMENTS`; sentence batch remains64. Increase the
+coordinator's bounded page to256 for two128-document workers. Request input and
+response byte bounds still apply. The coordinator reuses each available worker
+and sizes compact JSON batches in linear time while retaining exact byte limits.
+
+Qualify outputs and memory on the target corpus before selecting this profile.
+Stop both old workers and wait for the coordinator's durable paused checkpoint
+before replacing either production endpoint. Record the new fingerprint/runtime
+qualification, then resume with trusted checkpoint counts. Do not hot-swap a
+worker underneath an active coordinator. Keep the prior image/configuration
+for rollback; failed candidates must not update the entity dictionary or publish.

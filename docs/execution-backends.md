@@ -198,3 +198,19 @@ Pending articles still undergo worker identity and qualification checks and
 transactional content, batch membership, table policy and mention validation.
 The command fails if supplied totals disagree with the observed end of pending
 work. This faster retry is not a substitute for a full publication audit.
+
+
+## Bounded preparation tuning
+
+Worker startup can enable `--prepare-batch-documents 32` with a128-document
+request limit. One CPU thread prepares only the next chunk while the original
+GPU owner infers the current chunk. Cancellation retains the inference slot
+until both inference and prefetched preparation finish; shutdown closes the
+model afterward. Default0 retains sequential document preparation. Tokenizer
+processes remain separately bounded by `--tokenizer-workers`.
+
+The coordinator sends work to the endpoint that becomes available; a slower
+worker does not prevent a faster endpoint from receiving its next batch. Raw
+request sizing encodes each document once, accounts exactly for JSON commas and
+headers, and still rejects oversized inputs without truncation. Neither tuning
+changes the v1 request schema or permits per-request model settings.

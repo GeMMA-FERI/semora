@@ -142,6 +142,7 @@ def test_real_obeliks_entity_with_xml_reference_preserves_raw_text():
     pytest.importorskip('classla')
     from classla.models.common.doc import Document
     from classla.utils.obeliks import ObeliksTrainer
+
     from semora.ner.base import Entity, validate
 
     text = 'Ana &amp; Marija'
@@ -155,3 +156,17 @@ def test_real_obeliks_entity_with_xml_reference_preserves_raw_text():
     entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
     assert entities == [Entity(0, len(text), 'PER', text)]
     validate(text, entities)
+
+
+def test_parallel_tokenizer_returns_warning_count_without_raw_ocr(monkeypatch, capsys):
+    from semora.ner import adapters
+
+    def tokenize(_text):
+        print("Warning: Cannot compute token index. private OCR paragraph")
+        return ("raw", ["tokens"], {"metadata": True})
+
+    monkeypatch.setattr(adapters, "tokenize_article", tokenize)
+    value, warning_count = adapters._tokenize_article_with_warnings("input")
+    assert value == ("raw", ["tokens"], {"metadata": True})
+    assert warning_count == 1
+    assert capsys.readouterr().out == ""

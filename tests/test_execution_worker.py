@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -285,3 +286,134 @@ def test_startup_cancellation_still_closes_model_on_owner_thread(tmp_path: Path)
         assert len({thread for _, thread in model.events}) == 1
 
     asyncio.run(run())
+
+
+def test_worker_counts_parallel_tokenizer_warnings(tmp_path):
+    app, models = make_app(tmp_path)
+    with TestClient(app) as client:
+        model = models[0]
+        original = model.predict
+        model.token_alignment_warnings = 0
+
+        def predict(texts, batch_size):
+            model.token_alignment_warnings += 3
+            return original(texts, batch_size)
+
+        model.predict = predict
+        request = batch(client, ("Ana",))
+        assert client.post("/v1/ner", headers=AUTH, json=request.to_dict()).status_code == 200
+        capability = client.get("/v1/capabilities", headers=AUTH).json()
+        assert capability["counters"]["token_alignment_warnings"] == 3
+
+
+class StagedModel(FakeModel):
+    def __init__(self):
+        super().__init__()
+        self.preparation_threads = []
+        self.next_prepared = threading.Event()
+        self.preparation_release = threading.Event()
+        self.block_preparation = False
+        self.check_overlap = False
+        self.fail_prediction = False
+
+    def prepare(self, texts):
+        self.preparation_threads.append(threading.get_ident())
+        if texts == ["Ana2"]:
+            self.next_prepared.set()
+            if self.block_preparation:
+                assert self.preparation_release.wait(5)
+        return texts
+
+    def predict_prepared(self, texts, batch_size):
+        if texts == ["Ana1"] and self.check_overlap:
+            assert self.next_prepared.wait(3)
+        if texts == ["Ana1"] and self.fail_prediction:
+            raise RuntimeError("private OCR content")
+        return super().predict(texts, batch_size)
+
+
+def staged_worker(tmp_path):
+    model = StagedModel()
+    def factory(_settings):
+        # Record creation on the actual model-owner thread, not the test caller.
+        model.events = [("create", threading.get_ident())]
+        return model
+    worker = NERWorker(WorkerSettings(resources=tmp_path, max_documents=3, prepare_batch_documents=1),
+                       adapter_factory=factory, identity_factory=lambda _model: {"format": "fake.ner.v1"})
+    return worker, model
+
+
+def staged_request(worker):
+    return Request("staged", "ner", worker.fingerprint,
+                   tuple(Document.create(str(i), f"Ana{i + 1}") for i in range(3)))
+
+
+def test_document_preparation_overlaps_inference_and_preserves_owner_and_order(tmp_path):
+    async def scenario():
+        worker, model = staged_worker(tmp_path)
+        await worker.start()
+        model.check_overlap = True
+        try:
+            request = staged_request(worker)
+            response = Response.from_dict(json.loads(await worker.infer(request)))
+            results = response.validate_against(request)
+            assert [result.document_id for result in results] == ["0", "1", "2"]
+        finally:
+            await worker.close()
+        owner = model.events[0][1]
+        assert all(thread == owner for _event, thread in model.events)
+        assert model.preparation_threads and all(thread != owner for thread in model.preparation_threads)
+    asyncio.run(scenario())
+
+
+def test_staged_failure_waits_for_prefetch_before_releasing_capacity(tmp_path):
+    async def scenario():
+        worker, model = staged_worker(tmp_path)
+        await worker.start()
+        model.check_overlap = model.block_preparation = model.fail_prediction = True
+        request = staged_request(worker)
+        active = asyncio.create_task(worker.infer(request))
+        try:
+            assert await asyncio.to_thread(model.next_prepared.wait, 3)
+            assert not active.done()
+            with pytest.raises(WorkerError) as busy:
+                await worker.infer(request)
+            assert busy.value.status == 503
+            model.preparation_release.set()
+            with pytest.raises(WorkerError) as failed:
+                await active
+            assert failed.value.status == 500
+            assert "private" not in str(failed.value)
+            model.check_overlap = model.block_preparation = model.fail_prediction = False
+            await worker.infer(request)
+        finally:
+            model.preparation_release.set()
+            await worker.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("chunk", [-1, True, 33])
+def test_preparation_chunk_bounds(tmp_path, chunk):
+    with pytest.raises(ValueError, match="Preparation chunk"):
+        WorkerSettings(resources=tmp_path, prepare_batch_documents=chunk)
+
+
+def test_cancellation_keeps_capacity_during_document_preparation(tmp_path):
+    async def scenario():
+        worker, model = staged_worker(tmp_path)
+        await worker.start()
+        model.check_overlap = model.block_preparation = True
+        request = staged_request(worker)
+        active = asyncio.create_task(worker.infer(request))
+        try:
+            assert await asyncio.to_thread(model.next_prepared.wait, 3)
+            active.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+            with pytest.raises(WorkerError) as busy:
+                await worker.infer(request)
+            assert busy.value.status == 503
+        finally:
+            model.preparation_release.set()
+            await worker.close()
+    asyncio.run(scenario())

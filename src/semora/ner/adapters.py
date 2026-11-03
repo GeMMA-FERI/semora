@@ -5,9 +5,12 @@ import importlib
 import re
 import time
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import redirect_stdout
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
+
+from semora.text.diagnostics import TokenAlignmentWarnings
 
 from .base import Adapter, Entity, Prediction
 from .decoding import word_pipeline_class
@@ -118,6 +121,7 @@ class ClasslaAdapter:
         if tokenizer_workers < 0:
             raise ValueError("Tokenizer workers cannot be negative")
         self.tokenizer_workers = tokenizer_workers
+        self.token_alignment_warnings = 0
         self.tokenizer_pool: ProcessPoolExecutor | None = None
         options: dict[str, Any] = {"processors": "tokenize,ner", "type": model or "default", "ner_decoder": ner_decoder}
         if resources:
@@ -155,9 +159,10 @@ class ClasslaAdapter:
                 self.tokenizer_pool = ProcessPoolExecutor(
                     max_workers=self.tokenizer_workers, mp_context=get_context("spawn")
                 )
-            documents = [
-                tokenizer.process_tokenized(*value) for value in self.tokenizer_pool.map(tokenize_article, texts)
-            ]
+            documents = []
+            for value, warning_count in self.tokenizer_pool.map(_tokenize_article_with_warnings, texts):
+                self.token_alignment_warnings += warning_count
+                documents.append(tokenizer.process_tokenized(*value))
         else:
             documents = [tokenizer.process(text) for text in texts]
         for document, text in zip(documents, texts, strict=True):
@@ -208,6 +213,15 @@ def tokenize_article(text: str):
     from classla.utils.obeliks import ObeliksTrainer
 
     return ObeliksTrainer.tokenize(text)
+
+
+def _tokenize_article_with_warnings(text: str):
+    # Spawned processes do not inherit the service's Python stdout redirect.
+    # Return diagnostics counts with the tokenized result, never raw paragraphs.
+    warnings = TokenAlignmentWarnings()
+    with redirect_stdout(warnings):
+        value = tokenize_article(text)
+    return value, warnings.count
 
 
 def classla_source_hash(module: Any) -> str:
