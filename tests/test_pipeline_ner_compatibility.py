@@ -103,9 +103,36 @@ def test_qualification_binds_adoption_reference_and_worker(tmp_path, monkeypatch
         == receipt
     )
     current = {"worker_fingerprint": fingerprint, "worker_identity": worker_identity}
+    worker_identity = {**worker_identity, "fixture": "corrected"}
+    fingerprint = semantic_fingerprint(worker_identity)
+    updated_reference = {"metadata": metadata, "identity": worker_identity, "fingerprint": fingerprint}
+    updated_receipt = qualify_ner_continuation(
+        database,
+        run_id="classla-sl",
+        execution=execution,
+        reference=updated_reference,
+        comparison=comparison,
+        evidence_path=evidence_path,
+    )
+    assert updated_receipt["worker_fingerprint"] == fingerprint
     remote = {"execution": {"workers": [{"url": "http://example", "runtime": {"device": "cuda"}}]}}
     with closing(sqlite3.connect(database)) as connection, connection:
         _, recorded = _recorded_identity(connection, "classla-sl")
+        assert (
+            json.loads(connection.execute("SELECT receipt_json FROM pipeline_ner_compatibility").fetchone()[0])
+            == receipt
+        )
+        assert (
+            json.loads(connection.execute("SELECT receipt_json FROM pipeline_ner_compatibility_history").fetchone()[0])
+            == updated_receipt
+        )
+        assert compatible(
+            connection,
+            "classla-sl",
+            recorded,
+            {"worker_fingerprint": fingerprint, "worker_identity": worker_identity},
+            remote,
+        )
         assert compatible(connection, "classla-sl", recorded, current, remote)
         assert not compatible(connection, "classla-sl", recorded, {**current, "worker_fingerprint": "0" * 64}, remote)
         with pytest.raises(ValueError, match="runtime"):

@@ -153,6 +153,15 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
             command.add_argument("--batch", required=True)
             _add_execution(command)
             command.add_argument("--progress-file", help="Atomic Pebble progress JSON path.")
+            command.add_argument(
+                "--trust-completed-state", action="store_true",
+                help="Trust prior completed NER rows and supplied counts during a maintenance retry.",
+            )
+            command.add_argument("--trusted-eligible-articles", type=int, help="Prior audited eligible article count.")
+            command.add_argument(
+                "--trusted-completed-articles", type=int,
+                help="Optional last durable completed count; omitted counts batch completion markers.",
+            )
             command.add_argument("--adapter", default="classla")
             command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
             command.add_argument("--batch-articles", type=int, default=32)
@@ -533,6 +542,9 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
                     ner_pipeline_depth=args.ner_pipeline_depth,
                     ner_decoder=args.ner_decoder,
                     resources=args.resources,
+                    trust_completed_state=args.trust_completed_state,
+                    trusted_eligible_articles=args.trusted_eligible_articles,
+                    trusted_completed_articles=args.trusted_completed_articles,
                     progress=ner_progress,
                     execution=_execution(args),
                 )

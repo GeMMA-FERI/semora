@@ -27,19 +27,57 @@ def _receipt(connection, run_id):
     return json.loads(row[0]) if row else None
 
 
+def _receipts(connection, run_id):
+    old = _receipt(connection, run_id)
+    if old is not None:
+        yield old
+    if _table(connection, "pipeline_ner_compatibility_history"):
+        rows = connection.execute(
+            "SELECT receipt_json FROM pipeline_ner_compatibility_history WHERE ner_run_id=?", (run_id,)
+        )
+        for row in rows:
+            yield json.loads(row[0])
+
+
+def _runtime_key(workers):
+    return _digest(
+        sorted(
+            ({"url": worker["url"], "runtime": worker["runtime"]} for worker in workers),
+            key=lambda worker: worker["url"],
+        )
+    )
+
+
 def compatible(connection, run_id, recorded, current, metadata):
-    receipt = _receipt(connection, run_id)
-    if receipt is None or current.get("worker_fingerprint") != receipt.get("worker_fingerprint"):
+    candidates = [
+        receipt
+        for receipt in _receipts(connection, run_id)
+        if current.get("worker_fingerprint") == receipt.get("worker_fingerprint")
+    ]
+    if not candidates:
         return False
+    workers = metadata.get("execution", {}).get("workers", [])
+    receipt = next(
+        (
+            candidate
+            for candidate in candidates
+            if workers
+            and all(
+                {worker["url"]: worker["runtime"] for worker in candidate["worker_execution"]["workers"]}.get(
+                    worker.get("url")
+                )
+                == worker.get("runtime")
+                for worker in workers
+            )
+        ),
+        None,
+    )
+    if receipt is None:
+        raise ValueError("Remote worker endpoint or runtime differs from the qualified receipt.")
     config, historical = _recorded_identity(connection, run_id)
     adoption = connection.execute(
         "SELECT evidence_json,model_identity_json FROM pipeline_ner_adoptions WHERE ner_run_id=?", (run_id,)
     ).fetchone()
-    workers = metadata.get("execution", {}).get("workers", [])
-    qualified = receipt.get("worker_execution", {}).get("workers", [])
-    runtime_by_url = {worker["url"]: worker["runtime"] for worker in qualified}
-    if not workers or any(runtime_by_url.get(worker.get("url")) != worker.get("runtime") for worker in workers):
-        raise ValueError("Remote worker endpoint or runtime differs from the qualified receipt.")
     if (
         historical != recorded
         or adoption is None
@@ -142,11 +180,31 @@ def qualify_ner_continuation(database_path, *, run_id, execution, reference, com
                 "receipt_json TEXT NOT NULL, qualified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )
             old = _receipt(connection, run_id)
-            if old is not None and old != receipt:
-                raise ValueError("A different compatibility receipt already exists for this run.")
             if old is None:
                 connection.execute(
                     "INSERT INTO pipeline_ner_compatibility(ner_run_id,receipt_json) VALUES (?,?)",
                     (run_id, _json(receipt)),
                 )
+            elif old != receipt:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS pipeline_ner_compatibility_history ("
+                    "ner_run_id TEXT NOT NULL REFERENCES ner_runs(ner_run_id), "
+                    "worker_fingerprint TEXT NOT NULL, runtime_key TEXT NOT NULL, receipt_json TEXT NOT NULL, "
+                    "qualified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                    "PRIMARY KEY (ner_run_id, worker_fingerprint, runtime_key))"
+                )
+                runtime_key = _runtime_key(workers)
+                previous = connection.execute(
+                    "SELECT receipt_json FROM pipeline_ner_compatibility_history "
+                    "WHERE ner_run_id=? AND worker_fingerprint=? AND runtime_key=?",
+                    (run_id, receipt["worker_fingerprint"], runtime_key),
+                ).fetchone()
+                if previous is not None and json.loads(previous[0]) != receipt:
+                    raise ValueError("A different receipt already exists for this worker and runtime.")
+                if previous is None:
+                    connection.execute(
+                        "INSERT INTO pipeline_ner_compatibility_history "
+                        "(ner_run_id,worker_fingerprint,runtime_key,receipt_json) VALUES (?,?,?,?)",
+                        (run_id, receipt["worker_fingerprint"], runtime_key, _json(receipt)),
+                    )
         return receipt

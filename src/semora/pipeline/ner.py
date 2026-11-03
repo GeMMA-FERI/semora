@@ -182,6 +182,17 @@ def _coverage(connection: sqlite3.Connection, batch_id: str, run_id: str) -> tup
     return eligible, completed
 
 
+def _trusted_completed_count(connection: sqlite3.Connection, batch_id: str, run_id: str) -> int:
+    """Count completion markers for the frozen batch without loading article text or mentions."""
+    return connection.execute(
+        "SELECT COUNT(*) FROM pipeline_batch_issues b "
+        "CROSS JOIN articles a INDEXED BY idx_articles_newspaper_id "
+        "CROSS JOIN article_ner_state s "
+        "WHERE b.batch_id=? AND a.newspaper_id=b.newspaper_id AND a.is_valid=1 "
+        "AND s.ner_run_id=? AND s.article_id=a.article_id", (batch_id, run_id),
+    ).fetchone()[0]
+
+
 def _register(connection: sqlite3.Connection, run_id: str, metadata: dict, identity: dict) -> None:
     previous, recorded = _recorded_identity(connection, run_id)
     if previous is not None:
@@ -214,6 +225,8 @@ def index_batch_ner(
     tokenizer_workers: int = 0, ner_pipeline_depth: int = 1, ner_decoder: str = "numpy",
     resources: str | Path | None = None, model: Any = None, progress: Callable[[dict], None] | None = None,
     execution: ExecutionConfig | None = None,
+    trust_completed_state: bool = False, trusted_eligible_articles: int | None = None,
+    trusted_completed_articles: int | None = None,
 ) -> dict:
     """Extract only pending articles in one frozen batch, with atomic article outputs.
 
@@ -231,6 +244,18 @@ def index_batch_ner(
         batch_articles, batch_size, pipeline_depth, ner_pipeline_depth,
     )) or type(tokenizer_workers) is not int or tokenizer_workers < 0:
         raise ValueError("NER batch sizes/depths must be positive integers and tokenizer workers nonnegative.")
+    if type(trust_completed_state) is not bool:
+        raise ValueError("trust_completed_state must be a boolean.")
+    if trust_completed_state:
+        if type(trusted_eligible_articles) is not int or trusted_eligible_articles < 0:
+            raise ValueError("Trusted NER resume requires a nonnegative previously audited eligible count.")
+        if trusted_completed_articles is not None and (
+            type(trusted_completed_articles) is not int
+            or not 0 <= trusted_completed_articles <= trusted_eligible_articles
+        ):
+            raise ValueError("Trusted NER completed count must be between zero and the eligible count.")
+    elif trusted_eligible_articles is not None or trusted_completed_articles is not None:
+        raise ValueError("Trusted NER counts require trust_completed_state.")
     path = Path(database_path).resolve(strict=True)
     owned_model = None
     with ExitStack() as locks:
@@ -246,20 +271,30 @@ def index_batch_ner(
                     raise ValueError("NER model identity changed; use a different run ID for incompatible models.")
             elif recorded is not None and adapter in {"classla", "transformers"} and recorded["adapter"] != adapter:
                 raise ValueError("NER adapter changed; use the matching adapter or a different run ID.")
-            eligible, initial = _coverage(connection, batch_id, run_id)
+            if trust_completed_state:
+                eligible = trusted_eligible_articles
+                initial = (trusted_completed_articles if trusted_completed_articles is not None
+                           else _trusted_completed_count(connection, batch_id, run_id))
+                if initial > eligible:
+                    raise ValueError("Trusted NER completion count exceeds the eligible count.")
+            else:
+                eligible, initial = _coverage(connection, batch_id, run_id)
             if progress is not None:
                 progress({"event": "ner_start", "batch_id": batch_id, "ner_run_id": run_id,
                           "completed_articles": initial, "total": eligible})
             added = mentions = 0
             cursor = ""
-            upper = connection.execute(
-                "SELECT MAX(a.article_id) " + _MEMBERSHIP,
-                (run_id, batch_id),
-            ).fetchone()[0]
+            exhausted = False
+            upper = (
+                connection.execute("SELECT MAX(article_id) FROM articles WHERE is_valid=1").fetchone()[0]
+                if trust_completed_state else connection.execute(
+                    "SELECT MAX(a.article_id) " + _MEMBERSHIP, (run_id, batch_id),
+                ).fetchone()[0]
+            )
 
             def read_batch() -> list[dict]:
-                nonlocal cursor
-                if upper is None:
+                nonlocal cursor, exhausted
+                if upper is None or exhausted:
                     return []
                 with closing(open_connection(path, read_only=True)) as reader:
                     rows = [dict(row) for row in reader.execute(
@@ -271,6 +306,8 @@ def index_batch_ner(
                         row["inference_content"] = mask_html_tables(row["content"])
                 if rows:
                     cursor = rows[-1]["article_id"]
+                else:
+                    exhausted = True
                 return rows
 
             try:
@@ -325,7 +362,14 @@ def index_batch_ner(
                                 progress({"event": "ner_checkpoint", "batch_id": batch_id, "ner_run_id": run_id,
                                           "completed_articles": initial + added, "total": eligible,
                                           **({"remote": model.diagnostics} if execution.backend == "remote" else {})})
-                current_eligible, completed = _coverage(connection, batch_id, run_id)
+                if trust_completed_state:
+                    # The operator trusts the prior eligible/completed counts and immutable
+                    # completed rows. Ensure the bounded scan did not leave pending inputs.
+                    if read_batch():
+                        raise ValueError("Batch NER has pending articles; trusted counts are inconsistent.")
+                    current_eligible, completed = eligible, initial + added
+                else:
+                    current_eligible, completed = _coverage(connection, batch_id, run_id)
                 if current_eligible != eligible or completed != eligible:
                     raise ValueError("Batch NER membership changed or has pending articles; audit/retry the batch.")
                 return {
@@ -333,6 +377,7 @@ def index_batch_ner(
                     "completed_articles": completed, "added_articles": added, "skipped_articles": initial,
                     "added_entities": mentions, "pending_articles": eligible - completed, "complete": True,
                     "exhausted_snapshot": True, "retrieval_ready": False, "publication_ready": False,
+                    "trusted_completed_state": trust_completed_state,
                     **({"remote": model.diagnostics} if execution.backend == "remote" and model is not None else {}),
                 }
             finally:

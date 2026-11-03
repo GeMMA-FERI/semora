@@ -177,6 +177,24 @@ summary, and hashes of the historical configuration and adoption. Every remote
 append checks the current fingerprint, qualified endpoint and exact advertised
 runtime and rechecks those historical records. A selected subset of the
 qualified endpoints is allowed. Hardware details not advertised by the API are
-not independently verified. A changed worker or historical evidence requires a separate run or an explicit
-review; a receipt is never silently replaced. Sample parity is not a guarantee
-of parity on all inputs.
+not independently verified. A changed worker requires a new explicit
+qualification; the previous receipt is retained and later receipts are appended
+to qualification history. Changed historical evidence invalidates those receipts.
+Sample parity is not a guarantee of parity on all inputs.
+
+
+## Trusted NER resume
+
+`pipeline ner index --trust-completed-state --trusted-eligible-articles N`
+skips the full revalidation of previously completed article text and mention
+counts. `N` must come from a prior full preflight of the same unchanged batch.
+The command counts existing batch completion markers using indexes unless
+`--trusted-completed-articles M` supplies the exact last durable count from a
+checkpoint of that same run and batch. Supplying the count avoids that scan.
+This is an operator trust decision: completed rows, batch membership, article
+validity and source text must remain unchanged since the trusted measurements.
+
+Pending articles still undergo worker identity and qualification checks and
+transactional content, batch membership, table policy and mention validation.
+The command fails if supplied totals disagree with the observed end of pending
+work. This faster retry is not a substitute for a full publication audit.
