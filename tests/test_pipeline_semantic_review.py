@@ -71,10 +71,10 @@ def test_semantic_store_rejects_a_different_logical_archive(tmp_path: Path) -> N
         assert connection.execute("SELECT * FROM semantic_chunks ORDER BY vector_id").fetchall() == before
 
 
-def test_semantic_store_rejects_restored_archive_missing_committed_mapping_members(tmp_path: Path) -> None:
+def test_membership_audit_rejects_restored_archive_missing_committed_mapping_members(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
 
-    from semora.pipeline.semantic import index_batch_vectors
+    from semora.pipeline.semantic import index_batch_vectors, validate_corpus_membership
 
     class Tokenizer:
         def __call__(self, text, **_kwargs):
@@ -108,11 +108,12 @@ def test_semantic_store_rejects_restored_archive_missing_committed_mapping_membe
     with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
         before = connection.execute("SELECT * FROM semantic_chunks ORDER BY vector_id").fetchall()
     ingest(restored, "third")
-    model = Model()
 
-    with pytest.raises(ValueError):
-        index_batch_vectors(restored, "third", directory, dimensions=2, model=model)
+    # Routine resumes skip the historical scan; the explicit audit must catch it.
+    with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
+        connection.execute("ATTACH DATABASE ? AS corpus", (str(restored),))
+        with pytest.raises(ValueError, match="Mapped historical chunks"):
+            validate_corpus_membership(connection)
 
-    assert model.calls == 0
     with closing(sqlite3.connect(directory / "mapping.sqlite")) as connection:
         assert connection.execute("SELECT * FROM semantic_chunks ORDER BY vector_id").fetchall() == before
