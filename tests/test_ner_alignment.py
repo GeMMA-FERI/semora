@@ -123,3 +123,35 @@ def test_real_obeliks_soft_hyphen_entity_preserves_original_text():
     entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
     assert entities == [Entity(0, len(text), 'PER', text)]
     validate(text, entities)
+
+@pytest.mark.parametrize(('text', 'words', 'spans'), [
+    ('&lt;Jutra&gt;', ['<', 'Jutra', '>'], [(0, 4), (4, 9), (9, 13)]),
+    ('Ana &amp; Marija', ['Ana', '&', 'Marija'], [(0, 3), (4, 9), (10, 16)]),
+    ('&#60;Jutra&#x3e;', ['&', '#60', ';', 'Jutra', '&', '#x3e', ';'],
+     [(0, 1), (1, 4), (4, 5), (5, 10), (10, 11), (11, 15), (15, 16)]),
+    ('&quot;Ana', ['&', 'quot', ';', 'Ana'], [(0, 1), (1, 5), (5, 6), (6, 9)]),
+    ('A\x03&amp;B', ['A', '&', 'B'], [(0, 1), (2, 7), (7, 8)]),
+])
+def test_xml_reference_alignment_uses_source_spans(text, words, spans):
+    doc = document(*words)
+    align_classla_tokens(doc, text)
+    assert [(t._start_char, t._end_char) for t in doc.iter_tokens()] == spans
+
+
+def test_real_obeliks_entity_with_xml_reference_preserves_raw_text():
+    pytest.importorskip('classla')
+    from classla.models.common.doc import Document
+    from classla.utils.obeliks import ObeliksTrainer
+    from semora.ner.base import Entity, validate
+
+    text = 'Ana &amp; Marija'
+    raw, sentences, metadata = ObeliksTrainer.tokenize(text)
+    doc = Document(sentences, raw, metasentences=metadata)
+    align_classla_tokens(doc, text)
+    tokens = list(doc.iter_tokens())
+    assert [token.text for token in tokens] == ['Ana', '&', 'Marija']
+    for index, token in enumerate(tokens):
+        token.ner = 'B-PER' if index == 0 else 'I-PER'
+    entities = [Entity(e.start_char, e.end_char, e.type, e.text) for e in doc.build_ents()]
+    assert entities == [Entity(0, len(text), 'PER', text)]
+    validate(text, entities)

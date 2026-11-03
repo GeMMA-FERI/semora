@@ -38,11 +38,34 @@ def _match_across_controls(text: str, word: str, cursor: int) -> tuple[int, int]
 
 
 def align_classla_tokens(document: Any, text: str) -> None:
-    """Obeliks offsets restart per paragraph; reconstruct and verify article offsets."""
-    # Obeliks normalizes soft hyphens to ASCII hyphens before tokenization.
-    # This substitution is one-to-one, so offsets still address the unmodified
-    # document text used by build_ents() and stored in the database.
-    matching_text = text.replace('\xad', '-')
+    """Reconstruct article offsets despite Obeliks' token normalization."""
+    # Obeliks emits XML-escaped tokens then decodes &amp;, &lt; and &gt; in
+    # index_of(). Existing occurrences of those strings in the source therefore
+    # collapse too. Numeric and other named references are left as-is.
+    matches = list(re.finditer(r"&(?:amp|lt|gt);", text))
+    starts = ends = None
+    if not matches:
+        matching_text = text.replace('\xad', '-')
+    else:
+        replacements = {"&amp;": "&", "&lt;": "<", "&gt;": ">"}
+        pieces = []
+        starts = []
+        ends = []
+        pos = 0
+        for match in matches:
+            for index in range(pos, match.start()):
+                pieces.append('-' if text[index] == '\xad' else text[index])
+                starts.append(index)
+                ends.append(index + 1)
+            pieces.append(replacements[match.group()])
+            starts.append(match.start())
+            ends.append(match.end())
+            pos = match.end()
+        for index in range(pos, len(text)):
+            pieces.append('-' if text[index] == '\xad' else text[index])
+            starts.append(index)
+            ends.append(index + 1)
+        matching_text = ''.join(pieces)
     cursor = 0
     for token in document.iter_tokens():
         start = matching_text.find(token.text, cursor)
@@ -50,13 +73,17 @@ def align_classla_tokens(document: Any, text: str) -> None:
         if start < 0 or not _TOKENIZER_GAP.fullmatch(matching_text[cursor:start]):
             start, end = _match_across_controls(matching_text, token.text, cursor)
             if start < 0:
-                raise ValueError(f"Cannot align CLASSLA token {token.text!r} at article character {cursor}")
+                source_cursor = (
+                    (starts[cursor] if cursor < len(starts) else len(text)) if starts is not None else cursor
+                )
+                raise ValueError(f"Cannot align CLASSLA token {token.text!r} at article character {source_cursor}")
         # CLASSLA exposes read-only properties backed by these fields.
-        token._start_char = start
-        token._end_char = end
-        cursor = token.end_char
-    if not _TOKENIZER_GAP.fullmatch(text[cursor:]):
-        raise ValueError(f"CLASSLA tokenization omitted text after article character {cursor}")
+        token._start_char = starts[start] if starts is not None else start
+        token._end_char = ends[end - 1] if ends is not None else end
+        cursor = end
+    if not _TOKENIZER_GAP.fullmatch(matching_text[cursor:]):
+        source_cursor = (starts[cursor] if cursor < len(starts) else len(text)) if starts is not None else cursor
+        raise ValueError(f"CLASSLA tokenization omitted text after article character {source_cursor}")
 
 
 def load_adapter(name: str, **options: Any) -> Adapter:
