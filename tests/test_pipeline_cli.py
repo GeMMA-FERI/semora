@@ -679,3 +679,43 @@ def test_cli_surface_and_lemma_index_batch_without_external_models(tmp_path: Pat
     assert repeated["added_articles"] == 0
     assert repeated["skipped_articles"] == 1
     assert len(created) == 1
+
+
+def test_progress_replace_recovers_from_transient_windows_reader_lock(tmp_path, monkeypatch):
+    from semora.pipeline import cli
+
+    path = tmp_path / "progress.json"
+    path.write_text('{"completed": 1}', encoding="utf-8")
+    replace = cli.os.replace
+    attempts = []
+
+    def busy_twice(source, target):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            assert json.loads(path.read_text())["completed"] == 1
+            raise PermissionError("reader still holds the destination")
+        return replace(source, target)
+
+    monkeypatch.setattr(cli.os, "replace", busy_twice)
+    monkeypatch.setattr(cli.time, "sleep", lambda _delay: None)
+    cli._write_progress_file(path, {"completed": 2})
+    assert json.loads(path.read_text()) == {"completed": 2}
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_progress_replace_permanent_lock_keeps_previous_snapshot(tmp_path, monkeypatch):
+    from semora.pipeline import cli
+
+    path = tmp_path / "progress.json"
+    path.write_text('{"completed": 1}', encoding="utf-8")
+    times = iter([0.0, 4.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(times))
+
+    def locked(_source, _target):
+        raise PermissionError("permanent lock")
+
+    monkeypatch.setattr(cli.os, "replace", locked)
+    with pytest.raises(PermissionError, match="permanent lock"):
+        cli._write_progress_file(path, {"completed": 2})
+    assert json.loads(path.read_text()) == {"completed": 1}
+    assert not list(tmp_path.glob("*.tmp"))

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -287,7 +288,16 @@ def _write_progress_file(path: Path, snapshot: dict) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Windows readers may briefly omit delete sharing while opening the JSON.
+        deadline = time.monotonic() + 3.0
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
