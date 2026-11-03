@@ -2,12 +2,12 @@
 
 import time
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from .base import Prediction
+from .base import Entity, Prediction
 
 
 @dataclass
@@ -80,7 +80,9 @@ def iter_predictions(
         cpu.shutdown(wait=True, cancel_futures=True)
 
 
-def coalesce_batches(batches, max_articles: int = 0):
+def coalesce_batches(
+    batches: Iterable[BatchResult], max_articles: int = 0,
+) -> Generator[BatchResult, None, None]:
     """Group transport results into bounded writes without changing predictions.
 
     Zero preserves transport commit boundaries. The caller retains ownership of
@@ -92,7 +94,8 @@ def coalesce_batches(batches, max_articles: int = 0):
     if not max_articles:
         yield from batches
         return
-    rows, entities = [], []
+    rows: list[dict[str, Any]] = []
+    entities: list[list[Entity]] = []
     read_seconds = predict_seconds = 0.0
     for batch in batches:
         if len(batch.rows) != len(batch.prediction.entities):
