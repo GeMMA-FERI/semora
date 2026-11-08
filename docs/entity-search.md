@@ -80,3 +80,53 @@ An actual CLI smoke build indexed 977 extracted mentions into 790 distinct names
 The selected Semora regression suite passed 43 tests; the full Nora agent/gateway
 suite passed 105 tests, including five cached pages from one fuzzy query.
 No production archive indexing or service startup was performed during these tests.
+
+
+## Reviewed name groups
+
+`semora.curation` stores preferred names and normalized variant membership in an
+independent, persistent SQLite database. The source dictionary and corpus remain
+read-only. Initialize it explicitly with the published corpus identity:
+
+```powershell
+python -m semora.curation.cli --store indexes/curation/curation.sqlite --corpus-id <corpus-id> init
+python -m semora.curation.cli --store indexes/curation/curation.sqlite --corpus-id <corpus-id> list
+python -m semora.curation.cli --store indexes/curation/curation.sqlite --corpus-id <corpus-id> mutate --request request.json
+```
+
+A mutation envelope contains `action`, `payload`, `operation_id` (UUID), `actor`
+(trusted operator identity), and `expected_revision`. Actions are `create_group`,
+`update_group`, `delete_group`, `reject_pair`, `reopen_pair`, and `undo_change`.
+Group creation/update takes `preferred_name`, 1-100 `members`, and optional
+`description`; updates also take `group_id`. Pair operations take `first`,
+`second`, `reason`. Undo takes the original `operation_id`; dissolution takes
+`group_id`. This CLI is for trusted local operators. AIDHCH's native curation
+worker supplies authenticated admin identities for remote operations.
+
+Mutations, scoped audit snapshots and revision advancement commit together.
+Retried operation IDs replay their saved results; different requests cannot reuse
+an ID. Undo checks only affected records and current membership/rejection
+conflicts. One normalized name belongs to at most one group. Group UUIDs and name
+keys survive dictionary rebuilds; missing names remain unresolved.
+
+Pass `curation_path=...` to `SearchEngine` to opt into curated discovery and group
+lookup. A published corpus is required and must match the store binding. Indexed
+preferred exact/prefix matches take precedence; otherwise raw spellfix candidates
+map to their approved groups. Exact `entity` lookup remains unchanged. Group
+article lookup takes `group_id` instead of `entity` and returns deduplicated source
+hits with original `matched_name`, unresolved members and curation revision.
+Continuations require the same publication generation and curation revision.
+
+`CuratedRetrieval.count_articles()` computes a separate exact distinct-article
+count with live source/hash eligibility, within a 15-minute SQL budget. Save the
+result through `CurationStore.save_count()` only after computation succeeds and
+the revision is still current. Cached counts are tied to publication and group
+membership version. Failed counts remain pending; no approximate sum is returned.
+NORA/AIDHCH schedules this work separately after group edits. Admin suggestions
+are bounded to five spellfix anchors; evidence validates only the first 40 raw
+memberships and reports its nonrepresentative sampling scope.
+
+Back up curation using SQLite's backup API or a consistent stopped-writer copy;
+never delete it when rebuilding derived indexes. Focused tests are
+`test_curation_store.py`, `test_curation_catalogue.py`, and
+`test_curated_retrieval.py`; the last uses the existing trusted spellfix fixture.

@@ -47,13 +47,16 @@ class EntitySearch:
                     "SELECT advancement_token FROM pipeline_entity_profile WHERE profile_id=1"
                 ).fetchone()
                 if (
-                    binding is None or profile is None or binding["pending_token"] is not None
+                    binding is None
+                    or profile is None
+                    or binding["pending_token"] is not None
                     or binding["advancement_token"] != profile["advancement_token"]
                 ):
                     raise ValueError("Entity dictionary advancement differs from the corpus.")
             load_spellfix(self.connection, extension_path(Path(engine.database.path).resolve().parent.parent))
-            self.connection.execute("ATTACH DATABASE ? AS corpus", (
-                Path(engine.database.path).resolve().as_uri() + "?mode=ro",))
+            self.connection.execute(
+                "ATTACH DATABASE ? AS corpus", (Path(engine.database.path).resolve().as_uri() + "?mode=ro",)
+            )
             self.connection.execute("PRAGMA query_only=ON")
         except BaseException:
             self.connection.close()
@@ -66,19 +69,34 @@ class EntitySearch:
         query = normalize_name(query)
         literal = query[:-1] if query.endswith("*") else query
         if not 3 <= len(literal) <= 200 or any(c in literal for c in "*?[]"):
-            raise ValueError("Use 3–200 characters and at most one trailing * wildcard.")
+            raise ValueError("Use 3-200 characters and at most one trailing * wildcard.")
         rows = self.connection.execute(
             "SELECT n.name,n.article_count,s.distance FROM name_spellfix s "
             "JOIN names n ON n.entity_id=s.rowid "
             "WHERE s.word MATCH ? AND s.top=100 "
-            "ORDER BY s.distance,n.article_count DESC,n.normalized_name", (query,),
+            "ORDER BY s.distance,n.article_count DESC,n.normalized_name",
+            (query,),
         ).fetchall()
-        return {"entities": [dict(row) for row in rows], "candidate_limit": 100,
-                "generation": self.generation, "limited": len(rows) == 100}
+        return {
+            "entities": [dict(row) for row in rows],
+            "candidate_limit": 100,
+            "generation": self.generation,
+            "limited": len(rows) == 100,
+        }
 
-    def search_entity_articles(self, entity, *, limit=20, after=None, generation=None,
-                               newspaper=None, date_from=None, date_to=None,
-                               max_snippet_chars=320, source_wrap_chars=240):
+    def search_entity_articles(
+        self,
+        entity,
+        *,
+        limit=20,
+        after=None,
+        generation=None,
+        newspaper=None,
+        date_from=None,
+        date_to=None,
+        max_snippet_chars=320,
+        source_wrap_chars=240,
+    ):
         if not 1 <= limit <= 20:
             raise ValueError("Entity article page size must be between 1 and 20")
         if generation is not None and generation != self.generation:
@@ -89,33 +107,70 @@ class EntitySearch:
         end = date.fromisoformat(date_to) if date_to else None
         if start and end and start > end:
             raise ValueError("date_to must not precede date_from")
+        candidates = self._candidates(
+            entity, rows=limit + 1, after=after, newspaper=newspaper, date_from=date_from, date_to=date_to
+        )
+        hits = self._hits(candidates[:limit], max_snippet_chars, source_wrap_chars)
+        return {
+            "hits": hits,
+            "generation": self.generation,
+            "next_after": candidates[limit - 1]["article_id"] if len(candidates) > limit else None,
+        }
+
+    def _candidates(
+        self, entity, *, rows, after=None, newspaper=None, date_from=None, date_to=None, full=True, inclusive=False
+    ):
+        columns = (
+            "a.*,m.char_start AS mention_start,a.title AS article_title, "
+            "p.source,p.title AS newspaper_title,p.date,p.urn,p.newspaper_id AS document_id, "
+            "p.relative_path,p.content AS newspaper_content"
+            if full
+            else "m.article_id,m.char_start AS mention_start"
+        )
         # Membership is indexed by entity and article. Check live completion hashes
         # so updated/deleted articles never use stale offsets from the snapshot.
-        candidates = self.connection.execute(
-            "SELECT a.*,m.char_start AS mention_start,a.title AS article_title, "
-            "p.source,p.title AS newspaper_title,p.date,p.urn,p.newspaper_id AS document_id, "
-            "p.relative_path,p.content AS newspaper_content FROM names n "
+        return self.connection.execute(
+            "SELECT " + columns + " FROM names n "
             "JOIN entity_articles m ON m.entity_id=n.entity_id "
             "JOIN corpus.article_ner_state s ON s.article_id=m.article_id AND s.ner_run_id=? "
             "AND s.content_sha256=m.content_sha256 "
             "JOIN corpus.articles a ON a.article_id=m.article_id "
             "JOIN corpus.newspapers p ON p.newspaper_id=a.newspaper_id "
-            "WHERE n.normalized_name=? AND m.article_id>? AND a.is_valid=1 "
+            "WHERE n.normalized_name=? AND m.article_id" + (">=" if inclusive else ">") + "? AND a.is_valid=1 "
             "AND a.char_start IS NOT NULL AND a.char_end IS NOT NULL "
             "AND a.line_start IS NOT NULL AND a.line_end IS NOT NULL "
             "AND (? IS NULL OR p.source=? OR p.title=?) "
             "AND (? IS NULL OR p.date>=?) AND (? IS NULL OR p.date<=?) "
             "ORDER BY m.article_id LIMIT ?",
-            (self.run_id, normalize_name(entity), after or "", newspaper, newspaper, newspaper,
-             date_from, date_from, date_to, date_to, limit + 1),
+            (
+                self.run_id,
+                normalize_name(entity),
+                after or "",
+                newspaper,
+                newspaper,
+                newspaper,
+                date_from,
+                date_from,
+                date_to,
+                date_to,
+                rows,
+            ),
         ).fetchall()
+
+    def _hits(self, candidates, max_snippet_chars, source_wrap_chars):
         hits = []
-        for candidate in candidates[:limit]:
+        for candidate in candidates:
             row = dict(candidate)
             row["_focus_char"] = int(row["char_end"]) - len(row["content"]) + row["mention_start"]
-            hits.append(self.engine._make_hit(
-                row, 1.0, before=0, after=0, context_lines=0,
-                max_snippet_chars=max_snippet_chars, source_wrap_chars=source_wrap_chars,
-            ).as_dict())
-        return {"hits": hits, "generation": self.generation,
-                "next_after": candidates[limit - 1]["article_id"] if len(candidates) > limit else None}
+            hits.append(
+                self.engine._make_hit(
+                    row,
+                    1.0,
+                    before=0,
+                    after=0,
+                    context_lines=0,
+                    max_snippet_chars=max_snippet_chars,
+                    source_wrap_chars=source_wrap_chars,
+                ).as_dict()
+            )
+        return hits

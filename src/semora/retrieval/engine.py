@@ -28,6 +28,7 @@ class SearchEngine:
         semantic_dir: str | Path = "indexes/semantic",
         *,
         entity_dir: str | Path | None = None,
+        curation_path: str | Path | None = None,
         load_semantic: bool = False,
         semantic_device: str = "cpu",
         semantic_rerank: bool = False,
@@ -65,11 +66,15 @@ class SearchEngine:
         self._semantic_manifest: dict[str, Any] | None = None
         self.last_profile: dict[str, Any] | None = None
         self._active_profile: dict[str, Any] | None = None
+        self._curation_path = Path(curation_path).resolve() if curation_path is not None else None
+        self._curation_store: Any = None
         self._entity_search: Any = None
         if load_semantic:
             self.load_semantic()
 
     def close(self) -> None:
+        if self._curation_store is not None:
+            self._curation_store.close()
         if self._entity_search is not None:
             self._entity_search.close()
         if self._semantic_mapping is not None:
@@ -85,10 +90,32 @@ class SearchEngine:
         return self._entity_search
 
     def search_entities(self, query: str) -> dict:
+        if self._curation_path is not None:
+            return self._curated().discovery(query)
         return self._entities().search_entities(query)
 
-    def search_entity_articles(self, entity: str, **options) -> dict:
+    def search_entity_articles(
+        self, entity: str | None = None, *, group_id=None, curation_revision=None, **options
+    ) -> dict:
+        if (entity is None) == (group_id is None):
+            raise ValueError("Supply exactly one of entity or group_id.")
+        if group_id is not None:
+            return self._curated().articles(group_id, curation_revision=curation_revision, **options)
+        if curation_revision is not None:
+            raise ValueError("curation_revision requires group_id.")
         return self._entities().search_entity_articles(entity, **options)
+
+    def _curated(self):
+        from semora.curation import CurationStore
+        from semora.curation.retrieval import CuratedRetrieval
+
+        if self._curation_path is None or self.publication is None:
+            raise ValueError("Curated retrieval requires an enabled store and a published corpus.")
+        if self._curation_store is None:
+            self._curation_store = CurationStore(
+                self._curation_path, corpus_id=self.publication["corpus_id"], read_only=True
+            )
+        return CuratedRetrieval(self._entities(), self._curation_store)
 
     @property
     def semantic_loaded(self) -> bool:
@@ -150,19 +177,28 @@ class SearchEngine:
             assert count is not None
             revision = self.publication["publication_id"]
             status["bm25"].update(
-                available=count > 0, complete=True, indexed_articles=count,
-                updated_at=None, publication_id=revision,
+                available=count > 0,
+                complete=True,
+                indexed_articles=count,
+                updated_at=None,
+                publication_id=revision,
             )
             status["lemma"].update(
-                available=count > 0, complete=True, surface_articles=count,
-                processed_articles=count, indexed_articles=count, updated_at=None,
+                available=count > 0,
+                complete=True,
+                surface_articles=count,
+                processed_articles=count,
+                indexed_articles=count,
+                updated_at=None,
                 publication_id=revision,
             )
             status["semantic"]["publication_id"] = revision
             scope = self.publication.get("entity_scope", "complete")
             status["entities"] = {
-                "available": True, "complete": scope == "complete",
-                "scope": scope, "publication_id": revision,
+                "available": True,
+                "complete": scope == "complete",
+                "scope": scope,
+                "publication_id": revision,
             }
         return status
 
