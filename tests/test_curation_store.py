@@ -154,3 +154,11 @@ def test_dissolution_and_undo_after_unrelated_edit(store):
         "SELECT before_json FROM curation_changes WHERE operation_id=?", (dissolved["operation_id"],)
     ).fetchone()[0]
     assert "maribor" not in audit
+
+
+def test_receipts_distinguish_group_creation_from_undo_dissolution(store):
+    created = mutate(store)
+    assert created["group_exists"] is True
+    undone = mutate(store, "undo_change", {"operation_id": created["operation_id"]})
+    assert undone["group_id"] == created["group_id"]
+    assert undone["group_exists"] is False

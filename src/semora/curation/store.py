@@ -278,6 +278,7 @@ class CurationStore:
                 self._apply(action, payload, revision + 1, group_id)
             result = {"operation_id": operation_id, "revision": revision + 1, "group_id": group_id}
             after = self._capture(group_id, pair)
+            result["group_exists"] = after["group"] is not None
             self.connection.execute("UPDATE curation_metadata SET revision=? WHERE id=1", (revision + 1,))
             self.connection.execute(
                 "INSERT INTO curation_changes(operation_id,actor,request_hash,action,"
