@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 from semora.ner.spellfix import extension_path, load_spellfix
-from semora.pipeline.batches import batch_status
 from semora.pipeline.entities import _expected, _memberships
 from semora.pipeline.entity_baseline import (
     NORMALIZATION,
@@ -32,6 +31,7 @@ from semora.pipeline.semantic import (
     validate_corpus_membership,
 )
 from semora.pipeline.semantic_faiss import _load_generation, _shards
+from semora.pipeline.table_policy import table_policy
 from semora.retrieval.semantic_faiss import FaissBuildConfig, _import_faiss
 from semora.storage.connection import open_connection
 
@@ -47,6 +47,7 @@ def audit_publication(
     *,
     run_id: str = "classla-sl",
     allow_historical_entities: bool = False,
+    trust_passed_stages_from: str | Path | None = None,
     spellfix_path: str | Path | None = None,
     faiss_module=None,
     progress=None,
@@ -56,6 +57,8 @@ def audit_publication(
     This deliberately streams the full dictionary and vector ledger. A sampled
     check cannot certify that an old serving revision covers the current corpus.
     """
+    if trust_passed_stages_from is not None and allow_historical_entities:
+        raise ValueError("Trusted complete-stage reuse cannot use historical-only publication.")
     report: dict[str, Any] = {
         "format": "semora.pipeline.publication-audit.v1",
         "batch_id": batch_id,
@@ -94,7 +97,7 @@ def audit_publication(
 
     with closing(open_connection(source, read_only=True)) as corpus:
         corpus.execute("BEGIN")
-        check("ingestion", lambda: _ingestion(corpus, batch_status(source, batch_id)))
+        check("ingestion", lambda: _ingestion(corpus, _ingestion_status(corpus, batch_id)))
         identity = corpus.execute(
             "SELECT corpus_id FROM pipeline_corpus_identity WHERE identity_id=1"
         ).fetchone()
@@ -108,12 +111,21 @@ def audit_publication(
             report["epoch"] = row[0]
         except sqlite3.DatabaseError as exc:
             report["errors"].append({"stage": "publication_state", "reason": str(exc)})
+        reused = {}
+        if trust_passed_stages_from is not None:
+            from semora.pipeline.publication_reuse import reuse_passed_stages
+            reused = reuse_passed_stages(corpus, batch_id, run_id, semantic,
+                semantic_generation, entity, trust_passed_stages_from, report)
+            if progress:
+                progress({"event": "publication_prior_stages_reused", "checked": 3, "total": 6})
         for stage in ("surface", "lemma"):
             check(
                 stage,
                 lambda stage=stage: _lexical(corpus, batch_id, stage, trust_completed=allow_historical_entities),
             )
-        if allow_historical_entities:
+        if "ner" in reused:
+            report["stages"]["ner"] = reused["ner"]
+        elif allow_historical_entities:
             check("ner", lambda: _historical_ner(corpus, run_id))
         else:
             check("ner", lambda: _ner(corpus, batch_id, run_id))
@@ -158,7 +170,10 @@ def audit_publication(
                         "dimensions": config["dimensions"],
                         "index_sha256": verified["index_sha256"]}
 
-        check("semantic", semantic_stage)
+        if "semantic" in reused:
+            report["stages"]["semantic"] = reused["semantic"]
+        else:
+            check("semantic", semantic_stage)
 
         def entity_stage() -> dict:
             manifest, dictionary, manifest_hash = _manifest(entity, run_id)
@@ -236,7 +251,9 @@ def audit_publication(
                         "baseline_manifest_names": manifest["names"],
                         "generation": manifest["generation"]}
 
-        if allow_historical_entities:
+        if "entities" in reused:
+            report["stages"]["entities"] = reused["entities"]
+        elif allow_historical_entities:
             check("entities", lambda: _historical_entities(corpus, entity, run_id, identity[0], report))
         else:
             check("entities", entity_stage)
@@ -309,6 +326,27 @@ def _historical_entities(
     return {"complete": False, "historical_only": True, "generation": manifest["generation"]}
 
 
+def _ingestion_status(corpus: sqlite3.Connection, batch_id: str) -> dict:
+    """Read only ingestion ledgers; lexical coverage is checked separately.
+
+    General batch_status also joins every article to lexical ledgers. Those
+    counts are unused by this gate and can dominate a publication retry.
+    """
+    batch = corpus.execute("SELECT * FROM pipeline_batches WHERE batch_id=?", (batch_id,)).fetchone()
+    if batch is None:
+        raise ValueError(f"Unknown batch: {batch_id}")
+    issues = corpus.execute(
+        "SELECT COUNT(*) FROM pipeline_batch_issues WHERE batch_id=?", (batch_id,),
+    ).fetchone()[0]
+    stages = {stage: corpus.execute(
+        "SELECT COUNT(*) FROM pipeline_batch_issues b JOIN pipeline_issue_stages s USING(newspaper_id) "
+        "WHERE b.batch_id=? AND s.stage=?", (batch_id, stage),
+    ).fetchone()[0] for stage in ("articles", "chunks")}
+    return {"issues": issues, "issue_count": batch["issue_count"], "stages": stages,
+            "ingestion_complete": batch["state"] == "ingested"
+            and all(count == batch["issue_count"] for count in stages.values())}
+
+
 def _ingestion(corpus: sqlite3.Connection, status: dict) -> dict:
     if not status["ingestion_complete"] or status["issues"] != status["issue_count"]:
         raise ValueError("Selected batch newspaper/article/chunk ingestion is incomplete.")
@@ -338,8 +376,12 @@ def _lexical(
     row = corpus.execute("SELECT config_json FROM pipeline_lexical_configs WHERE stage=?", (stage,)).fetchone()
     if row is None:
         raise ValueError(f"{stage} lexical configuration is not registered.")
-    coverage = _trusted_coverage if trust_completed else _validate_existing
-    eligible, completed = coverage(corpus, batch_id, stage, json.loads(row[0]))
+    policy = table_policy(corpus, batch_id) or "legacy"
+    config = json.loads(row[0])
+    eligible, completed = (
+        _trusted_coverage(corpus, batch_id, stage, config) if trust_completed
+        else _validate_existing(corpus, batch_id, stage, config, policy)
+    )
     if eligible != completed:
         raise ValueError(f"{stage} lexical index is incomplete: {completed}/{eligible}.")
     missing = corpus.execute(

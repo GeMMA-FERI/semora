@@ -138,3 +138,37 @@ def test_partial_publication_requires_explicit_opt_in(tmp_path: Path, monkeypatc
 
     assert not strict["eligible"] and strict["candidate"] is None
     assert partial["eligible"] and partial["candidate"]["entity_scope"] == "historical_only"
+
+
+@pytest.mark.parametrize("stage", ["surface", "lemma"])
+def test_lexical_audit_uses_active_table_policy_and_rejects_stale_hash(tmp_path, stage):
+    from contextlib import closing
+
+    from semora.storage.connection import open_connection
+
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    with closing(open_connection(source)) as db, db:
+        db.execute("UPDATE articles SET content=content || '<table><td>hidden</td></table>'")
+    index_batch_lexical(source, "batch-a")
+    index_batch_lexical(source, "batch-a", stage="lemma", lemmatizer=CountingLemmatizer())
+    with closing(open_connection(source)) as db:
+        assert publication_audit._lexical(db, "batch-a", stage)["complete"]
+        with db:
+            db.execute("UPDATE pipeline_lexical_state SET input_sha256='stale' WHERE stage=?", (stage,))
+        with pytest.raises(ValueError, match="input/configuration differs"):
+            publication_audit._lexical(db, "batch-a", stage)
+
+
+@pytest.mark.parametrize("trust_completed", [False, True])
+def test_lexical_audit_rejects_incomplete_table_repair(tmp_path, trust_completed):
+    from contextlib import closing
+
+    from semora.storage.connection import open_connection
+
+    source = ingest(tmp_path, "batch-a", "Straza/a.md")
+    index_batch_lexical(source, "batch-a")
+    with closing(open_connection(source)) as db:
+        with db:
+            db.execute("UPDATE pipeline_batch_table_policies SET state='repairing'")
+        with pytest.raises(ValueError, match="table repair is incomplete"):
+            publication_audit._lexical(db, "batch-a", "surface", trust_completed=trust_completed)

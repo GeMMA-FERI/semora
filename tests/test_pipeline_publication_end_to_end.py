@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -128,6 +129,77 @@ def test_native_publication_from_legacy_to_new_batch(tmp_path: Path, monkeypatch
     assert checked["eligible"], checked["errors"]
     published = publish_batch(database, "new-batch", semantic, generation, entity, faiss_module=faiss)
     assert published["published"] and published["publication_ready"]
+
+    # A failed lexical gate may reuse only previously passed complete stages.
+    # Expensive scan hooks must never run in this explicitly trusted mode.
+    from semora.pipeline import publication_audit as audit_module
+    prior = json.loads(json.dumps(checked))
+    prior.update(eligible=False, candidate=None)
+    for stage in ("surface", "lemma"):
+        prior["stages"][stage] = {"complete": False}
+    prior["errors"] = [{"stage": "surface", "reason": "previous policy mismatch"}]
+    receipt = tmp_path / "passed-stages.json"
+    receipt.write_text(json.dumps(prior), encoding="utf-8")
+
+    def forbidden_scan(*_args, **_kwargs):
+        raise AssertionError("Trusted retry repeated a passed bulk scan")
+
+    with monkeypatch.context() as trusted:
+        for name in ("ner_coverage", "_load_generation", "_dictionary_rows", "_expected_memberships"):
+            trusted.setattr(audit_module, name, forbidden_scan)
+        retried = publish_batch(database, "new-batch", semantic, generation, entity,
+            trust_passed_stages_from=receipt, faiss_module=faiss)
+        assert retried["published"] and retried["already_published"]
+        assert retried["trusted_stage_reuse"]["stages"] == ["ner", "semantic", "entities"]
+        assert retried["stages"]["surface"]["complete"]
+        assert retried["stages"]["lemma"]["complete"]
+        pointer_bytes = (database.parent / "publication.json").read_bytes()
+        for mutation, message in (
+            ({"epoch": prior["epoch"] - 1}, "identity/epoch"),
+            ({"entity_manifest_sha256": "0" * 64}, "generation/manifest"),
+            ({"entity_scope": "historical_only"}, "identity/epoch"),
+            ({"errors": [{"stage": "ner", "reason": "failed"}]}, "outside the lexical"),
+        ):
+            receipt.write_text(json.dumps({**prior, **mutation}), encoding="utf-8")
+            with pytest.raises(ValueError, match=message):
+                publish_batch(database, "new-batch", semantic, generation, entity,
+                    trust_passed_stages_from=receipt, faiss_module=faiss)
+            assert (database.parent / "publication.json").read_bytes() == pointer_bytes
+        incomplete = json.loads(json.dumps(prior))
+        incomplete["stages"]["entities"]["complete"] = False
+        receipt.write_text(json.dumps(incomplete), encoding="utf-8")
+        with pytest.raises(ValueError, match="incomplete stage"):
+            publish_batch(database, "new-batch", semantic, generation, entity,
+                trust_passed_stages_from=receipt, faiss_module=faiss)
+        receipt.write_text(json.dumps(prior), encoding="utf-8")
+        with sqlite3.connect(database) as connection:
+            old_hashes = connection.execute(
+                "SELECT article_id,input_sha256 FROM pipeline_lexical_state WHERE stage='surface'"
+            ).fetchall()
+            connection.execute("UPDATE pipeline_lexical_state SET input_sha256='stale' WHERE stage='surface'")
+        failed_lexical = publish_batch(database, "new-batch", semantic, generation, entity,
+            trust_passed_stages_from=receipt, faiss_module=faiss)
+        assert not failed_lexical["published"]
+        assert any(error["stage"] == "surface" for error in failed_lexical["errors"])
+        assert (database.parent / "publication.json").read_bytes() == pointer_bytes
+        with sqlite3.connect(database) as connection:
+            connection.executemany(
+                "UPDATE pipeline_lexical_state SET input_sha256=? WHERE article_id=? AND stage='surface'",
+                [(digest, article) for article, digest in old_hashes])
+        index_path = semantic / "generations" / generation / "index.faiss"
+        index_bytes = index_path.read_bytes()
+        index_path.write_bytes(index_bytes + b"corrupted")
+        with pytest.raises(ValueError, match="checksum changed"):
+            publish_batch(database, "new-batch", semantic, generation, entity,
+                trust_passed_stages_from=receipt, faiss_module=faiss)
+        index_path.write_bytes(index_bytes)
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE pipeline_entity_bindings SET pending_token='unfinished'")
+        with pytest.raises(ValueError, match="advancement is unfinished"):
+            publish_batch(database, "new-batch", semantic, generation, entity,
+                trust_passed_stages_from=receipt, faiss_module=faiss)
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE pipeline_entity_bindings SET pending_token=NULL")
 
     class QueryModel:
         def __init__(self, *_args, **_kwargs):

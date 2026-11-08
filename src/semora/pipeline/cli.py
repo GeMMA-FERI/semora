@@ -206,6 +206,10 @@ def add_pipeline_parser(commands: argparse._SubParsersAction) -> None:
         "--allow-historical-entities", action="store_true",
         help="Publish new lexical/semantic coverage while entity search keeps its adopted historical scope.",
     )
+    publication.add_argument(
+        "--trust-passed-stages-from",
+        help="Explicitly trust unchanged NER/semantic/entity outputs from this earlier audit; rerun lexical checks.",
+    )
     publication.add_argument("--spellfix-path", help="Trusted local spellfix DLL/SO; default: <root>/extensions.")
     publication.add_argument(
         "--publish", action="store_true", help="Repeat the audit and atomically select this revision."
@@ -626,6 +630,7 @@ def _execute_operation(args: argparse.Namespace, database: Path) -> tuple[dict, 
             Path(args.entity_dir).resolve() if args.entity_dir else database.parent / "entities",
             run_id=args.run_id,
             allow_historical_entities=args.allow_historical_entities,
+            trust_passed_stages_from=args.trust_passed_stages_from,
             spellfix_path=Path(args.spellfix_path).resolve() if args.spellfix_path else None,
             progress=_progress,
         )

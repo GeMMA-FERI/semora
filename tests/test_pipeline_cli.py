@@ -732,3 +732,17 @@ def test_ner_cli_forwards_coordinator_write_batch(monkeypatch, capsys, tmp_path)
            str(tmp_path / "corpus.sqlite"), "--batch", "test", "--maintenance",
            "--write-batch-articles", "512")
     assert received[0]["write_batch_articles"] == 512
+
+
+def test_publication_cli_forwards_trusted_passed_stages(monkeypatch, capsys, tmp_path):
+    from semora.pipeline import publication_publish
+    received = []
+    def publish(*args, **kwargs):
+        received.append(kwargs)
+        return {"eligible": True, "published": True}
+    monkeypatch.setattr(publication_publish, "publish_batch", publish)
+    receipt = str(tmp_path / "previous.json")
+    invoke(monkeypatch, capsys, "pipeline", "publication", "--database",
+           str(tmp_path / "corpus.sqlite"), "--batch", "test", "--maintenance",
+           "--semantic-generation", "a" * 64, "--publish", "--trust-passed-stages-from", receipt)
+    assert received[0]["trust_passed_stages_from"] == receipt

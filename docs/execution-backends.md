@@ -236,3 +236,22 @@ mentions commit atomically; progress counts advance only afterward. A failure
 discards the current uncommitted group; restart skips durable prior groups.
 Grouped transactions reduce commit frequency without weakening durability or
 changing stored predictions, model identity or worker qualification.
+
+
+## Explicitly trusted publication retry
+
+After a full audit passed NER, semantic and entities but failed only lexical
+checks, publication can accept `--trust-passed-stages-from <audit.json>`.
+This is an operator assertion that the passed outputs have not changed since
+that report. Old reports have no database snapshot watermarks; identity/epoch
+checks cannot prove the absence of direct edits. Never use this after restoring
+or modifying those outputs. Full validation remains the default.
+
+The retry retains writer exclusion, repeats ingestion and strict surface/lemma
+validation using the active table policy, and checks matching corpus/batch/run,
+epoch, complete scope, dictionary generation/manifest/current advancement binding,
+semantic store/shard-ledger identity and the serving FAISS checksum. It reuses
+only successful NER/semantic/entity stages. It skips their bulk row, membership
+and vector-file scans. A historical-only report or incompatible/incomplete
+receipt is rejected. The final report records the receipt SHA-256, reused stages
+and trust assumption; the serving pointer still changes only after the gate.
