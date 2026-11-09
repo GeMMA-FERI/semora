@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from semora.curation import CurationStore
-from semora.curation.proposals import prepare_task, training_example, validate_response
+from semora.curation.proposals import digest, prepare_task, review_response, training_example, validate_response
 from semora.curation.store import Conflict
 
 
@@ -26,6 +26,17 @@ def case(tmp_path):
             },
         )
         prepared = prepare_task(catalogue, "Ljubljana")
+        # Retain coverage of already persisted v1 tasks after introducing v2.
+        prepared["context"]["prompt_version"] = "name-equivalence-v1"
+        prepared["context"]["evidence"] = [
+            {
+                "name": name,
+                "sampling": "bounded",
+                "passages": [{"evidence_id": f"e{i}-0", "content_sha256": "hash", "passage": name}],
+            }
+            for i, name in enumerate(["ljubljana", "ljubijana"])
+        ]
+        prepared["fingerprint"] = digest({key: prepared[key] for key in ("context", "task")})
         response = {
             "preferred_name": "Ljubljana",
             "decisions": [
@@ -97,7 +108,7 @@ def test_export_rejects_invalid_target(case):
         training_example(prepared, response, review_status="accepted", proposal_id="p", attempt_id="a")
 
 
-def test_existing_group_uses_actual_anchor_evidence(tmp_path):
+def test_existing_group_preparation_does_not_require_anchor_evidence(tmp_path):
     import uuid
 
     with CurationStore(tmp_path / "c.sqlite", corpus_id="c", initialize=True) as store:
@@ -118,13 +129,9 @@ def test_existing_group_uses_actual_anchor_evidence(tmp_path):
                 "passages": [{"passage": name}] if name != "alpha" else [],
             },
         )
-        assert prepare_task(catalogue, "Zulu")["context"]["evidence"][0]["name"] == "zulu"
-        catalogue.evidence = lambda name, **k: {
-            "sampling": "bounded",
-            "passages": [] if name == "zulu" else [{"passage": name}],
-        }
-        with pytest.raises(ValueError, match="anchor"):
-            prepare_task(catalogue, "Zulu")
+        assert prepare_task(catalogue, "Zulu")["context"]["evidence"] == []
+        catalogue.evidence = lambda *a, **k: pytest.fail("Spelling preparation must not read articles")
+        assert prepare_task(catalogue, "Zulu")["context"]["anchor"] == "zulu"
 
 
 def test_review_application_is_atomic_and_idempotent(case):
@@ -259,3 +266,132 @@ def test_json_text_training_target_is_an_object(case):
         prepared, json.dumps(response), review_status="accepted", proposal_id="p", attempt_id="a"
     )
     assert json.loads(example["messages"][-1]["content"]) == response
+
+
+@pytest.fixture
+def spelling_case(tmp_path):
+    with CurationStore(tmp_path / "v2.sqlite", corpus_id="c", initialize=True) as store:
+        calls = []
+
+        def evidence(name, *, limit):
+            assert limit == 1
+            calls.append(name)
+            return {
+                "sampling": "bounded",
+                "passages": [{"article_id": name, "content_sha256": "hash", "passage": name}],
+            }
+
+        catalogue = SimpleNamespace(
+            store=store,
+            entities=SimpleNamespace(generation="g"),
+            evidence=evidence,
+            suggest_variants=lambda *a, **k: {
+                "candidates": [
+                    {"normalized_name": name, "group_id": None}
+                    for name in ["ljubijana", "ljubljani", "ljubljane", "ljubjana", "ljubljna"]
+                ]
+            },
+        )
+        prepared = prepare_task(catalogue, "Ljubljana")
+        response = {
+            "preferred_name": "Ljubljana",
+            "decisions": [
+                {"name": name, "decision": "include", "reason": "Obvious spelling variant.", "evidence_ids": []}
+                for name in prepared["context"]["candidates"]
+            ],
+        }
+        yield catalogue, prepared, response, calls
+
+
+def test_spelling_first_requires_no_passages_and_uses_small_prompt(spelling_case):
+    import json
+
+    catalogue, prepared, response, calls = spelling_case
+    assert calls == []
+    prompt = json.loads(prepared["task"]["messages"][-1]["content"])
+    assert set(prompt) == {"stage", "anchor", "existing_members", "candidates"}
+    assert prepared["task"]["reasoning_effort"] == "low"
+    result = review_response(catalogue, prepared, response)
+    assert "ljubijana" in result["members"] and "follow_up" not in result
+    assert calls == []
+
+
+def test_context_is_requested_once_and_only_for_three_ambiguous_names(spelling_case):
+    catalogue, prepared, response, calls = spelling_case
+    for item in response["decisions"]:
+        item["decision"] = "needs_evidence"
+    result = review_response(catalogue, prepared, response)
+    follow_up = result["follow_up"]
+    assert calls == ["ljubljana", "ljubijana", "ljubljani", "ljubljane"]
+    assert follow_up["context"]["stage"] == "context"
+    assert len(follow_up["context"]["requested_names"]) == 3
+    assert follow_up["context"]["prior_decisions"][-1]["decision"] == "uncertain"
+    assert follow_up["context"]["parent_fingerprint"] == prepared["fingerprint"]
+    with pytest.raises(ValueError, match="Invalid decision"):
+        review_response(catalogue, follow_up, response)
+
+
+def test_context_include_requires_valid_references_if_it_cites_passages(spelling_case):
+    catalogue, prepared, response, _ = spelling_case
+    response["decisions"][0]["decision"] = "needs_evidence"
+    follow_up = review_response(catalogue, prepared, response)["follow_up"]
+    response["decisions"][0].update(decision="include", evidence_ids=["e1-0"])
+    with pytest.raises(ValueError, match="anchor and candidate"):
+        validate_response(follow_up, response, catalogue.store, "g")
+    response["decisions"][0]["evidence_ids"] = ["e0-0", "e1-0"]
+    assert review_response(catalogue, follow_up, response)["needs_evidence"] == []
+
+
+def test_missing_context_becomes_uncertain_without_another_model_call(spelling_case):
+    catalogue, prepared, response, _ = spelling_case
+    catalogue.evidence = lambda *a, **k: {"sampling": "bounded", "passages": []}
+    response["decisions"][0]["decision"] = "needs_evidence"
+    result = review_response(catalogue, prepared, response)
+    assert "follow_up" not in result
+    assert result["response"]["decisions"][0]["decision"] == "uncertain"
+    assert result["prepared"]["context"]["stage"] == "context"
+
+
+def test_unresolved_context_requests_cannot_be_applied_or_exported(spelling_case):
+    import uuid
+
+    from semora.curation.proposals import apply_reviewed
+
+    catalogue, prepared, response, _ = spelling_case
+    response["decisions"][0]["decision"] = "needs_evidence"
+    with pytest.raises(ValueError, match="context requests"):
+        apply_reviewed(
+            prepared,
+            response,
+            catalogue.store,
+            "g",
+            operation_id=uuid.uuid4().hex,
+            actor="admin:1",
+            expected_revision=0,
+        )
+    with pytest.raises(ValueError, match="context requests"):
+        training_example(prepared, response, review_status="accepted", proposal_id="p", attempt_id="a")
+
+
+def test_follow_up_training_does_not_train_on_the_unreviewed_first_reply(spelling_case):
+    catalogue, prepared, response, _ = spelling_case
+    response["decisions"][0]["decision"] = "needs_evidence"
+    follow_up = review_response(catalogue, prepared, response)["follow_up"]
+    response["decisions"][0].update(decision="uncertain", reason="Context inconclusive.")
+    example = training_example(follow_up, response, review_status="edited", proposal_id="p", attempt_id="a")
+    assert [message["role"] for message in example["messages"]] == ["system", "user", "assistant"]
+
+
+def test_context_lookup_refuses_mixed_curation_read_window(spelling_case):
+    catalogue, prepared, response, _ = spelling_case
+    response["decisions"][0]["decision"] = "needs_evidence"
+    original = catalogue.evidence
+
+    def evidence(name, **kwargs):
+        result = original(name, **kwargs)
+        catalogue.store.connection.execute("UPDATE curation_metadata SET revision=revision+1")
+        return result
+
+    catalogue.evidence = evidence
+    with pytest.raises(Conflict, match="during context lookup"):
+        review_response(catalogue, prepared, response)
