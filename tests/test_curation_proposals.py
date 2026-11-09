@@ -76,7 +76,7 @@ def test_stale_and_tampered_tasks(case):
     altered["context"]["candidates"].append("injected")
     with pytest.raises(ValueError, match="fingerprint"):
         validate_response(altered, response, store, "g")
-    store.connection.execute("UPDATE curation_metadata SET revision=revision+1")
+    store.connection.execute("INSERT INTO rejected_pairs VALUES('ljubijana','ljubljana','reviewed separately')")
     with pytest.raises(Conflict):
         validate_response(prepared, response, store, "g")
 
@@ -129,6 +129,7 @@ def test_existing_group_uses_actual_anchor_evidence(tmp_path):
 
 def test_review_application_is_atomic_and_idempotent(case):
     import uuid
+
     from semora.curation.proposals import apply_reviewed
 
     store, prepared, response = case
@@ -160,6 +161,7 @@ def test_review_application_is_atomic_and_idempotent(case):
 
 def test_all_uncertain_proposal_is_not_applied(case):
     import uuid
+
     from semora.curation.proposals import apply_reviewed
 
     store, prepared, response = case
@@ -169,3 +171,91 @@ def test_all_uncertain_proposal_is_not_applied(case):
             prepared, response, store, "g", operation_id=uuid.uuid4().hex, actor="admin:1", expected_revision=0
         )
     assert store.groups() == []
+
+
+def test_unrelated_approvals_preserve_proposals_and_replay(case):
+    import uuid
+
+    from semora.curation.proposals import apply_reviewed
+
+    store, prepared, response = case
+    store.mutate(
+        "create_group",
+        {"preferred_name": "Maribor", "members": ["maribor", "mariboru"]},
+        operation_id=uuid.uuid4().hex,
+        actor="admin:1",
+        expected_revision=0,
+    )
+    assert validate_response(prepared, response, store, "g")["expected_revision"] == 1
+    operation = uuid.uuid4().hex
+    receipt = apply_reviewed(
+        prepared, response, store, "g", operation_id=operation, actor="admin:1", expected_revision=0
+    )
+    assert receipt["revision"] == 2
+    assert (
+        apply_reviewed(prepared, response, store, "g", operation_id=operation, actor="admin:1", expected_revision=0)
+        == receipt
+    )
+
+
+def test_relevant_membership_change_invalidates_proposal(case):
+    import uuid
+
+    store, prepared, response = case
+    store.mutate(
+        "create_group",
+        {"preferred_name": "Ljubijana", "members": ["ljubijana"]},
+        operation_id=uuid.uuid4().hex,
+        actor="admin:1",
+        expected_revision=0,
+    )
+    with pytest.raises(Conflict):
+        validate_response(prepared, response, store, "g")
+
+
+def test_validation_rejects_edit_during_relevant_state_read(case, monkeypatch):
+    from semora.curation import proposals
+
+    store, prepared, response = case
+    original = proposals.relevant_state
+
+    def interleaved(*args):
+        state = original(*args)
+        store.connection.execute("UPDATE curation_metadata SET revision=revision+1")
+        return state
+
+    monkeypatch.setattr(proposals, "relevant_state", interleaved)
+    with pytest.raises(Conflict, match="during proposal validation"):
+        validate_response(prepared, response, store, "g")
+
+
+def test_preparation_guards_state_capture(case, monkeypatch):
+    from semora.curation import proposals
+
+    store, _, _ = case
+    catalogue = SimpleNamespace(
+        store=store,
+        entities=SimpleNamespace(generation="g"),
+        suggest_variants=lambda *a, **k: {"candidates": [{"normalized_name": "ljubijana", "group_id": None}]},
+        evidence=lambda name, **k: {"sampling": "bounded", "passages": [{"passage": name}]},
+    )
+    original = proposals.relevant_state
+
+    def interleaved(*args):
+        state = original(*args)
+        store.connection.execute("UPDATE curation_metadata SET revision=revision+1")
+        return state
+
+    monkeypatch.setattr(proposals, "relevant_state", interleaved)
+    with pytest.raises(Conflict, match="during task preparation"):
+        prepare_task(catalogue, "Ljubljana")
+
+
+def test_json_text_training_target_is_an_object(case):
+    import json
+
+    _, prepared, response = case
+    example = training_example(
+        prepared, json.dumps(response), review_status="accepted", proposal_id="p", attempt_id="a"
+    )
+    assert json.loads(example["messages"][-1]["content"]) == response

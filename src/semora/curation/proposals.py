@@ -30,6 +30,33 @@ def digest(value):
     ).hexdigest()
 
 
+def relevant_state(store, names, group_id):
+    """Only decisions affecting these spellings invalidate the expensive model work."""
+    names = sorted(set(names))
+    return {
+        "memberships": {name: store.membership(name) for name in names},
+        "group_version": store.group(group_id)["version"] if group_id else None,
+        "rejected_pairs": [[a, b] for a, b in combinations(names, 2) if store.rejected(a, b)],
+    }
+
+
+class RecordedState:
+    def __init__(self, context):
+        self.context = context
+
+    def metadata(self):
+        return {"corpus_id": self.context["corpus_id"], "revision": self.context["revision"]}
+
+    def membership(self, name):
+        return self.context["state"]["memberships"].get(name)
+
+    def group(self, group_id):
+        return {"version": self.context["state"]["group_version"]}
+
+    def rejected(self, first, second):
+        return sorted([first, second]) in self.context["state"]["rejected_pairs"]
+
+
 def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limit: int = 8) -> dict[str, Any]:
     """Bounded discovery; revisions bracket all separately snapshotted reads."""
     if type(limit) is not int or not 1 <= limit <= 12:
@@ -61,8 +88,6 @@ def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limi
         )
     if not evidence[0]["passages"]:
         raise ValueError("No valid source evidence for the anchor.")
-    if store.metadata()["revision"] != revision:
-        raise Conflict("Curation changed during task preparation; retry.")
     context = {
         "prompt_version": PROMPT_VERSION,
         "corpus_id": store.metadata()["corpus_id"],
@@ -72,9 +97,12 @@ def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limi
         "group_id": group_id,
         "existing_members": existing,
         "description": group["description"] if group else "",
+        "state": relevant_state(store, [*existing, *candidates], group_id),
         "candidates": candidates,
         "evidence": evidence,
     }
+    if store.metadata()["revision"] != revision:
+        raise Conflict("Curation changed during task preparation; retry.")
     decision = {
         "type": "object",
         "additionalProperties": False,
@@ -115,10 +143,12 @@ def validate_response(prepared: dict[str, Any], response: Any, store: Any, gener
     if digest({k: prepared[k] for k in ("context", "task")}) != prepared["fingerprint"]:
         raise ValueError("Prepared task fingerprint differs.")
     context = prepared["context"]
+    metadata = store.metadata()
     if (
-        context["corpus_id"] != store.metadata()["corpus_id"]
+        context["corpus_id"] != metadata["corpus_id"]
         or context["generation"] != generation
-        or context["revision"] != store.metadata()["revision"]
+        or context["state"]
+        != relevant_state(store, [*context["existing_members"], *context["candidates"]], context["group_id"])
     ):
         raise Conflict("Proposal is stale; prepare a new task.")
     if isinstance(response, str):
@@ -168,12 +198,14 @@ def validate_response(prepared: dict[str, Any], response: Any, store: Any, gener
         or normalize_name(preferred) not in members
     ):
         raise ValueError("Preferred name must be one of the selected spellings.")
+    if store.metadata()["revision"] != metadata["revision"]:
+        raise Conflict("Curation changed during proposal validation; retry.")
     return {
         "preferred_name": preferred.strip(),
         "members": sorted(set(members)),
         "group_id": context["group_id"],
         "decisions": decisions,
-        "expected_revision": context["revision"],
+        "expected_revision": metadata["revision"],
         "fingerprint": prepared["fingerprint"],
     }
 
@@ -188,17 +220,9 @@ def training_example(
     # reviewed examples remain exportable after later publications and edits.
     context = prepared["context"]
 
-    class RecordedState:
-        def metadata(self):
-            return {"corpus_id": context["corpus_id"], "revision": context["revision"]}
-
-        def membership(self, name):
-            return context["group_id"] if name in context["existing_members"] else None
-
-        def rejected(self, first, second):
-            return False
-
-    validate_response(prepared, reviewed_response, RecordedState(), context["generation"])
+    if isinstance(reviewed_response, str):
+        reviewed_response = json.loads(reviewed_response)
+    validate_response(prepared, reviewed_response, RecordedState(context), context["generation"])
     return {
         "format": "semora.consolidation.training.v1",
         "proposal_id": proposal_id,
@@ -228,26 +252,20 @@ def apply_reviewed(
     import uuid
 
     normalized_id = str(uuid.UUID(operation_id))
-    prior = store.connection.execute("SELECT 1 FROM curation_changes WHERE operation_id=?", (normalized_id,)).fetchone()
+    prior = store.connection.execute(
+        "SELECT revision FROM curation_changes WHERE operation_id=?", (normalized_id,)
+    ).fetchone()
     context = prepared["context"]
     if expected_revision != context["revision"]:
         raise Conflict("Review revision differs from prepared task.")
     if prior:
         # Pure validation against recorded state derives the identical mutation
         # payload; mutate() still checks actor/request hash before replaying.
-        class RecordedState:
-            def metadata(self):
-                return {"corpus_id": context["corpus_id"], "revision": context["revision"]}
-
-            def membership(self, name):
-                return context["group_id"] if name in context["existing_members"] else None
-
-            def rejected(self, first, second):
-                return False
-
-        checked = validate_response(prepared, response, RecordedState(), context["generation"])
+        checked = validate_response(prepared, response, RecordedState(context), context["generation"])
+        mutation_revision = prior[0] - 1
     else:
         checked = validate_response(prepared, response, store, generation)
+        mutation_revision = checked["expected_revision"]
     if len(checked["members"]) < 2:
         raise ValueError("No additional spelling was selected; reject the proposal instead.")
     payload = {
@@ -261,6 +279,6 @@ def apply_reviewed(
         payload,
         operation_id=operation_id,
         actor=actor,
-        expected_revision=expected_revision,
+        expected_revision=mutation_revision,
         authorize=authorize,
     )

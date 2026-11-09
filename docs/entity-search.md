@@ -122,7 +122,7 @@ count with live source/hash eligibility, within a 15-minute SQL budget. Save the
 result through `CurationStore.save_count()` only after computation succeeds and
 the revision is still current. Cached counts are tied to publication and group
 membership version. Failed counts remain pending; no approximate sum is returned.
-NORA/AIDHCH schedules this work separately after group edits. Admin suggestions
+NORA/AIDHCH schedules this work only on explicit admin requests. Admin suggestions
 are bounded to five spellfix anchors; evidence validates only the first 40 raw
 memberships and reports its nonrepresentative sampling scope.
 
@@ -138,3 +138,36 @@ and normalized member set. Metadata-only edits and their undo carry valid cache
 rows forward within the audited transaction; record versions remain monotonic.
 An in-flight count can be saved after metadata edits if its membership hash still
 matches. Membership changes or another publication require a new explicit count.
+
+
+## Model-assisted consolidation proposals
+
+`semora.curation.proposals` prepares model-independent message/schema tasks from
+bounded catalogue candidates and source evidence. `prepare_task()` defaults to
+eight candidates (maximum twelve) and two passages per name; it preserves existing
+members, excludes transfers from other groups and requires anchor evidence.
+Groups above twenty members stay in manual review. Sampling limitations are
+included in the prompt; historical text is data, never model instructions.
+
+`validate_response()` requires exactly one include/exclude/uncertain decision per
+candidate and valid source references for both anchor and included spelling. The
+preferred name must be selected, existing members cannot disappear, and rejected
+pairs remain separate. These are mechanical checks, not proof of name identity.
+Humans approve semantic equivalence, including person/organization ambiguity.
+
+Tasks retain corpus/publication, relevant memberships, group version, rejected
+pairs, prompt/schema and a full fingerprint. Unrelated edits do not invalidate
+them. Preparation/validation bracket reads with revision checks; `apply_reviewed()`
+uses a current transactional revision and the existing idempotent, audited store.
+Same-operation receipt replay remains safe after later edits. The original source
+and entity dictionary are unchanged, and no article count is scheduled implicitly.
+
+NORA supplies generic idle-time inference and full attempt transcripts; AIDHCH
+owns authorization, the durable backlog, proposal review and application requests.
+Semora neither schedules a model nor decides when the host is idle.
+
+`training_example()` exports only accepted/edited human targets, validates them
+against the recorded task state and preserves proposal/attempt IDs. Historical
+examples remain exportable after later publications; that does not authorize
+applying their obsolete proposals. Raw model attempts and rejection decisions
+remain separate records. Tests: `tests/test_curation_proposals.py`.
