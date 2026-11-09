@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from itertools import combinations
+from typing import Any
 
 from semora.curation.store import Conflict
 from semora.ner.names import normalize_name
@@ -28,7 +30,7 @@ def digest(value):
     ).hexdigest()
 
 
-def prepare_task(catalogue, name, *, group_id=None, limit=8):
+def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limit: int = 8) -> dict[str, Any]:
     """Bounded discovery; revisions bracket all separately snapshotted reads."""
     if type(limit) is not int or not 1 <= limit <= 12:
         raise ValueError("Use 1-12 proposal candidates.")
@@ -69,6 +71,7 @@ def prepare_task(catalogue, name, *, group_id=None, limit=8):
         "anchor": anchor,
         "group_id": group_id,
         "existing_members": existing,
+        "description": group["description"] if group else "",
         "candidates": candidates,
         "evidence": evidence,
     }
@@ -107,7 +110,7 @@ def prepare_task(catalogue, name, *, group_id=None, limit=8):
     return {**prepared, "fingerprint": digest(prepared)}
 
 
-def validate_response(prepared, response, store, generation):
+def validate_response(prepared: dict[str, Any], response: Any, store: Any, generation: str) -> dict[str, Any]:
     """Validate membership and evidence mechanically; semantic approval remains human."""
     if digest({k: prepared[k] for k in ("context", "task")}) != prepared["fingerprint"]:
         raise ValueError("Prepared task fingerprint differs.")
@@ -175,7 +178,9 @@ def validate_response(prepared, response, store, generation):
     }
 
 
-def training_example(prepared, reviewed_response, *, review_status, proposal_id, attempt_id):
+def training_example(
+    prepared: dict[str, Any], reviewed_response: Any, *, review_status: str, proposal_id: str, attempt_id: str
+) -> dict[str, Any]:
     """Export only explicit human targets. Raw attempts remain in the execution archive."""
     if review_status not in ("accepted", "edited"):
         raise ValueError("Only human-approved targets are eligible for supervised export.")
@@ -206,3 +211,56 @@ def training_example(prepared, reviewed_response, *, review_status, proposal_id,
             {"role": "assistant", "content": json.dumps(reviewed_response, ensure_ascii=False)},
         ],
     }
+
+
+def apply_reviewed(
+    prepared: dict[str, Any],
+    response: Any,
+    store: Any,
+    generation: str,
+    *,
+    operation_id: str,
+    actor: str,
+    expected_revision: int,
+    authorize: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Approval is explicit; replay the same mutation identity after a lost receipt."""
+    import uuid
+
+    normalized_id = str(uuid.UUID(operation_id))
+    prior = store.connection.execute("SELECT 1 FROM curation_changes WHERE operation_id=?", (normalized_id,)).fetchone()
+    context = prepared["context"]
+    if expected_revision != context["revision"]:
+        raise Conflict("Review revision differs from prepared task.")
+    if prior:
+        # Pure validation against recorded state derives the identical mutation
+        # payload; mutate() still checks actor/request hash before replaying.
+        class RecordedState:
+            def metadata(self):
+                return {"corpus_id": context["corpus_id"], "revision": context["revision"]}
+
+            def membership(self, name):
+                return context["group_id"] if name in context["existing_members"] else None
+
+            def rejected(self, first, second):
+                return False
+
+        checked = validate_response(prepared, response, RecordedState(), context["generation"])
+    else:
+        checked = validate_response(prepared, response, store, generation)
+    if len(checked["members"]) < 2:
+        raise ValueError("No additional spelling was selected; reject the proposal instead.")
+    payload = {
+        "group_id": context["group_id"] or uuid.UUID(operation_id).hex,
+        "preferred_name": checked["preferred_name"],
+        "members": checked["members"],
+        "description": context.get("description", ""),
+    }
+    return store.mutate(
+        "update_group" if context["group_id"] else "create_group",
+        payload,
+        operation_id=operation_id,
+        actor=actor,
+        expected_revision=expected_revision,
+        authorize=authorize,
+    )

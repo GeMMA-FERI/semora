@@ -125,3 +125,47 @@ def test_existing_group_uses_actual_anchor_evidence(tmp_path):
         }
         with pytest.raises(ValueError, match="anchor"):
             prepare_task(catalogue, "Zulu")
+
+
+def test_review_application_is_atomic_and_idempotent(case):
+    import uuid
+    from semora.curation.proposals import apply_reviewed
+
+    store, prepared, response = case
+    operation = uuid.uuid4().hex
+
+    def deny():
+        raise PermissionError("Revoked")
+
+    with pytest.raises(PermissionError):
+        apply_reviewed(
+            prepared, response, store, "g", operation_id=operation, actor="admin:1", expected_revision=0, authorize=deny
+        )
+    assert store.groups() == []
+    receipt = apply_reviewed(
+        prepared, response, store, "g", operation_id=operation, actor="admin:1", expected_revision=0
+    )
+    assert store.metadata()["revision"] == 1
+    assert (
+        apply_reviewed(prepared, response, store, "g", operation_id=operation, actor="admin:1", expected_revision=0)
+        == receipt
+    )
+    with pytest.raises(Conflict):
+        apply_reviewed(
+            prepared, response, store, "g", operation_id=uuid.uuid4().hex, actor="admin:1", expected_revision=0
+        )
+    with pytest.raises(Conflict):
+        apply_reviewed(prepared, response, store, "g", operation_id=operation, actor="admin:2", expected_revision=0)
+
+
+def test_all_uncertain_proposal_is_not_applied(case):
+    import uuid
+    from semora.curation.proposals import apply_reviewed
+
+    store, prepared, response = case
+    response["decisions"][0]["decision"] = "uncertain"
+    with pytest.raises(ValueError, match="No additional"):
+        apply_reviewed(
+            prepared, response, store, "g", operation_id=uuid.uuid4().hex, actor="admin:1", expected_revision=0
+        )
+    assert store.groups() == []
