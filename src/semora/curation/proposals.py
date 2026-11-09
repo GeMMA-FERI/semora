@@ -18,6 +18,12 @@ This is vocabulary curation, not article-by-article entity identification.
 Start with the spellings. Include obvious OCR, accent, spacing or grammatical
 variants directly, without passages. Keep distinct names separate. A person and
 an organization named after them are not equivalent names.
+Decisions describe membership in the anchor's group, not which raw spellings to
+discard. include = this is an equivalent spelling; MERGE it into this group.
+exclude = this is a DISTINCT name; KEEP IT SEPARATE from this group.
+A duplicate, typo or accent variant must be include, never exclude merely
+because it is a duplicate. For example, for anchor ljubljana, ljubijana is include
+(OCR variant), while maribor is exclude (a different place).
 If spelling alone is ambiguous, choose needs_evidence to request a small context
 lookup, or uncertain if context would not settle it. Never invent a spelling.
 Use an empty evidence_ids list for spelling-only decisions. Never invent IDs.
