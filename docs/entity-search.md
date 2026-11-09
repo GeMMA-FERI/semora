@@ -130,3 +130,11 @@ Back up curation using SQLite's backup API or a consistent stopped-writer copy;
 never delete it when rebuilding derived indexes. Focused tests are
 `test_curation_store.py`, `test_curation_catalogue.py`, and
 `test_curated_retrieval.py`; the last uses the existing trusted spellfix fixture.
+
+## On-demand curation counts
+
+`count_articles` reuses the cached distinct count for the current publication
+and normalized member set. Metadata-only edits and their undo carry valid cache
+rows forward within the audited transaction; record versions remain monotonic.
+An in-flight count can be saved after metadata edits if its membership hash still
+matches. Membership changes or another publication require a new explicit count.

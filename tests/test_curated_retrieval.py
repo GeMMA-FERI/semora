@@ -152,3 +152,58 @@ def test_preferred_name_cannot_shadow_unrelated_raw_names(curated):
     prefix = reader.discovery("Marija*")
     assert any(item["name"] == "Marija 002" for item in prefix["entities"])
     assert prefix["limited"]
+
+
+def test_cached_count_skips_membership_scan_and_survives_metadata_edit(curated):
+    import sqlite3
+
+    reader, group, _ = curated
+    reader.store.save_count(reader.count_articles(group))
+    scans = []
+
+    def observe(action, table, *rest):
+        if action == sqlite3.SQLITE_READ and table == "entity_articles":
+            scans.append(table)
+        return sqlite3.SQLITE_OK
+
+    reader.connection.set_authorizer(observe)
+    try:
+        assert reader.count_articles(group)["article_count"] == 110
+        reader.store.mutate(
+            "update_group",
+            dict(group_id=group, preferred_name="Renamed", description="Note", members=["Ana Novak", "Marija 000"]),
+            operation_id=str(uuid.uuid4()),
+            actor="a",
+            expected_revision=1,
+        )
+        assert reader.count_articles(group)["article_count"] == 110
+        assert not scans
+        reader.store.connection.execute("UPDATE group_counts SET publication='old'")
+        reader.store.connection.commit()
+        assert reader.count_articles(group)["article_count"] == 110
+        assert scans
+    finally:
+        reader.connection.set_authorizer(None)
+
+
+def test_inflight_count_survives_metadata_edit_only(curated):
+    reader, group, _ = curated
+    count = reader.count_articles(group)
+    reader.store.mutate(
+        "update_group",
+        dict(group_id=group, preferred_name="Renamed", members=["Ana Novak", "Marija 000"]),
+        operation_id=str(uuid.uuid4()),
+        actor="a",
+        expected_revision=1,
+    )
+    reader.store.save_count(count)
+    assert reader.preview_group(group)["article_count"] == 110
+    reader.store.mutate(
+        "update_group",
+        dict(group_id=group, preferred_name="Renamed", members=["Marija 000"]),
+        operation_id=str(uuid.uuid4()),
+        actor="a",
+        expected_revision=2,
+    )
+    with pytest.raises(ValueError, match="changed"):
+        reader.store.save_count(count)

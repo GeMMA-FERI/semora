@@ -8,6 +8,7 @@ from datetime import date
 from semora.ner.names import normalize_name
 
 from .catalogue import CurationCatalogue, review_read
+from .store import membership_key
 
 
 class CuratedRetrieval(CurationCatalogue):
@@ -172,6 +173,19 @@ class CuratedRetrieval(CurationCatalogue):
     @review_read
     def count_articles(self, group_id):
         group = self.store.group(group_id)
+        cached = self.store.connection.execute(
+            "SELECT article_count FROM group_counts WHERE group_id=? AND publication=? AND revision=?",
+            (group_id, self.entities.generation, group["version"]),
+        ).fetchone()
+        if cached is not None:
+            return {
+                "group_id": group_id,
+                "article_count": cached[0],
+                "generation": self.entities.generation,
+                "curation_revision": self.store.metadata()["revision"],
+                "group_version": group["version"],
+                "membership_key": membership_key(group["members"]),
+            }
         # Exact, potentially expensive work is a separate bounded admin job, never discovery work.
         parts = []
         parameters: list[str] = []
@@ -198,4 +212,5 @@ class CuratedRetrieval(CurationCatalogue):
             "generation": self.entities.generation,
             "curation_revision": self.store.metadata()["revision"],
             "group_version": group["version"],
+            "membership_key": membership_key(group["members"]),
         }

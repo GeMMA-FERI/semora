@@ -162,3 +162,45 @@ def test_receipts_distinguish_group_creation_from_undo_dissolution(store):
     undone = mutate(store, "undo_change", {"operation_id": created["operation_id"]})
     assert undone["group_id"] == created["group_id"]
     assert undone["group_exists"] is False
+
+
+def test_metadata_edits_and_undo_promote_counts_but_keep_record_versions(store):
+    created = mutate(store)
+    group_id = created["group_id"]
+    version = store.group(group_id)["version"]
+    store.save_count(dict(group_id=group_id, group_version=version, generation="g", article_count=10))
+    edited = mutate(
+        store,
+        "update_group",
+        dict(group_id=group_id, preferred_name="City", description="Note", members=["Ljubljana", "Ljubljani"]),
+    )
+    assert store.group(group_id)["version"] > version
+    mutate(store, "undo_change", dict(operation_id=edited["operation_id"]))
+    current = store.group(group_id)["version"]
+    assert current > edited["revision"]
+    assert (
+        store.connection.execute("SELECT article_count FROM group_counts WHERE revision=?", (current,)).fetchone()[0]
+        == 10
+    )
+    mutate(store, "update_group", dict(group_id=group_id, preferred_name="City", members=["Ljubljana"]))
+    assert (
+        store.connection.execute(
+            "SELECT 1 FROM group_counts WHERE revision=?", (store.group(group_id)["version"],)
+        ).fetchone()
+        is None
+    )
+
+
+def test_metadata_roundtrip_does_not_erase_undo_conflicts(store):
+    group_id = mutate(store)["group_id"]
+
+    def rename(name):
+        return mutate(
+            store, "update_group", dict(group_id=group_id, preferred_name=name, members=["Ljubljana", "Ljubljani"])
+        )
+
+    first = rename("B")
+    rename("C")
+    rename("B")
+    with pytest.raises(Conflict):
+        mutate(store, "undo_change", dict(operation_id=first["operation_id"]))

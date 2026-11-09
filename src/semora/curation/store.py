@@ -23,6 +23,11 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def membership_key(members):
+    """Stable count identity, independent of display metadata and audit revisions."""
+    return hashlib.sha256(_json(sorted(members)).encode()).hexdigest()
+
+
 def _text(value, field, maximum=2000):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum or "\x00" in value:
         raise ValueError(f"{field} must be nonblank text of at most {maximum} characters.")
@@ -159,9 +164,13 @@ class CurationStore:
         """Persist only a complete count for the still-current curation revision."""
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            if self.group(result["group_id"])["version"] != result["group_version"]:
+            current = self.group(result["group_id"])
+            if "membership_key" in result:
+                unchanged = result["membership_key"] == membership_key(current["members"])
+            else:
+                unchanged = current["version"] == result["group_version"]
+            if not unchanged:
                 raise Conflict("Curation changed while counting; retry the count.")
-            self.group(result["group_id"])
             count = result["article_count"]
             if type(count) is not int or count < 0:
                 raise ValueError("Expected an exact nonnegative count.")
@@ -279,6 +288,17 @@ class CurationStore:
             result = {"operation_id": operation_id, "revision": revision + 1, "group_id": group_id}
             after = self._capture(group_id, pair)
             result["group_exists"] = after["group"] is not None
+            if (
+                before["group"] is not None
+                and after["group"] is not None
+                and before["group"]["members"] == after["group"]["members"]
+            ):
+                # Promote valid counts atomically, preserving monotonic record revisions for undo.
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO group_counts SELECT group_id,publication,?,article_count "
+                    "FROM group_counts WHERE group_id=? AND revision=?",
+                    (after["group"]["version"], group_id, before["group"]["version"]),
+                )
             self.connection.execute("UPDATE curation_metadata SET revision=? WHERE id=1", (revision + 1,))
             self.connection.execute(
                 "INSERT INTO curation_changes(operation_id,actor,request_hash,action,"
