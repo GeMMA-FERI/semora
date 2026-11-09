@@ -142,32 +142,44 @@ matches. Membership changes or another publication require a new explicit count.
 
 ## Model-assisted consolidation proposals
 
-`semora.curation.proposals` prepares model-independent message/schema tasks from
-bounded catalogue candidates and source evidence. `prepare_task()` defaults to
-eight candidates (maximum twelve) and two passages per name; it preserves existing
-members, excludes transfers from other groups and requires anchor evidence.
-Groups above twenty members stay in manual review. Sampling limitations are
-included in the prompt; historical text is data, never model instructions.
+`semora.curation.proposals` owns versioned model-independent tasks and validation.
+Version 2 starts with name spellings only: no article queries or snippets.
+`prepare_task()` defaults to eight candidates (maximum twelve), preserves existing
+members and excludes transfers from other groups. Groups above twenty members
+stay in manual review. The compact prompt omits backend IDs/state and requests
+low reasoning, concise reasons and a 1,536-token output budget.
 
-`validate_response()` requires exactly one include/exclude/uncertain decision per
-candidate and valid source references for both anchor and included spelling. The
-preferred name must be selected, existing members cannot disappear, and rejected
-pairs remain separate. These are mechanical checks, not proof of name identity.
-Humans approve semantic equivalence, including person/organization ambiguity.
+The model can include obvious OCR, accent, spacing or grammatical variants directly,
+exclude distinct names, mark uncertainty, or request context with `needs_evidence`.
+`review_response()` handles at most one context round: three requested names plus
+the anchor, one bounded passage each. Missing samples and requests above the budget
+become uncertain. The follow-up cannot request another round. Sampling limitations
+are explicit; source text is data, never instructions. This is vocabulary grouping,
+not article-by-article identity annotation.
+
+`validate_response()` requires exactly one decision per candidate, known names and
+evidence IDs, an included spelling as preferred name, preserved existing members
+and no rejected pairs. Spelling-only inclusions use an empty evidence list. An
+inclusion citing context must reference both anchor and candidate. Persisted v1
+proposals retain their original mandatory-citation rule and 1,000-character reason
+limit; v2 reasons are limited to 240 characters. Unresolved context requests cannot
+be applied or exported as reviewed targets. Mechanical validation does not prove
+semantic equivalence; admins still approve every group.
 
 Tasks retain corpus/publication, relevant memberships, group version, rejected
-pairs, prompt/schema and a full fingerprint. Unrelated edits do not invalidate
-them. Preparation/validation bracket reads with revision checks; `apply_reviewed()`
-uses a current transactional revision and the existing idempotent, audited store.
-Same-operation receipt replay remains safe after later edits. The original source
-and entity dictionary are unchanged, and no article count is scheduled implicitly.
+pairs, prompt/schema and a full fingerprint. Context rounds retain the parent
+fingerprint and initial decisions as user-context data. Unrelated edits do not
+invalidate them. Revision guards bracket preparation, validation and optional
+context lookup; `apply_reviewed()` uses the existing transactional, idempotent,
+audited store. Same-operation receipt replay remains safe after later edits.
+Source text and the entity dictionary are unchanged; counts remain on demand.
 
-NORA supplies generic idle-time inference and full attempt transcripts; AIDHCH
-owns authorization, the durable backlog, proposal review and application requests.
-Semora neither schedules a model nor decides when the host is idle.
+NORA supplies generic inference, per-task reasoning controls and full attempt
+transcripts. AIDHCH owns the backlog, round coordination, admin review and history.
+Semora does not schedule the model or decide when the host is idle.
 
-`training_example()` exports only accepted/edited human targets, validates them
-against the recorded task state and preserves proposal/attempt IDs. Historical
-examples remain exportable after later publications; that does not authorize
-applying their obsolete proposals. Raw model attempts and rejection decisions
-remain separate records. Tests: `tests/test_curation_proposals.py`.
+`training_example()` exports accepted/edited human targets validated against the
+recorded task state. The unreviewed first-round answer is not an assistant training
+target in the context-round export; raw exchanges remain separately retained.
+Historical examples remain exportable after later publications, without authorizing
+application of obsolete proposals. Tests: `tests/test_curation_proposals.py`.
