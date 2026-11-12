@@ -11,6 +11,7 @@ from typing import Any
 
 from semora.retrieval.models import SearchHit, SourceExcerpt
 from semora.retrieval.publication import read_publication
+from semora.retrieval.scope import resolve_scope
 from semora.storage import Database
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
@@ -656,6 +657,42 @@ class SearchEngine:
         if state is None or int(state["indexed_articles"]) == 0:
             raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
 
+    def _materialize_match(self, row: Any, newspaper_contents: dict[str, str] | None = None) -> dict[str, Any]:
+        """Fetch article text only after selection, sharing issue text per result page."""
+        full = self.database.conn.execute(
+            """
+            SELECT articles.*, articles.title AS article_title,
+                   newspapers.source, newspapers.title AS newspaper_title,
+                   newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
+                   newspapers.relative_path
+            FROM articles JOIN newspapers ON newspapers.newspaper_id=articles.newspaper_id
+            WHERE articles.article_id=? AND articles.is_valid=1
+            """,
+            (row["article_id"],),
+        ).fetchone()
+        if full is None:
+            raise ValueError("Article changed during retrieval; restart search.")
+        match = dict(full)
+        contents = newspaper_contents if newspaper_contents is not None else {}
+        issue = str(match["document_id"])
+        if issue not in contents:
+            source = self.database.conn.execute(
+                "SELECT content FROM newspapers WHERE newspaper_id=?",
+                (issue,),
+            ).fetchone()
+            if source is None:
+                raise ValueError("Newspaper changed during retrieval; restart search.")
+            contents[issue] = str(source["content"])
+        match["newspaper_content"] = contents[issue]
+        if "_focus_char" in row.keys():
+            match["_focus_char"] = row["_focus_char"]
+        elif "_focus_query" in row.keys():
+            match["_focus_char"] = _query_focus_char(match, str(row["_focus_query"]))
+        if "rank" in row.keys():
+            match["rank"] = row["rank"]
+        return match
+
+
     def _search_regex(
         self,
         pattern: str,
@@ -666,35 +703,83 @@ class SearchEngine:
         date_from: str | None,
         date_to: str | None,
     ) -> list[tuple[Any, float]]:
+        from collections.abc import Iterator
+
+
         expression = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
-        results: list[tuple[Any, float]] = []
-        articles = self.database.conn.execute(
+        connection = self.database.conn
+        scope = resolve_scope(connection, newspaper, date_from, date_to)
+        if self._active_profile is not None:
+            self._active_profile["regex_articles_examined"] = 0
+        if scope.filtered and scope.issue_ids == ():
+            return []
+
+        if scope.filtered:
+            issue_cte, parameters = scope.issues_cte()
+            candidate_sql = f"""
+                WITH {issue_cte}
+                SELECT articles.article_id
+                FROM selected_issues
+                CROSS JOIN articles ON articles.newspaper_id = selected_issues.newspaper_id
+                WHERE articles.is_valid = 1
+                ORDER BY articles.article_id
             """
-            SELECT articles.*, articles.title AS article_title,
-                   newspapers.source, newspapers.title AS newspaper_title,
-                   newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
-                   newspapers.relative_path, newspapers.content AS newspaper_content
-            FROM articles
-            JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
-            WHERE articles.is_valid = 1
-              AND (? IS NULL OR newspapers.source = ? OR newspapers.title = ?)
-              AND (? IS NULL OR newspapers.date >= ?)
-              AND (? IS NULL OR newspapers.date <= ?)
-            ORDER BY articles.article_id
-            """,
-            (newspaper, newspaper, newspaper, date_from, date_from, date_to, date_to),
-        )
-        for article in articles:
-            match = expression.search(str(article["content"]))
-            if match is None:
-                continue
-            row = dict(article)
-            content_start = int(row["char_end"]) - len(str(row["content"]))
-            row["_focus_char"] = content_start + match.start()
-            results.append((row, 1.0))
-            if len(results) >= limit:
-                break
-        return results
+        else:
+            parameters = ()
+            candidate_sql = """
+                SELECT article_id, content, char_end FROM articles
+                WHERE is_valid = 1 ORDER BY article_id
+            """
+        if self._active_profile is not None:
+            self._active_profile["query_plans"]["regex_candidates"] = [
+                str(row["detail"])
+                for row in connection.execute("EXPLAIN QUERY PLAN " + candidate_sql, parameters)
+            ]
+
+        def article_rows() -> Iterator[sqlite3.Row]:
+            candidates = connection.execute(candidate_sql, parameters)
+            try:
+                if not scope.filtered:
+                    yield from candidates
+                    return
+                # Sort only IDs in the scoped candidate query, never article/source
+                # blobs. Bounded reads preserve global article order across issues.
+                batch_size = min(64, limit)
+                while batch := candidates.fetchmany(batch_size):
+                    ids = tuple(row["article_id"] for row in batch)
+                    placeholders = ",".join("?" for _ in ids)
+                    rows = connection.execute(
+                        "SELECT article_id,content,char_end FROM articles WHERE article_id IN ("
+                        + placeholders
+                        + ") ORDER BY article_id",
+                        ids,
+                    )
+                    try:
+                        yield from rows
+                    finally:
+                        rows.close()
+            finally:
+                candidates.close()
+
+        selected: list[dict[str, Any]] = []
+        rows = article_rows()
+        try:
+            for article in rows:
+                if self._active_profile is not None:
+                    self._active_profile["regex_articles_examined"] += 1
+                match = expression.search(str(article["content"]))
+                if match is None:
+                    continue
+                content_start = int(article["char_end"]) - len(str(article["content"]))
+                selected.append(
+                    {"article_id": article["article_id"], "_focus_char": content_start + match.start()}
+                )
+                if len(selected) >= limit:
+                    break
+        finally:
+            rows.close()
+        newspaper_contents: dict[str, str] = {}
+        return [(self._materialize_match(row, newspaper_contents), 1.0) for row in selected]
 
     def _search_semantic(
         self,
