@@ -313,3 +313,38 @@ def test_evidence_does_not_override_restricted_spelling_policy(catalogue):
     target.update(decision="include", evidence_ids=["e0-0", "e1-0"])
     result = evaluate_response(catalogue, follow_up, response)
     assert result["status"] == "deferred" and "marina" not in result["validated"]["members"]
+
+
+def test_published_members_retain_bounded_decisions_and_evidence_references(catalogue):
+    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    response = answer(prepared, decision="uncertain")
+    next(d for d in response["decisions"] if d["name"] == "ljubijana")["decision"] = "needs_evidence"
+    catalogue.evidence = lambda name, **kw: {
+        "sampling": "bounded",
+        "passages": [{"passage": f"source passage for {name}"}],
+    }
+    follow_up = evaluate_response(catalogue, prepared, response)["prepared"]
+    response = answer(follow_up, decision="uncertain")
+    next(d for d in response["decisions"] if d["name"] == "ljubijana").update(
+        decision="include", reason="\u00e9" * 240, evidence_ids=["e0-0", "e1-0"]
+    )
+    evaluated = evaluate_response(catalogue, follow_up, response)
+    assert evaluated["status"] == "accepted"
+    catalogue.store.configure_serving(True, settings_revision=1, operation_id=uuid.uuid4().hex)
+    operation = uuid.uuid4().hex
+    metadata = {"model_configuration_id": "model-1", "settings_revision": 1}
+    result = apply_autonomous(catalogue, follow_up, response, operation_id=operation, provenance=metadata)
+    group = catalogue.store.group(result["group_id"])
+    retained = group["member_provenance"]["ljubijana"]["provenance"]
+    assert retained["accepted_decisions"] == [
+        {
+            "name": "ljubijana",
+            "reason": "\u00e9" * 120,
+            "reason_truncated": True,
+            "evidence_ids": ["e0-0", "e1-0"],
+        }
+    ]
+    assert retained["evidence_ids"] == ["e0-0", "e1-0"]
+    assert "passages" not in retained and "evidence" not in retained
+    assert len(evaluated["response"]["decisions"][0]["reason"]) == 240
+    assert apply_autonomous(catalogue, follow_up, response, operation_id=operation, provenance=metadata) == result

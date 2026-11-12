@@ -402,12 +402,29 @@ def apply_autonomous(
     }
     if not isinstance(provenance, dict):
         raise ValueError("Autonomous provenance must be an object.")
+    decisions = []
+    for decision in selected["decisions"]:
+        if decision["decision"] != "include":
+            continue
+        reason = decision["reason"].encode("utf-8")
+        recorded_decision = {
+            "name": decision["name"],
+            "reason": reason[:240].decode("utf-8", errors="ignore"),
+            "evidence_ids": list(decision["evidence_ids"]),
+        }
+        if len(reason) > 240:
+            recorded_decision["reason_truncated"] = True
+        decisions.append(recorded_decision)
+    # Retain direct decision references without duplicating source passages. Full
+    # reasons and evidence remain in evaluation receipts; the store enforces 16KiB.
     provenance = {
         **provenance,
         "policy_version": POLICY_VERSION,
         "prompt_version": context["prompt_version"],
         "generation": context["generation"],
         "prepared_fingerprint": prepared["fingerprint"],
+        "accepted_decisions": decisions,
+        "evidence_ids": sorted({reference for decision in decisions for reference in decision["evidence_ids"]}),
     }
 
     def validate():
