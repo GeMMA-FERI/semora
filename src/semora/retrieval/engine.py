@@ -11,7 +11,7 @@ from typing import Any
 
 from semora.retrieval.models import SearchHit, SourceExcerpt
 from semora.retrieval.publication import read_publication
-from semora.retrieval.scope import resolve_scope
+from semora.retrieval.scope import SearchScope, resolve_scope
 from semora.storage import Database
 
 DEFAULT_MAX_SNIPPET_CHARS = 600
@@ -496,15 +496,17 @@ class SearchEngine:
         date_to: str | None,
         offset: int = 0,
     ) -> list[tuple[Any, float]]:
-        return self._search_fts(
-            "article_fts",
-            query,
-            limit,
-            newspaper,
-            date_from,
-            date_to,
-            offset,
-            focus_query=query,
+        return self._materialize_matches(
+            self._search_fts(
+                "article_fts",
+                query,
+                limit,
+                newspaper,
+                date_from,
+                date_to,
+                offset,
+                focus_query=query,
+            )
         )
 
     def _search_lemma_bm25(
@@ -517,15 +519,17 @@ class SearchEngine:
         offset: int = 0,
     ) -> list[tuple[Any, float]]:
         self._require_lemma_index()
-        return self._search_fts(
-            "article_lemma_fts",
-            query,
-            limit,
-            newspaper,
-            date_from,
-            date_to,
-            offset,
-            focus_query=query,
+        return self._materialize_matches(
+            self._search_fts(
+                "article_lemma_fts",
+                query,
+                limit,
+                newspaper,
+                date_from,
+                date_to,
+                offset,
+                focus_query=query,
+            )
         )
 
     def _search_combined_bm25(
@@ -540,8 +544,30 @@ class SearchEngine:
     ) -> list[tuple[Any, float]]:
         requested = offset + limit
         candidate_limit = max(50, requested * 5)
-        surface = self._search_bm25(query, candidate_limit, newspaper, date_from, date_to)
-        lemma = self._search_lemma_bm25(query, candidate_limit, newspaper, date_from, date_to)
+        scope = resolve_scope(self.database.conn, newspaper, date_from, date_to)
+        surface = self._search_fts(
+            "article_fts",
+            query,
+            candidate_limit,
+            newspaper,
+            date_from,
+            date_to,
+            0,
+            focus_query=query,
+            scope=scope,
+        )
+        self._require_lemma_index()
+        lemma = self._search_fts(
+            "article_lemma_fts",
+            query,
+            candidate_limit,
+            newspaper,
+            date_from,
+            date_to,
+            0,
+            focus_query=query,
+            scope=scope,
+        )
         combined: dict[str, tuple[Any, float]] = {}
         for row, score in surface:
             combined[str(row["article_id"])] = (row, score)
@@ -553,7 +579,7 @@ class SearchEngine:
             combined.values(),
             key=lambda item: (-item[1], str(item[0]["article_id"])),
         )
-        return ranked[offset:requested]
+        return self._materialize_matches(ranked[offset:requested])
 
     def _search_fts(
         self,
@@ -566,96 +592,75 @@ class SearchEngine:
         offset: int,
         *,
         focus_query: str,
+        scope: SearchScope | None = None,
     ) -> list[tuple[Any, float]]:
         if table not in {"article_fts", "article_lemma_fts"}:
             raise ValueError(f"Unsupported FTS table: {table}")
-        sql = f"""
-            SELECT articles.*, articles.title AS article_title,
-                   newspapers.source, newspapers.title AS newspaper_title,
-                   newspapers.date, newspapers.urn, newspapers.newspaper_id AS document_id,
-                   newspapers.relative_path, newspapers.content AS newspaper_content,
-                   bm25({table}, 2.0, 1.0) AS rank
-            FROM {table}
-            JOIN article_fts_map ON article_fts_map.fts_id = {table}.rowid
-            JOIN articles ON articles.article_id = article_fts_map.article_id
-            JOIN newspapers ON newspapers.newspaper_id = articles.newspaper_id
-            WHERE {table} MATCH ?
-              AND articles.is_valid = 1
-              AND (? IS NULL OR newspapers.source = ? OR newspapers.title = ?)
-              AND (? IS NULL OR newspapers.date >= ?)
-              AND (? IS NULL OR newspapers.date <= ?)
-            ORDER BY rank, articles.article_id
-            LIMIT ? OFFSET ?
+        scope = scope if scope is not None else resolve_scope(self.database.conn, newspaper, date_from, date_to)
+        if scope.narrow:
+            issues, issue_parameters = scope.issues_cte()
+            # Keep the original FTS table: row-ID restriction changes eligible
+            # documents without changing BM25's corpus statistics or weights.
+            sql = f"""
+                WITH {issues}, selected_articles AS MATERIALIZED (
+                    SELECT m.fts_id, a.article_id
+                    FROM selected_issues AS i
+                    CROSS JOIN articles AS a ON a.newspaper_id=i.newspaper_id
+                    JOIN article_fts_map AS m ON m.article_id=a.article_id
+                    WHERE a.is_valid=1
+                )
+                SELECT selected_articles.article_id, bm25({table}, 2.0, 1.0) AS rank
+                FROM {table}
+                JOIN selected_articles ON selected_articles.fts_id={table}.rowid
+                WHERE {table} MATCH ?
+                  AND {table}.rowid IN (SELECT fts_id FROM selected_articles)
+                ORDER BY rank, selected_articles.article_id
+                LIMIT ? OFFSET ?
             """
-        parameters = (
-            query,
-            newspaper,
-            newspaper,
-            newspaper,
-            date_from,
-            date_from,
-            date_to,
-            date_to,
-            limit,
-            offset,
-        )
+            parameters = (*issue_parameters, query, limit, offset)
+        else:
+            predicate, filter_parameters = scope.filter_sql()
+            sql = f"""
+                SELECT articles.article_id, bm25({table}, 2.0, 1.0) AS rank
+                FROM {table}
+                JOIN article_fts_map ON article_fts_map.fts_id={table}.rowid
+                JOIN articles ON articles.article_id=article_fts_map.article_id
+                JOIN newspapers ON newspapers.newspaper_id=articles.newspaper_id
+                WHERE {table} MATCH ? AND articles.is_valid=1 AND {predicate}
+                ORDER BY rank, articles.article_id
+                LIMIT ? OFFSET ?
+            """
+            parameters = (query, *filter_parameters, limit, offset)
         if self._active_profile is not None:
             plan_started = time.perf_counter()
-            plan = self.database.conn.execute(
-                f"EXPLAIN QUERY PLAN {sql}",
-                parameters,
-            ).fetchall()
+            plan = self.database.conn.execute(f"EXPLAIN QUERY PLAN {sql}", parameters).fetchall()
             self._active_profile["query_plans"][table] = [str(row["detail"]) for row in plan]
+            self._active_profile.setdefault("fts_strategies", {})[table] = (
+                "scope-first" if scope.narrow else "text-first"
+            )
             self._record_profile_time("query_planning", plan_started)
         sql_started = time.perf_counter()
+        if scope.narrow:
+            # An empty row-ID list otherwise bypasses FTS query parsing. An
+            # exact one-row seek preserves malformed-query errors without a
+            # global match scan, even when the selected scope has no FTS rows.
+            self.database.conn.execute(
+                f"SELECT rowid FROM {table} WHERE {table} MATCH ? AND rowid=0 LIMIT 1",
+                (query,),
+            ).fetchall()
         rows = self.database.conn.execute(sql, parameters).fetchall()
         self._record_profile_time(f"{table}_sql", sql_started)
         result_started = time.perf_counter()
-        results: list[tuple[Any, float]] = []
-        for row in rows:
-            match = dict(row)
-            match["_focus_char"] = _query_focus_char(match, focus_query)
-            results.append((match, -float(row["rank"])))
+        results = [
+            ({"article_id": row["article_id"], "rank": row["rank"], "_focus_query": focus_query}, -float(row["rank"]))
+            for row in rows
+        ]
         self._record_profile_time("fts_result_processing", result_started)
         return results
 
-    def _record_profile_time(self, name: str, started: float) -> None:
-        if self._active_profile is None:
-            return
-        timings = self._active_profile["timings_seconds"]
-        timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
-
-    def _sqlite_profile(self) -> dict[str, Any]:
-        profile = self._active_profile
-        assert profile is not None
-        page_size = int(self.database.conn.execute("PRAGMA page_size").fetchone()[0])
-        page_count = int(self.database.conn.execute("PRAGMA page_count").fetchone()[0])
-        cache_setting = int(self.database.conn.execute("PRAGMA cache_size").fetchone()[0])
-        mmap_size = int(self.database.conn.execute("PRAGMA mmap_size").fetchone()[0])
-        cache_bytes = abs(cache_setting) * 1024 if cache_setting < 0 else cache_setting * page_size
-        plans = [step for plan in profile["query_plans"].values() for step in plan]
-        warnings = []
-        if cache_bytes < 64 * 1024**2:
-            warnings.append("SQLite page cache is below 64 MiB; random joins may repeatedly read from disk.")
-        if mmap_size == 0:
-            warnings.append("SQLite memory-mapped I/O is disabled.")
-        if any("USE TEMP B-TREE FOR ORDER BY" in step for step in plans):
-            warnings.append("SQLite sorts all FTS matches by BM25 rank before LIMIT; common terms can be expensive.")
-        return {
-            "database_size_bytes": page_size * page_count,
-            "page_size_bytes": page_size,
-            "page_count": page_count,
-            "cache_size_bytes": cache_bytes,
-            "mmap_size_bytes": mmap_size,
-            "warnings": warnings,
-        }
-
-    def _require_lemma_index(self) -> None:
-        state = self.database.conn.execute(
-            "SELECT indexed_articles FROM article_lemma_index_state WHERE state_id = 1"
-        ).fetchone()
-        if state is None or int(state["indexed_articles"]) == 0:
-            raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
+    def _materialize_matches(self, matches: list[tuple[Any, float]]) -> list[tuple[Any, float]]:
+        newspaper_contents: dict[str, str] = {}
+        return [(self._materialize_match(row, newspaper_contents), score) for row, score in matches]
 
     def _materialize_match(self, row: Any, newspaper_contents: dict[str, str] | None = None) -> dict[str, Any]:
         """Fetch article text only after selection, sharing issue text per result page."""
@@ -692,6 +697,55 @@ class SearchEngine:
             match["rank"] = row["rank"]
         return match
 
+    def _record_profile_time(self, name: str, started: float) -> None:
+        if self._active_profile is None:
+            return
+        timings = self._active_profile["timings_seconds"]
+        timings[name] = timings.get(name, 0.0) + time.perf_counter() - started
+
+    def _sqlite_profile(self) -> dict[str, Any]:
+        profile = self._active_profile
+        assert profile is not None
+        page_size = int(self.database.conn.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(self.database.conn.execute("PRAGMA page_count").fetchone()[0])
+        cache_setting = int(self.database.conn.execute("PRAGMA cache_size").fetchone()[0])
+        mmap_size = int(self.database.conn.execute("PRAGMA mmap_size").fetchone()[0])
+        cache_bytes = abs(cache_setting) * 1024 if cache_setting < 0 else cache_setting * page_size
+        plans = [
+            step
+            for name, plan in profile["query_plans"].items()
+            if name in {"article_fts", "article_lemma_fts"}
+            for step in plan
+        ]
+        warnings = []
+        if cache_bytes < 64 * 1024**2:
+            warnings.append("SQLite page cache is below 64 MiB; random joins may repeatedly read from disk.")
+        if mmap_size == 0:
+            warnings.append("SQLite memory-mapped I/O is disabled.")
+        if any("USE TEMP B-TREE FOR ORDER BY" in step for step in plans):
+            strategies = profile.get("fts_strategies", {})
+            if strategies and all(strategy == "scope-first" for strategy in strategies.values()):
+                warnings.append("SQLite sorts scoped FTS matches by BM25 rank before LIMIT.")
+            else:
+                warnings.append(
+                    "SQLite sorts eligible FTS matches by BM25 rank before LIMIT; "
+                    "broad common-term searches can be expensive."
+                )
+        return {
+            "database_size_bytes": page_size * page_count,
+            "page_size_bytes": page_size,
+            "page_count": page_count,
+            "cache_size_bytes": cache_bytes,
+            "mmap_size_bytes": mmap_size,
+            "warnings": warnings,
+        }
+
+    def _require_lemma_index(self) -> None:
+        state = self.database.conn.execute(
+            "SELECT indexed_articles FROM article_lemma_index_state WHERE state_id = 1"
+        ).fetchone()
+        if state is None or int(state["indexed_articles"]) == 0:
+            raise ValueError("Build the lemma index with 'semora index lemma' before lemma search.")
 
     def _search_regex(
         self,
