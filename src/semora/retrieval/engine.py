@@ -89,6 +89,16 @@ class SearchEngine:
             self._entity_search = EntitySearch(self, self.entity_dir)
         return self._entity_search
 
+    def configure_curation(self, path: str | Path | None) -> None:
+        """Select an existing read-only sidecar; never initialize or migrate it."""
+        selected = Path(path).resolve() if path is not None else None
+        if selected == self._curation_path:
+            return
+        if self._curation_store is not None:
+            self._curation_store.close()
+            self._curation_store = None
+        self._curation_path = selected
+
     def search_entities(self, query: str) -> dict:
         if self._curation_path is not None:
             return self._curated().discovery(query)
