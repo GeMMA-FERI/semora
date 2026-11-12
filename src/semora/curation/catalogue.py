@@ -175,13 +175,24 @@ class CurationCatalogue:
         }
 
     @review_read
-    def preview_group(self, group_id):
-        group = self.store.group(group_id)
+    def preview_group(self, group_id, *, include_provenance=True):
+        group = (
+            self.store.group(group_id)
+            if include_provenance is True
+            else self.store.group(group_id, include_provenance=include_provenance)
+        )
+        names = group["members"]
+        placeholders = ",".join("?" for _ in names)
+        resolved = {
+            row["normalized_name"]: row
+            for row in self.connection.execute(
+                f"SELECT normalized_name,name,article_count FROM names WHERE normalized_name IN ({placeholders})",
+                names,
+            )
+        }
         members = []
-        for name in group["members"]:
-            row = self.connection.execute(
-                "SELECT name,article_count FROM names WHERE normalized_name=?", (name,)
-            ).fetchone()
+        for name in names:
+            row = resolved.get(name)
             members.append(
                 {
                     "normalized_name": name,

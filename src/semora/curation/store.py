@@ -188,37 +188,82 @@ class CurationStore:
             ],
         }
 
-    def group(self, group_id):
-        group = self._legacy_group(group_id)
-        default = annotation("")
+    def group(self, group_id, *, include_provenance=True):
+        if type(include_provenance) is not bool:
+            raise ValueError("include_provenance must be a Boolean.")
+        rows = self.connection.execute("SELECT * FROM name_groups WHERE group_id=?", (group_id,)).fetchall()
+        if not rows:
+            raise ValueError("Unknown name group.")
+        return self._hydrate_groups(rows, include_provenance=include_provenance)[0]
+
+    def _hydrate_groups(self, rows, *, include_provenance=True):
+        if not rows:
+            return []
+        group_ids = [row["group_id"] for row in rows]
+        placeholders = ",".join("?" for _ in group_ids)
+        defaults = {group_id: self._unknown_annotation(include_provenance) for group_id in group_ids}
+        annotations = dict(defaults)
+        members = {group_id: {} for group_id in group_ids}
         if self.metadata()["schema_version"] == 1:
-            return {**group, **default, "member_provenance": {name: default for name in group["members"]}}
-        row = self.connection.execute("SELECT * FROM group_provenance WHERE group_id=?", (group_id,)).fetchone()
-        value = self._annotation_row(row) if row else default
-        members = {name: default for name in group["members"]}
-        for row in self.connection.execute(
-            "SELECT p.* FROM group_members m JOIN member_provenance p "
-            "ON p.normalized_name=m.normalized_name WHERE m.group_id=?",
-            (group_id,),
-        ):
-            members[row["normalized_name"]] = self._annotation_row(row)
-        origins = {item["origin"] for item in members.values()}
-        origin = next(iter(origins)) if len(origins) == 1 else "mixed"
-        return {
-            **group,
-            **value,
-            "origin": origin,
-            "human_reviewed": value["human_reviewed"] and all(item["human_reviewed"] for item in members.values()),
-            "member_provenance": members,
-        }
+            member_rows = self.connection.execute(
+                f"SELECT group_id,normalized_name FROM group_members WHERE group_id IN ({placeholders}) "
+                "ORDER BY group_id,normalized_name",
+                group_ids,
+            )
+            for row in member_rows:
+                members[row["group_id"]][row["normalized_name"]] = self._unknown_annotation(include_provenance)
+        else:
+            group_columns = "*" if include_provenance else "group_id,origin,human_reviewed"
+            for row in self.connection.execute(
+                f"SELECT {group_columns} FROM group_provenance WHERE group_id IN ({placeholders})",
+                group_ids,
+            ):
+                annotations[row["group_id"]] = self._annotation_row(row, include_provenance=include_provenance)
+            member_columns = ",p.provenance_json" if include_provenance else ""
+            for row in self.connection.execute(
+                "SELECT m.group_id,m.normalized_name,p.origin,p.human_reviewed" + member_columns + " "
+                "FROM group_members m LEFT JOIN member_provenance p ON p.normalized_name=m.normalized_name "
+                f"WHERE m.group_id IN ({placeholders}) ORDER BY m.group_id,m.normalized_name",
+                group_ids,
+            ):
+                members[row["group_id"]][row["normalized_name"]] = (
+                    self._annotation_row(row, include_provenance=include_provenance)
+                    if row["origin"] is not None
+                    else self._unknown_annotation(include_provenance)
+                )
+        result = []
+        for row in rows:
+            group_id = row["group_id"]
+            value = annotations[group_id]
+            member_values = members[group_id]
+            origins = {item["origin"] for item in member_values.values()}
+            origin = next(iter(origins)) if len(origins) == 1 else "mixed"
+            result.append(
+                {
+                    **dict(row),
+                    **value,
+                    "members": list(member_values),
+                    "origin": origin,
+                    "human_reviewed": value["human_reviewed"]
+                    and all(item["human_reviewed"] for item in member_values.values()),
+                    "member_provenance": member_values,
+                }
+            )
+        return result
 
     @staticmethod
-    def _annotation_row(row):
-        return {
-            "origin": row["origin"],
-            "human_reviewed": bool(row["human_reviewed"]),
-            "provenance": json.loads(row["provenance_json"]),
-        }
+    def _unknown_annotation(include_provenance):
+        value = annotation("")
+        if not include_provenance:
+            value.pop("provenance")
+        return value
+
+    @staticmethod
+    def _annotation_row(row, *, include_provenance=True):
+        value = {"origin": row["origin"], "human_reviewed": bool(row["human_reviewed"])}
+        if include_provenance:
+            value["provenance"] = json.loads(row["provenance_json"])
+        return value
 
     def _save_annotations(self, group_id, value, members):
         self.connection.execute(
@@ -281,15 +326,61 @@ class CurationStore:
             self.connection.rollback()
             raise
 
-    def groups(self, *, after="", limit=50):
+    def groups(self, *, after="", limit=50, summary=False):
+        if type(summary) is not bool:
+            raise ValueError("summary must be a Boolean.")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Use a group page size of 1-100.")
-        return [
-            self.group(r[0])
-            for r in self.connection.execute(
-                "SELECT group_id FROM name_groups WHERE group_id>? ORDER BY group_id LIMIT ?", (after, limit)
+        rows = self.connection.execute(
+            "SELECT * FROM name_groups WHERE group_id>? ORDER BY group_id LIMIT ?", (after, limit)
+        ).fetchall()
+        return self._group_summaries(rows) if summary else self._hydrate_groups(rows)
+
+    def _group_summaries(self, rows):
+        if not rows:
+            return []
+        ids = [row["group_id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        if self.metadata()["schema_version"] == 1:
+            sql = (
+                "SELECT g.group_id,COUNT(m.normalized_name) AS member_count "
+                "FROM name_groups g LEFT JOIN group_members m ON m.group_id=g.group_id "
+                f"WHERE g.group_id IN ({placeholders}) GROUP BY g.group_id"
             )
-        ]
+        else:
+            sql = (
+                "SELECT g.group_id,COUNT(m.normalized_name) AS member_count,"
+                "MAX(COALESCE(p.origin,'unknown')) AS last_origin,"
+                "MIN(COALESCE(p.origin,'unknown')) AS member_origin,"
+                "MIN(COALESCE(p.human_reviewed,0)) AS members_reviewed,"
+                "MAX(COALESCE(a.human_reviewed,0)) AS group_reviewed "
+                "FROM name_groups g LEFT JOIN group_members m ON m.group_id=g.group_id "
+                "LEFT JOIN member_provenance p ON p.normalized_name=m.normalized_name "
+                "LEFT JOIN group_provenance a ON a.group_id=g.group_id "
+                f"WHERE g.group_id IN ({placeholders}) GROUP BY g.group_id"
+            )
+        counts = {row["group_id"]: row for row in self.connection.execute(sql, ids)}
+        result = []
+        for row in rows:
+            counted = counts[row["group_id"]]
+            count = counted["member_count"]
+            modern = "member_origin" in counted.keys()
+            origin = (
+                (counted["member_origin"] if counted["member_origin"] == counted["last_origin"] else "mixed")
+                if modern
+                else "unknown"
+            )
+            result.append(
+                {
+                    **{key: row[key] for key in ("group_id", "preferred_name", "description", "version")},
+                    "member_count": count,
+                    "origin": origin if count else "mixed",
+                    "human_reviewed": bool(
+                        modern and counted["group_reviewed"] and (not count or counted["members_reviewed"])
+                    ),
+                }
+            )
+        return result
 
     def membership(self, name):
         row = self.connection.execute(
