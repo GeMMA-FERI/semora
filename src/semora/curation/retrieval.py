@@ -75,6 +75,8 @@ class CuratedRetrieval(CurationCatalogue):
                 {
                     "name": group["preferred_name"],
                     "group_id": group_id,
+                    "origin": group["origin"],
+                    "human_reviewed": group["human_reviewed"],
                     "matched_name": None if candidate.get("preferred_group") else candidate["name"],
                     "article_count": count[0] if count else None,
                     "count_status": "ready" if count else "pending",

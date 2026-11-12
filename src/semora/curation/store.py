@@ -6,10 +6,12 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from semora.ner.names import normalize_name
+
+from .provenance import annotation, autonomous_annotation, normalize_group
 
 NORMALIZATION = "nfc-casefold-whitespace-v1"
 MAX_MEMBERS = 100
@@ -48,6 +50,7 @@ class CurationStore:
         self.path = Path(path).resolve()
         if initialize and read_only:
             raise ValueError("Cannot initialize a read-only store.")
+        new_store = not self.path.exists()
         if initialize:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         mode = "ro" if read_only else ("rwc" if initialize else "rw")
@@ -90,15 +93,65 @@ class CurationStore:
                     )
             metadata = self.metadata()
             if (
-                metadata["schema_version"] != 1
+                metadata["schema_version"] not in (1, 2)
                 or metadata["corpus_id"] != corpus_id
                 or metadata["normalization"] != NORMALIZATION
             ):
                 raise ValueError("Curation store schema, corpus or normalization differs.")
+            if not read_only and metadata["schema_version"] == 1:
+                self._upgrade_provenance(backup=not new_store)
             if read_only:
                 self.connection.execute("PRAGMA query_only=ON")
         except BaseException:
             self.close()
+            raise
+
+    def _upgrade_provenance(self, *, backup=True):
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            # Interactive/count lanes can open together. Recheck after taking the writer lock.
+            if self.metadata()["schema_version"] != 1:
+                self.connection.rollback()
+                return
+            if backup:
+                path = self.path.with_name(self.path.name + ".schema1.backup-" + uuid.uuid4().hex)
+                # A separate read connection sees the committed schema1 snapshot while
+                # this connection holds the write reservation; self-backup would block.
+                with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as source:
+                    with closing(sqlite3.connect(path)) as target:
+                        source.backup(target)
+            for statement in (
+                "CREATE TABLE group_provenance (group_id TEXT PRIMARY KEY REFERENCES name_groups(group_id) "
+                "ON DELETE CASCADE, origin TEXT NOT NULL, "
+                "human_reviewed INTEGER NOT NULL CHECK(human_reviewed IN(0,1)), "
+                "provenance_json TEXT NOT NULL)",
+                "CREATE TABLE member_provenance (normalized_name TEXT PRIMARY KEY REFERENCES "
+                "group_members(normalized_name) ON DELETE CASCADE, origin TEXT NOT NULL, "
+                "human_reviewed INTEGER NOT NULL CHECK(human_reviewed IN(0,1)), provenance_json TEXT NOT NULL)",
+                "CREATE TABLE curation_serving (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL "
+                "CHECK(enabled IN(0,1)), settings_revision INTEGER NOT NULL CHECK(settings_revision>=0))",
+                "CREATE TABLE curation_setting_receipts (operation_id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, "
+                "result_json TEXT NOT NULL)",
+            ):
+                self.connection.execute(statement)
+            # Only an exact current snapshot with an explicit admin actor proves review.
+            # This visits the small sidecar audit, never the article corpus.
+            known = {}
+            for row in self.connection.execute("SELECT actor,after_json FROM curation_changes ORDER BY revision"):
+                state = json.loads(row["after_json"])
+                group = state.get("group")
+                if group is not None:
+                    known[state["group_id"]] = (group, annotation(row["actor"]))
+            for row in self.connection.execute("SELECT group_id FROM name_groups"):
+                group_id = row[0]
+                current = self._legacy_group(group_id)
+                prior = known.get(group_id)
+                value = prior[1] if prior and prior[0] == current else annotation("")
+                self._save_annotations(group_id, value, {name: value for name in current["members"]})
+            self.connection.execute("UPDATE curation_metadata SET schema_version=2 WHERE id=1")
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
             raise
 
     def close(self):
@@ -121,7 +174,7 @@ class CurationStore:
         finally:
             self.connection.rollback()
 
-    def group(self, group_id):
+    def _legacy_group(self, group_id):
         row = self.connection.execute("SELECT * FROM name_groups WHERE group_id=?", (group_id,)).fetchone()
         if row is None:
             raise ValueError("Unknown name group.")
@@ -134,6 +187,99 @@ class CurationStore:
                 )
             ],
         }
+
+    def group(self, group_id):
+        group = self._legacy_group(group_id)
+        default = annotation("")
+        if self.metadata()["schema_version"] == 1:
+            return {**group, **default, "member_provenance": {name: default for name in group["members"]}}
+        row = self.connection.execute("SELECT * FROM group_provenance WHERE group_id=?", (group_id,)).fetchone()
+        value = self._annotation_row(row) if row else default
+        members = {name: default for name in group["members"]}
+        for row in self.connection.execute(
+            "SELECT p.* FROM group_members m JOIN member_provenance p "
+            "ON p.normalized_name=m.normalized_name WHERE m.group_id=?",
+            (group_id,),
+        ):
+            members[row["normalized_name"]] = self._annotation_row(row)
+        origins = {item["origin"] for item in members.values()}
+        origin = next(iter(origins)) if len(origins) == 1 else "mixed"
+        return {
+            **group,
+            **value,
+            "origin": origin,
+            "human_reviewed": value["human_reviewed"] and all(item["human_reviewed"] for item in members.values()),
+            "member_provenance": members,
+        }
+
+    @staticmethod
+    def _annotation_row(row):
+        return {
+            "origin": row["origin"],
+            "human_reviewed": bool(row["human_reviewed"]),
+            "provenance": json.loads(row["provenance_json"]),
+        }
+
+    def _save_annotations(self, group_id, value, members):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO group_provenance VALUES(?,?,?,?)",
+            (group_id, value["origin"], int(value["human_reviewed"]), _json(value["provenance"])),
+        )
+        for name, item in members.items():
+            self.connection.execute(
+                "INSERT OR REPLACE INTO member_provenance VALUES(?,?,?,?)",
+                (name, item["origin"], int(item["human_reviewed"]), _json(item["provenance"])),
+            )
+
+    def serving_enabled(self):
+        """None preserves the gateway's existing environment-based behavior."""
+        if self.metadata()["schema_version"] == 1:
+            return None
+        row = self.connection.execute("SELECT enabled FROM curation_serving WHERE id=1").fetchone()
+        return bool(row[0]) if row else None
+
+    def configure_serving(self, enabled, settings_revision, operation_id, authorize=None):
+        if type(enabled) is not bool or type(settings_revision) is not int or settings_revision < 0:
+            raise ValueError("Expected a Boolean enabled flag and nonnegative settings revision.")
+        operation_id = str(uuid.UUID(_identifier(operation_id, "operation_id")))
+        request_hash = hashlib.sha256(_json([enabled, settings_revision]).encode()).hexdigest()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            prior = self.connection.execute(
+                "SELECT * FROM curation_setting_receipts WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if prior:
+                if prior["request_hash"] != request_hash:
+                    raise Conflict("Operation ID was already used for different settings.")
+                result = json.loads(prior["result_json"])
+            else:
+                current = self.connection.execute("SELECT * FROM curation_serving WHERE id=1").fetchone()
+                if (
+                    current
+                    and settings_revision == current["settings_revision"]
+                    and enabled != bool(current["enabled"])
+                ):
+                    raise Conflict("Settings revision was reused with different settings.")
+                if current is None or settings_revision > current["settings_revision"]:
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO curation_serving VALUES(1,?,?)", (int(enabled), settings_revision)
+                    )
+                    result = {"applied_settings_revision": settings_revision, "serving_enabled": enabled}
+                else:
+                    result = {
+                        "applied_settings_revision": current["settings_revision"],
+                        "serving_enabled": bool(current["enabled"]),
+                    }
+                self.connection.execute(
+                    "INSERT INTO curation_setting_receipts VALUES(?,?,?)", (operation_id, request_hash, _json(result))
+                )
+            if authorize is not None:
+                authorize()
+            self.connection.commit()
+            return result
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def groups(self, *, after="", limit=50):
         if type(limit) is not int or not 1 <= limit <= 100:
@@ -223,6 +369,8 @@ class CurationStore:
                 self.connection.executemany(
                     "INSERT INTO group_members VALUES(?,?)", [(name, group_id) for name in group["members"]]
                 )
+                normalized = normalize_group(group)
+                self._save_annotations(group_id, normalized, normalized["member_provenance"])
         if pair is not None:
             rejection = state["rejection"]
             if (
@@ -238,24 +386,76 @@ class CurationStore:
                 )
 
     def mutate(self, action, payload, *, operation_id, actor, expected_revision, authorize=None):
+        """Explicit manual operation; existing request hashes remain replayable."""
+        if action == "apply_autonomous":
+            raise ValueError("Use the dedicated autonomous publication method.")
+        return self._mutate(
+            action,
+            payload,
+            operation_id=operation_id,
+            actor=actor,
+            expected_revision=expected_revision,
+            authorize=authorize,
+        )
+
+    def apply_autonomous(self, payload, *, provenance, operation_id, validate, authorize=None):
+        """Append safe memberships after bounded affected-state validation under the writer lock."""
+        if not callable(validate):
+            raise ValueError("Autonomous publication requires affected-state validation.")
+        value = autonomous_annotation(provenance)
+        if not isinstance(payload, dict):
+            raise ValueError("Expected an operation object.")
+        payload = json.loads(_json(payload))
+        payload.setdefault("group_id", _identifier(operation_id, "operation_id"))
+        return self._mutate(
+            "apply_autonomous",
+            payload,
+            operation_id=operation_id,
+            actor="system:autonomous-curation",
+            expected_revision=None,
+            authorize=authorize,
+            autonomous=value,
+            validate=validate,
+        )
+
+    def _mutate(
+        self, action, payload, *, operation_id, actor, expected_revision, authorize=None, autonomous=None, validate=None
+    ):
         """Authorize inside the write transaction; duplicate delivery returns its saved result."""
         operation_id = str(uuid.UUID(_identifier(operation_id, "operation_id")))
         actor = _text(actor, "actor", 128)
-        if type(expected_revision) is not int or expected_revision < 0:
+        if autonomous is None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("expected_revision must be a nonnegative integer.")
-        request_hash = hashlib.sha256(_json([action, payload, actor, expected_revision]).encode()).hexdigest()
+        material = [action, payload, actor, expected_revision]
+        if autonomous is not None:
+            material.append(autonomous)
+        request_hash = hashlib.sha256(_json(material).encode()).hexdigest()
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            if autonomous is not None:
+                settings = self.connection.execute("SELECT * FROM curation_serving WHERE id=1").fetchone()
+                settings_revision = autonomous["provenance"].get("settings_revision")
+                if (
+                    settings is None
+                    or not settings["enabled"]
+                    or type(settings_revision) is not int
+                    or settings_revision != settings["settings_revision"]
+                ):
+                    raise Conflict("Autonomous publication settings are disabled or stale.")
             previous = self.connection.execute(
                 "SELECT * FROM curation_changes WHERE operation_id=?", (operation_id,)
             ).fetchone()
             if previous is not None:
                 if previous["request_hash"] != request_hash:
                     raise Conflict("Operation ID was already used for a different request.")
+                if autonomous is not None and authorize is not None:
+                    authorize()
                 self.connection.rollback()
                 return json.loads(previous["result_json"])
             revision = self.metadata()["revision"]
-            if revision != expected_revision:
+            if autonomous is not None:
+                validate()
+            if autonomous is None and revision != expected_revision:
                 raise Conflict("Curation revision changed; refresh before editing.")
             if not isinstance(payload, dict):
                 raise ValueError("Expected an operation object.")
@@ -263,7 +463,7 @@ class CurationStore:
             group_id = None
             if action == "create_group":
                 group_id = uuid.uuid4().hex
-            elif action in ("update_group", "delete_group"):
+            elif action in ("update_group", "delete_group", "apply_autonomous"):
                 group_id = _identifier(payload.get("group_id"), "group_id")
             elif action in ("reject_pair", "reopen_pair"):
                 pair = sorted(normalize_name(_text(payload.get(k), k)) for k in ("first", "second"))
@@ -276,7 +476,10 @@ class CurationStore:
                     raise Conflict("Unknown change to undo.")
                 saved_after = json.loads(target["after_json"])
                 group_id, pair = saved_after["group_id"], saved_after["pair"]
-                if self._capture(group_id, pair) != saved_after:
+                current = self._capture(group_id, pair)
+                if saved_after["group"] is not None and "member_provenance" not in saved_after["group"]:
+                    current["group"] = self._legacy_group(group_id) if current["group"] else None
+                if current != saved_after:
                     raise Conflict("Affected records changed; edit explicitly instead.")
             before = self._capture(group_id, pair)
             if action == "undo_change":
@@ -284,7 +487,10 @@ class CurationStore:
                     raise ValueError("Supply only operation_id for undo.")
                 self._restore(json.loads(target["before_json"]), revision + 1)
             else:
-                self._apply(action, payload, revision + 1, group_id)
+                applied_action = action
+                if action == "apply_autonomous":
+                    applied_action = "update_group" if before["group"] is not None else "create_group"
+                self._apply(applied_action, payload, revision + 1, group_id, autonomous=autonomous, actor=actor)
             result = {"operation_id": operation_id, "revision": revision + 1, "group_id": group_id}
             after = self._capture(group_id, pair)
             result["group_exists"] = after["group"] is not None
@@ -313,15 +519,14 @@ class CurationStore:
             self.connection.rollback()
             raise
 
-    def _apply(self, action, payload, version, group_id=None):
+    def _apply(self, action, payload, version, group_id=None, *, autonomous=None, actor=""):
         if not isinstance(payload, dict):
             raise ValueError("Expected an operation object.")
         if action in ("create_group", "update_group"):
             allowed = {"group_id", "preferred_name", "description", "members"}
             if set(payload) - allowed:
                 raise ValueError("Unknown group fields.")
-            if action == "update_group":
-                self.group(group_id)
+            prior = self.group(group_id) if action == "update_group" else None
             preferred = _text(payload.get("preferred_name"), "preferred_name")
             description = payload.get("description", "")
             if not isinstance(description, str) or len(description) > 2000:
@@ -330,6 +535,19 @@ class CurationStore:
             if not isinstance(members, list) or not 1 <= len(members) <= MAX_MEMBERS:
                 raise ValueError("Supply 1-100 members.")
             members = sorted({normalize_name(_text(n, "member")) for n in members})
+            if autonomous is not None and len(members) < 2:
+                raise ValueError("Autonomous groups require at least two spellings.")
+            if autonomous is not None and prior is not None:
+                if set(prior["members"]) == set(members):
+                    raise Conflict("No additional spelling was selected.")
+                if not set(prior["members"]) <= set(members):
+                    raise Conflict("Autonomous publication cannot remove existing memberships.")
+                protected = any(
+                    item["origin"] != "autonomous" or item["human_reviewed"]
+                    for item in prior["member_provenance"].values()
+                )
+                if protected and (preferred != prior["preferred_name"] or description != prior["description"]):
+                    raise Conflict("Autonomous publication cannot overwrite reviewed or unknown group metadata.")
             for member in members:
                 owner = self.membership(member)
                 if owner is not None and owner != group_id:
@@ -345,6 +563,16 @@ class CurationStore:
             )
             self.connection.execute("DELETE FROM group_members WHERE group_id=?", (group_id,))
             self.connection.executemany("INSERT INTO group_members VALUES(?,?)", [(name, group_id) for name in members])
+            value = autonomous if autonomous is not None else annotation(actor)
+            member_values = {name: value for name in members}
+            if prior is not None:
+                if autonomous is not None:
+                    member_values.update(prior["member_provenance"])
+                elif value["human_reviewed"]:
+                    for name in set(members) & prior["member_provenance"].keys():
+                        member_values[name] = {**prior["member_provenance"][name], "human_reviewed": True}
+                    value = {"origin": prior["origin"], "human_reviewed": True, "provenance": prior["provenance"]}
+            self._save_annotations(group_id, value, member_values)
             return group_id
         if action in ("reject_pair", "reopen_pair"):
             if set(payload) - {"first", "second", "reason"}:
