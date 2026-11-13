@@ -181,6 +181,7 @@ class CurationCatalogue:
             if include_provenance is True
             else self.store.group(group_id, include_provenance=include_provenance)
         )
+        group_id = group["group_id"]
         names = group["members"]
         placeholders = ",".join("?" for _ in names)
         resolved = {

@@ -100,6 +100,18 @@ class CurationStore:
                 raise ValueError("Curation store schema, corpus or normalization differs.")
             if not read_only and metadata["schema_version"] == 1:
                 self._upgrade_provenance(backup=not new_store)
+            self._redirects = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_redirects'"
+            ).fetchone() is not None
+            if not read_only:
+                self.connection.executescript("""
+                    CREATE TABLE IF NOT EXISTS group_redirects (
+                        retired_group_id TEXT PRIMARY KEY, group_id TEXT NOT NULL,
+                        CHECK(retired_group_id<>group_id));
+                    CREATE INDEX IF NOT EXISTS group_redirect_target ON group_redirects(group_id);
+                    CREATE TABLE IF NOT EXISTS autonomous_released_names (normalized_name TEXT PRIMARY KEY);
+                """)
+                self._redirects = True
             if read_only:
                 self.connection.execute("PRAGMA query_only=ON")
         except BaseException:
@@ -193,8 +205,26 @@ class CurationStore:
             raise ValueError("include_provenance must be a Boolean.")
         rows = self.connection.execute("SELECT * FROM name_groups WHERE group_id=?", (group_id,)).fetchall()
         if not rows:
-            raise ValueError("Unknown name group.")
+            canonical = self.canonical_group_id(group_id)
+            if canonical != group_id:
+                rows = self.connection.execute("SELECT * FROM name_groups WHERE group_id=?", (canonical,)).fetchall()
+            if not rows:
+                raise ValueError("Unknown name group.")
         return self._hydrate_groups(rows, include_provenance=include_provenance)[0]
+
+    def canonical_group_id(self, group_id):
+        if not self._redirects:
+            return group_id
+        seen = set()
+        while group_id not in seen and len(seen) < 100:
+            seen.add(group_id)
+            row = self.connection.execute(
+                "SELECT group_id FROM group_redirects WHERE retired_group_id=?", (group_id,)
+            ).fetchone()
+            if row is None:
+                return group_id
+            group_id = row[0]
+        raise Conflict("Name group redirects contain a cycle.")
 
     def _hydrate_groups(self, rows, *, include_provenance=True):
         if not rows:
@@ -402,6 +432,7 @@ class CurationStore:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             current = self.group(result["group_id"])
+            canonical = current["group_id"]
             if "membership_key" in result:
                 unchanged = result["membership_key"] == membership_key(current["members"])
             else:
@@ -413,7 +444,7 @@ class CurationStore:
                 raise ValueError("Expected an exact nonnegative count.")
             self.connection.execute(
                 "INSERT OR REPLACE INTO group_counts VALUES(?,?,?,?)",
-                (result["group_id"], result["generation"], self.group(result["group_id"])["version"], count),
+                (canonical, result["generation"], current["version"], count),
             )
             if authorize is not None:
                 authorize()
@@ -436,6 +467,10 @@ class CurationStore:
         return {"group_id": group_id, "group": group, "pair": pair, "rejection": rejection}
 
     def _restore(self, state, version):
+        if "merge" in state:
+            from .overlap import restore
+            restore(self, state["merge"], version)
+            return
         group_id, group, pair = state["group_id"], state["group"], state["pair"]
         if group is not None:
             for member in group["members"]:
@@ -552,6 +587,8 @@ class CurationStore:
                 raise ValueError("Expected an operation object.")
             pair = None
             group_id = None
+            union = None
+            merged_ids = None
             if action == "create_group":
                 group_id = uuid.uuid4().hex
             elif action in ("update_group", "delete_group", "apply_autonomous"):
@@ -568,11 +605,26 @@ class CurationStore:
                 saved_after = json.loads(target["after_json"])
                 group_id, pair = saved_after["group_id"], saved_after["pair"]
                 current = self._capture(group_id, pair)
+                if "merge" in saved_after:
+                    from .overlap import capture
+                    merged_ids = list(saved_after["merge"]["groups"])
+                    current["merge"] = capture(self, merged_ids)
                 if saved_after["group"] is not None and "member_provenance" not in saved_after["group"]:
                     current["group"] = self._legacy_group(group_id) if current["group"] else None
                 if current != saved_after:
                     raise Conflict("Affected records changed; edit explicitly instead.")
+            if action == "apply_autonomous":
+                from .overlap import plan_union
+                union = plan_union(self, payload)
+                group_id, payload = union["target"], union["payload"]
+                if union["sources"]:
+                    merged_ids = list(union["groups"])
+            elif action in ("update_group", "delete_group"):
+                group_id = self.canonical_group_id(group_id)
             before = self._capture(group_id, pair)
+            if merged_ids is not None:
+                from .overlap import capture
+                before["merge"] = capture(self, merged_ids)
             if action == "undo_change":
                 if set(payload) != {"operation_id"}:
                     raise ValueError("Supply only operation_id for undo.")
@@ -581,9 +633,21 @@ class CurationStore:
                 applied_action = action
                 if action == "apply_autonomous":
                     applied_action = "update_group" if before["group"] is not None else "create_group"
-                self._apply(applied_action, payload, revision + 1, group_id, autonomous=autonomous, actor=actor)
+                if union is not None:
+                    from .overlap import retire_sources
+                    retire_sources(self, union)
+                if union is None or not union["noop"]:
+                    self._apply(applied_action, payload, revision + 1, group_id, autonomous=autonomous, actor=actor)
+                if union is not None and not union["noop"]:
+                    from .overlap import preserve_members
+                    preserve_members(self, union)
             result = {"operation_id": operation_id, "revision": revision + 1, "group_id": group_id}
             after = self._capture(group_id, pair)
+            if merged_ids is not None:
+                from .overlap import capture
+                after["merge"] = capture(self, merged_ids)
+            if union is not None and union["noop"]:
+                result["already_grouped"] = True
             result["group_exists"] = after["group"] is not None
             if (
                 before["group"] is not None
@@ -596,6 +660,8 @@ class CurationStore:
                     "FROM group_counts WHERE group_id=? AND revision=?",
                     (after["group"]["version"], group_id, before["group"]["version"]),
                 )
+            from .overlap import enqueue_released
+            enqueue_released(self, before)
             self.connection.execute("UPDATE curation_metadata SET revision=? WHERE id=1", (revision + 1,))
             self.connection.execute(
                 "INSERT INTO curation_changes(operation_id,actor,request_hash,action,"
@@ -618,6 +684,8 @@ class CurationStore:
             if set(payload) - allowed:
                 raise ValueError("Unknown group fields.")
             prior = self.group(group_id) if action == "update_group" else None
+            if action == "create_group" and self.canonical_group_id(group_id) != group_id:
+                raise Conflict("A retired group identifier cannot be reused.")
             preferred = _text(payload.get("preferred_name"), "preferred_name")
             description = payload.get("description", "")
             if not isinstance(description, str) or len(description) > 2000:

@@ -67,6 +67,7 @@ class CuratedRetrieval(CurationCatalogue):
                 continue
             seen.add(group_id)
             group = self.store.group(group_id)
+            group_id = group["group_id"]
             count = self.store.connection.execute(
                 "SELECT article_count FROM group_counts WHERE group_id=? AND publication=? AND revision=?",
                 (group_id, self.entities.generation, group["version"]),
@@ -122,6 +123,7 @@ class CuratedRetrieval(CurationCatalogue):
         if start and end and start > end:
             raise ValueError("date_to must not precede date_from")
         group = self.store.group(group_id)
+        group_id = group["group_id"]
         streams = []
         unresolved = []
         for member in group["members"]:
@@ -175,6 +177,7 @@ class CuratedRetrieval(CurationCatalogue):
     @review_read
     def count_articles(self, group_id):
         group = self.store.group(group_id)
+        group_id = group["group_id"]
         cached = self.store.connection.execute(
             "SELECT article_count FROM group_counts WHERE group_id=? AND publication=? AND revision=?",
             (group_id, self.entities.generation, group["version"]),
