@@ -427,6 +427,17 @@ class CurationStore:
             is not None
         )
 
+    def _members_rejected(self, members):
+        """Test a bounded member set using the rejected-pair primary key once."""
+        names = list(set(members))
+        if len(names) < 2:
+            return False
+        marks = ",".join("?" for _ in names)
+        return self.connection.execute(
+            f"SELECT 1 FROM rejected_pairs WHERE first_name IN ({marks}) AND second_name IN ({marks}) LIMIT 1",
+            [*names, *names],
+        ).fetchone() is not None
+
     def save_count(self, result, *, authorize=None):
         """Persist only a complete count for the still-current curation revision."""
         self.connection.execute("BEGIN IMMEDIATE")
@@ -476,9 +487,8 @@ class CurationStore:
             for member in group["members"]:
                 if self.membership(member) not in (None, group_id):
                     raise Conflict("An affected name now belongs to another group.")
-            for i, first in enumerate(group["members"]):
-                if any(self.rejected(first, second) for second in group["members"][i + 1 :]):
-                    raise Conflict("An affected pair is now rejected.")
+            if self._members_rejected(group["members"]):
+                raise Conflict("An affected pair is now rejected.")
         if group_id is not None:
             self.connection.execute("DELETE FROM name_groups WHERE group_id=?", (group_id,))
             if group is not None:
@@ -711,9 +721,8 @@ class CurationStore:
                 owner = self.membership(member)
                 if owner is not None and owner != group_id:
                     raise Conflict("A name already belongs to another group; remove it there first.")
-            for i, first in enumerate(members):
-                if any(self.rejected(first, second) for second in members[i + 1 :]):
-                    raise Conflict("Reopen a rejected pair before grouping its names.")
+            if self._members_rejected(members):
+                raise Conflict("Reopen a rejected pair before grouping its names.")
             self.connection.execute(
                 "INSERT INTO name_groups VALUES(?,?,?,?,?) ON CONFLICT(group_id) DO UPDATE SET "
                 "preferred_name=excluded.preferred_name,description=excluded.description,version=excluded.version,"

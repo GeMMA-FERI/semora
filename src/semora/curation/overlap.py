@@ -33,7 +33,7 @@ def plan_union(store, payload):
         )
     )
     ids = list(dict.fromkeys(owners[name] for name in members if name in owners))
-    proposed = _identifier(payload.get("group_id"), "group_id")
+    proposed = store.canonical_group_id(_identifier(payload.get("group_id"), "group_id"))
     if not ids:
         return {"payload": payload, "target": proposed, "groups": {}, "sources": [], "noop": False}
     marks = ",".join("?" for _ in ids)
@@ -61,11 +61,7 @@ def plan_union(store, payload):
         selected.update(group["members"])
     if len(selected) > MAX_MEMBERS:
         raise Conflict("Merged group exceeds the 100-member limit.")
-    marks = ",".join("?" for _ in selected)
-    if store.connection.execute(
-        f"SELECT 1 FROM rejected_pairs WHERE first_name IN ({marks}) AND second_name IN ({marks}) LIMIT 1",
-        [*selected, *selected],
-    ).fetchone():
+    if store._members_rejected(selected):
         raise Conflict("Reopen a rejected pair before grouping its names.")
     prior = groups[target]
     merged = {
@@ -147,12 +143,7 @@ def restore(store, state, version):
         for member in group["members"]:
             if store.membership(member) not in (None, *ids):
                 raise Conflict("An affected name now belongs to another group.")
-        members = group["members"]
-        marks = ",".join("?" for _ in members)
-        if store.connection.execute(
-            f"SELECT 1 FROM rejected_pairs WHERE first_name IN ({marks}) AND second_name IN ({marks}) LIMIT 1",
-            [*members, *members],
-        ).fetchone():
+        if store._members_rejected(group["members"]):
             raise Conflict("An affected pair is now rejected.")
     marks = ",".join("?" for _ in ids)
     store.connection.execute(f"DELETE FROM name_groups WHERE group_id IN ({marks})", ids)

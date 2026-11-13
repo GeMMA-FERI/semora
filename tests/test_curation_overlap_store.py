@@ -293,3 +293,81 @@ def test_overlap_queries_use_existing_covering_membership_and_alias_indexes(stor
     assert "COVERING INDEX curation_group_members" in membership_plan
     assert "group_redirect_target" in redirects_plan
     assert "sqlite_autoindex_group_redirects" in redirects_plan
+
+
+def test_explicit_reviewed_extension_through_retired_id_preserves_replay(store):
+    first = automatic(store, ["alpha", "a1"])
+    second = automatic(store, ["beta", "b1"])
+    automatic(store, ["alpha", "beta"])
+    group = store.group(first["group_id"])
+    manual(
+        store,
+        "update_group",
+        {
+            "group_id": first["group_id"],
+            "preferred_name": "Reviewed",
+            "description": "Reviewed city",
+            "members": group["members"],
+        },
+    )
+    payload = {
+        "group_id": second["group_id"],
+        "preferred_name": "Reviewed",
+        "description": "Reviewed city",
+        "members": [*group["members"], "addition"],
+    }
+    operation = identifier()
+
+    def apply():
+        return store.apply_autonomous(
+            payload,
+            operation_id=operation,
+            validate=lambda: None,
+            provenance={"policy_version": "ocr-v1", "settings_revision": 1},
+        )
+
+    result = apply()
+    assert result["group_id"] == first["group_id"]
+    assert payload["group_id"] == second["group_id"]
+    assert store.group(first["group_id"])["preferred_name"] == "Reviewed"
+    assert store.group(first["group_id"])["member_provenance"]["addition"]["human_reviewed"] is False
+    assert apply() == result
+
+
+def test_bounded_rejection_probe_handles_empty_singleton_and_hundred_members(store):
+    members = [f"name-{index:03}" for index in range(100)]
+    statements = []
+    store.connection.set_trace_callback(statements.append)
+    try:
+        assert store._members_rejected([]) is False
+        assert store._members_rejected(["single"]) is False
+        assert statements == []
+        assert store._members_rejected(members) is False
+        assert len(statements) == 1
+        store.connection.execute("INSERT INTO rejected_pairs VALUES(?,?,?)", (members[-2], members[-1], "Distinct"))
+        statements.clear()
+        assert store._members_rejected(members) is True
+        assert len(statements) == 1
+        assert store._members_rejected([*members[:-1], "outside"]) is False
+    finally:
+        store.connection.set_trace_callback(None)
+
+
+def test_hundred_member_publication_uses_one_rejection_query(store):
+    statements = []
+    store.connection.set_trace_callback(statements.append)
+    try:
+        automatic(store, [f"name-{index:03}" for index in range(100)])
+    finally:
+        store.connection.set_trace_callback(None)
+    probes = [sql for sql in statements if "SELECT 1 FROM rejected_pairs" in sql]
+    assert len(probes) == 1
+    plan = " ".join(
+        row[3]
+        for row in store.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM rejected_pairs WHERE first_name IN (?,?) "
+            "AND second_name IN (?,?) LIMIT 1",
+            ["a", "b", "c", "d"],
+        )
+    )
+    assert "COVERING INDEX sqlite_autoindex_rejected_pairs" in plan
