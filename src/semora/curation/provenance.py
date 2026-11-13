@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import re
 
+MODEL_DISPLAY_VERSION = "model-display-v1"
+
 
 def annotation(actor):
     reviewed = re.fullmatch(r"admin:[1-9]\d*", actor) is not None

@@ -16,7 +16,7 @@ def eligible(group):
     )
 
 
-def plan_union(store, payload):
+def plan_union(store, payload, *, display_versions=None):
     """Read only selected memberships and affected groups under the caller's writer."""
     from .store import MAX_MEMBERS, Conflict, _identifier, _text
 
@@ -64,10 +64,16 @@ def plan_union(store, payload):
     if store._members_rejected(selected):
         raise Conflict("Reopen a rejected pair before grouping its names.")
     prior = groups[target]
+    may_rename = (
+        isinstance(display_versions, dict)
+        and type(display_versions.get(target)) is int
+        and display_versions[target] == prior["version"]
+    )
+    preferred = _text(payload.get("preferred_name"), "preferred_name", 200) if may_rename else prior["preferred_name"]
     merged = {
         **payload,
         "group_id": target,
-        "preferred_name": prior["preferred_name"],
+        "preferred_name": preferred,
         "description": prior["description"],
         "members": sorted(selected),
     }
@@ -77,7 +83,7 @@ def plan_union(store, payload):
         "target": target,
         "groups": groups,
         "sources": sources,
-        "noop": not sources and selected == set(prior["members"]),
+        "noop": not sources and selected == set(prior["members"]) and preferred == prior["preferred_name"],
     }
 
 
@@ -117,6 +123,12 @@ def retire_sources(store, plan):
 
 def preserve_members(store, plan):
     """Moving a spelling does not turn the current inference into its original source."""
+    if (
+        not plan["sources"] and plan["groups"]
+        and set(plan["payload"]["members"]) == set(plan["groups"][plan["target"]]["members"])
+    ):
+        # Metadata-only changes preserve the exact count for version promotion.
+        return
     for group in plan["groups"].values():
         for name, value in group["member_provenance"].items():
             from .store import _json

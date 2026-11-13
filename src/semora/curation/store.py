@@ -11,7 +11,7 @@ from pathlib import Path
 
 from semora.ner.names import normalize_name
 
-from .provenance import annotation, autonomous_annotation, normalize_group
+from .provenance import MODEL_DISPLAY_VERSION, annotation, autonomous_annotation, normalize_group
 
 NORMALIZATION = "nfc-casefold-whitespace-v1"
 MAX_MEMBERS = 100
@@ -625,7 +625,11 @@ class CurationStore:
                     raise Conflict("Affected records changed; edit explicitly instead.")
             if action == "apply_autonomous":
                 from .overlap import plan_union
-                union = plan_union(self, payload)
+                display_versions = (
+                    autonomous["provenance"].get("display_target_versions", {})
+                    if autonomous["provenance"].get("display_name_version") == MODEL_DISPLAY_VERSION else None
+                )
+                union = plan_union(self, payload, display_versions=display_versions)
                 group_id, payload = union["target"], union["payload"]
                 if union["sources"]:
                     merged_ids = list(union["groups"])
@@ -708,7 +712,13 @@ class CurationStore:
                 raise ValueError("Autonomous groups require at least two spellings.")
             if autonomous is not None and prior is not None:
                 if set(prior["members"]) == set(members):
-                    raise Conflict("No additional spelling was selected.")
+                    from .overlap import eligible
+                    rename = (
+                        autonomous["provenance"].get("display_name_version") == MODEL_DISPLAY_VERSION
+                        and preferred != prior["preferred_name"] and eligible(prior)
+                    )
+                    if not rename:
+                        raise Conflict("No additional spelling was selected.")
                 if not set(prior["members"]) <= set(members):
                     raise Conflict("Autonomous publication cannot remove existing memberships.")
                 protected = any(

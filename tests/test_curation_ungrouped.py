@@ -15,11 +15,20 @@ from semora.curation.autonomous import (
     initialize_autonomous,
 )
 from semora.curation.frequency import prepare_frequency
-from semora.curation.proposals import RecordedState, digest, prepare_task, validate_response
+from semora.curation.proposals import SYSTEM, RecordedState, digest, prepare_task, validate_response
 from semora.curation.store import Conflict
 
 from .test_curation_autonomous import answer
 from .test_curation_autonomous import catalogue as catalogue
+
+
+def legacy_display_task(prepared):
+    """Retain explicit v1 receipt tests when new discovery opts into model labels."""
+    prepared = copy.deepcopy(prepared)
+    prepared["context"].pop("display_name_version", None)
+    prepared["task"]["messages"][0]["content"] = SYSTEM
+    prepared["fingerprint"] = digest({key: prepared[key] for key in ("context", "task")})
+    return prepared
 
 
 def automatic_group(store, members, preferred=None):
@@ -148,6 +157,7 @@ def test_legacy_task_keeps_original_directional_policy(catalogue):
     legacy = copy.deepcopy(prepared)
     legacy["context"].pop("overlap_version")
     legacy["context"].pop("autonomous_groups")
+    legacy["context"].pop("display_name_version", None)
     legacy["fingerprint"] = digest({k: legacy[k] for k in ("context", "task")})
     assert evaluate_response(catalogue, legacy, answer(legacy))["status"] == "deferred"
 
@@ -229,7 +239,7 @@ def test_new_group_prefers_common_member_and_replays_identical_payload(catalogue
 
     discover_task(catalogue, operation_id=uuid.uuid4().hex)
 
-    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    prepared = legacy_display_task(discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"])
 
     assert prepared["context"]["anchor"] == "ljubijana"
 
@@ -269,7 +279,7 @@ def test_equal_frequency_retains_model_case_or_uses_stable_member_order(catalogu
 
     fresh_order(catalogue, tmp_path)
 
-    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    prepared = legacy_display_task(discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"])
 
     response = answer(prepared)
 
@@ -299,7 +309,7 @@ def test_excluded_higher_frequency_candidate_is_not_canonical(catalogue, tmp_pat
 
     discover_task(catalogue, operation_id=uuid.uuid4().hex)
 
-    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    prepared = legacy_display_task(discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"])
 
     assert prepared["context"]["anchor"] == "ljubijana"
 
@@ -325,7 +335,7 @@ def test_tied_nonanchor_canonical_uses_prepared_order_not_response_order(catalog
     fresh_order(catalogue, tmp_path)
     discover_task(catalogue, operation_id=uuid.uuid4().hex)
     discover_task(catalogue, operation_id=uuid.uuid4().hex)
-    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    prepared = legacy_display_task(discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"])
     context = prepared["context"]
     assert context["anchor"] == "ljubijana"
     stats = context["autonomous"]["stats"]

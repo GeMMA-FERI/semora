@@ -13,7 +13,16 @@ from typing import Any
 from semora.ner.names import normalize_name
 
 from .frequency import FrequencyNotReady, frequency_page
-from .proposals import PROMPT_VERSION, RecordedState, digest, prepare_task, review_response, validate_response
+from .proposals import (
+    PROMPT_VERSION,
+    RecordedState,
+    digest,
+    group_representative,
+    prepare_task,
+    review_response,
+    validate_response,
+)
+from .provenance import MODEL_DISPLAY_VERSION
 from .store import Conflict
 
 POLICY_VERSION = "conservative-ocr-v1"
@@ -435,22 +444,33 @@ def _policy_representatives(catalogue, prepared, response):
             group = catalogue.store.group(owner, include_provenance=False)
             if group.get("origin") != "autonomous" or group.get("human_reviewed") is not False:
                 raise Conflict("Autonomous union cannot modify a protected group.")
-            representative = normalize_name(group["preferred_name"])
             snapshot = context.get("autonomous_groups", {}).get(owner)
-            if snapshot:
-                if representative != snapshot["representative"]:
-                    raise Conflict("Autonomous group representative changed during inference.")
-                value = snapshot["representative_stats"]
+            if context.get("display_name_version") == MODEL_DISPLAY_VERSION:
+                unchanged = snapshot and (
+                    isinstance(catalogue.store, RecordedState)
+                    or (snapshot["version"] == group["version"] and snapshot["representative"] in group["members"])
+                )
+                if unchanged:
+                    representative, value = snapshot["representative"], snapshot["representative_stats"]
+                else:
+                    representative, value = group_representative(catalogue, group)
             else:
-                # Only a concurrently created owner reaches this path. The pinned
-                # dictionary is immutable; a bounded UNIQUE lookup may reject an
-                # old model decision without changing its original operation hash.
-                row = catalogue.connection.execute(
-                    "SELECT name,article_count FROM names WHERE normalized_name=?", (representative,)
-                ).fetchone()
-                if row is None:
-                    raise Conflict("Autonomous group representative is absent from the publication.")
-                value = dict(row)
+                representative = normalize_name(group["preferred_name"])
+                snapshot = context.get("autonomous_groups", {}).get(owner)
+                if snapshot:
+                    if representative != snapshot["representative"]:
+                        raise Conflict("Autonomous group representative changed during inference.")
+                    value = snapshot["representative_stats"]
+                else:
+                    # Only a concurrently created owner reaches this path. The pinned
+                    # dictionary is immutable; a bounded UNIQUE lookup may reject an
+                    # old model decision without changing its original operation hash.
+                    row = catalogue.connection.execute(
+                        "SELECT name,article_count FROM names WHERE normalized_name=?", (representative,)
+                    ).fetchone()
+                    if row is None:
+                        raise Conflict("Autonomous group representative is absent from the publication.")
+                    value = dict(row)
             if not isinstance(catalogue.store, RecordedState) and representative not in group["members"]:
                 raise Conflict("Autonomous group representative is not a group member.")
             groups[owner] = representative
@@ -494,21 +514,22 @@ def _final_result(catalogue, prepared, response):
                 )
             else:
                 added.append(decision["name"])
-    if context["group_id"]:
-        response["preferred_name"] = automatic["preferred_name"]
-    elif overlap:
-        # A newly discovered rare alias may point to a much more common spelling.
-        # Choose only among policy-accepted members using the pinned counts, so
-        # RecordedState and the live writer derive the same immutable payload.
-        accepted = set(added)
-        members = [context["anchor"], *[name for name in context["candidates"] if name in accepted]]
-        highest = max(stats[name]["article_count"] for name in members)
-        preferred = normalize_name(response["preferred_name"])
-        if preferred not in members or stats[preferred]["article_count"] != highest:
-            common = next(name for name in members if stats[name]["article_count"] == highest)
-            response["preferred_name"] = stats[common]["name"]
-    elif normalize_name(response["preferred_name"]) != context["anchor"]:
-        response["preferred_name"] = stats[context["anchor"]]["name"]
+    if context.get("display_name_version") != MODEL_DISPLAY_VERSION:
+        if context["group_id"]:
+            response["preferred_name"] = automatic["preferred_name"]
+        elif overlap:
+            # A newly discovered rare alias may point to a much more common spelling.
+            # Choose only among policy-accepted members using the pinned counts, so
+            # RecordedState and the live writer derive the same immutable payload.
+            accepted = set(added)
+            members = [context["anchor"], *[name for name in context["candidates"] if name in accepted]]
+            highest = max(stats[name]["article_count"] for name in members)
+            preferred = normalize_name(response["preferred_name"])
+            if preferred not in members or stats[preferred]["article_count"] != highest:
+                common = next(name for name in members if stats[name]["article_count"] == highest)
+                response["preferred_name"] = stats[common]["name"]
+        elif normalize_name(response["preferred_name"]) != context["anchor"]:
+            response["preferred_name"] = stats[context["anchor"]]["name"]
     checked = validate_response(
         prepared, response, catalogue.store, catalogue.entities.generation, allow_autonomous_overlap=overlap
     )
@@ -618,6 +639,12 @@ def apply_autonomous(
 
     if context.get("overlap_version") == "unreviewed-union-v1":
         provenance["overlap_version"] = context["overlap_version"]
+
+    if context.get("display_name_version") == MODEL_DISPLAY_VERSION:
+        provenance["display_name_version"] = MODEL_DISPLAY_VERSION
+        provenance["display_target_versions"] = {
+            group_id: group["version"] for group_id, group in context.get("autonomous_groups", {}).items()
+        }
 
     def validate():
         reservation = catalogue.store.connection.execute(
