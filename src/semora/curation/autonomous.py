@@ -496,6 +496,17 @@ def _final_result(catalogue, prepared, response):
                 added.append(decision["name"])
     if context["group_id"]:
         response["preferred_name"] = automatic["preferred_name"]
+    elif overlap:
+        # A newly discovered rare alias may point to a much more common spelling.
+        # Choose only among policy-accepted members using the pinned counts, so
+        # RecordedState and the live writer derive the same immutable payload.
+        accepted = set(added)
+        members = [context["anchor"], *[name for name in context["candidates"] if name in accepted]]
+        highest = max(stats[name]["article_count"] for name in members)
+        preferred = normalize_name(response["preferred_name"])
+        if preferred not in members or stats[preferred]["article_count"] != highest:
+            common = next(name for name in members if stats[name]["article_count"] == highest)
+            response["preferred_name"] = stats[common]["name"]
     elif normalize_name(response["preferred_name"]) != context["anchor"]:
         response["preferred_name"] = stats[context["anchor"]]["name"]
     checked = validate_response(

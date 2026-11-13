@@ -2,18 +2,20 @@
 
 import copy
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
 from semora.curation.autonomous import (
     POLICY_VERSION,
+    _final_result,
     apply_autonomous,
     discover_task,
     evaluate_response,
     initialize_autonomous,
 )
 from semora.curation.frequency import prepare_frequency
-from semora.curation.proposals import digest, prepare_task, validate_response
+from semora.curation.proposals import RecordedState, digest, prepare_task, validate_response
 from semora.curation.store import Conflict
 
 from .test_curation_autonomous import answer
@@ -219,3 +221,121 @@ def test_empty_release_batch_keeps_later_release_backlog_visible(catalogue):
     assert connection.execute("SELECT COUNT(*) FROM autonomous_released_names").fetchone()[0] == 1
     second = discover_task(catalogue, operation_id=uuid.uuid4().hex, scan_limit=2)
     assert second["prepared"]["context"]["anchor"] == "ljubljana"
+
+
+def test_new_group_prefers_common_member_and_replays_identical_payload(catalogue):
+
+    human_group(catalogue.store, ["marina", "marija"])
+
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+
+    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+
+    assert prepared["context"]["anchor"] == "ljubijana"
+
+    response = answer(prepared)
+
+    response["preferred_name"] = "Ljubijana"
+
+    recorded = SimpleNamespace(store=RecordedState(prepared["context"]), entities=catalogue.entities)
+
+    before = _final_result(recorded, prepared, response)
+
+    live = evaluate_response(catalogue, prepared, response)
+
+    assert before["validated"]["preferred_name"] == live["validated"]["preferred_name"] == "Ljubljana"
+
+    catalogue.store.configure_serving(True, settings_revision=1, operation_id=uuid.uuid4().hex)
+
+    operation = uuid.uuid4().hex
+
+    result = apply_autonomous(
+        catalogue, prepared, response, operation_id=operation, provenance={"settings_revision": 1}
+    )
+
+    assert catalogue.store.group(result["group_id"])["preferred_name"] == "Ljubljana"
+
+    assert _final_result(catalogue, prepared, response)["validated"]["preferred_name"] == "Ljubljana"
+
+    assert (
+        apply_autonomous(catalogue, prepared, response, operation_id=operation, provenance={"settings_revision": 1})
+        == result
+    )
+
+
+def test_equal_frequency_retains_model_case_or_uses_stable_member_order(catalogue, tmp_path):
+
+    catalogue.connection.execute("INSERT INTO names VALUES(5,'ljubljána','Ljubljána',100)")
+
+    fresh_order(catalogue, tmp_path)
+
+    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+
+    response = answer(prepared)
+
+    response["preferred_name"] = "LJUBLJÁNA"
+
+    assert _final_result(catalogue, prepared, response)["validated"]["preferred_name"] == "LJUBLJÁNA"
+
+    response["preferred_name"] = "Ljubijana"
+
+    for ordered in (response["decisions"], list(reversed(response["decisions"]))):
+        response["decisions"] = ordered
+
+        checked = _final_result(catalogue, prepared, response)
+
+        assert checked["validated"]["preferred_name"] == "Ljubljana"
+
+
+def test_excluded_higher_frequency_candidate_is_not_canonical(catalogue, tmp_path):
+
+    human_group(catalogue.store, ["marina", "marija"])
+
+    catalogue.connection.execute("INSERT INTO names VALUES(5,'maribor','Maribor',1000)")
+
+    fresh_order(catalogue, tmp_path)
+
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+
+    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+
+    assert prepared["context"]["anchor"] == "ljubijana"
+
+    response = answer(prepared)
+
+    response["preferred_name"] = "Ljubijana"
+
+    for decision in response["decisions"]:
+        decision["decision"] = "include" if decision["name"] == "ljubljana" else "exclude"
+
+    checked = evaluate_response(catalogue, prepared, response)
+
+    assert checked["status"] == "accepted"
+
+    assert checked["validated"]["preferred_name"] == "Ljubljana"
+
+    assert "maribor" not in checked["validated"]["members"]
+
+
+def test_tied_nonanchor_canonical_uses_prepared_order_not_response_order(catalogue, tmp_path):
+    human_group(catalogue.store, ["marina", "marija"])
+    catalogue.connection.execute("INSERT INTO names VALUES(5,'ljublj\u00e1na','Ljublj\u00e1na',100)")
+    fresh_order(catalogue, tmp_path)
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    prepared = discover_task(catalogue, operation_id=uuid.uuid4().hex)["prepared"]
+    context = prepared["context"]
+    assert context["anchor"] == "ljubijana"
+    stats = context["autonomous"]["stats"]
+    winners = [name for name in context["candidates"] if stats[name]["article_count"] == 100]
+    assert len(winners) == 2
+    expected = stats[winners[0]]["name"]
+    response = answer(prepared)
+    response["preferred_name"] = "Ljubijana"
+    original = response["decisions"]
+    for ordered in (original, list(reversed(original))):
+        response["decisions"] = ordered
+        checked = _final_result(catalogue, prepared, response)
+        assert checked["validated"]["preferred_name"] == expected
