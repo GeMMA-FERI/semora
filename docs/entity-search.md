@@ -210,3 +210,36 @@ dictionaries, so run it while foreground workloads are idle. The completed file
 is published atomically; an interrupted build is retried from scratch. Artifacts
 are reused only for the exact source identity. Missing artifacts produce an
 explicit not-ready discovery result; manual curation remains available.
+
+
+## Group-aware autonomous discovery and overlap convergence
+
+The immutable frequency artifact remains a ranking source. Current membership in
+`group_members` is the authoritative grouped flag, so no second checkmark needs
+synchronizing. Discovery tests bounded rank pages against that primary key and
+skips grouped anchors. Eligible unreviewed autonomous groups may still appear as
+matching spellings, allowing a new ungrouped variant to join an existing group.
+
+Publication keeps the existing operation receipt and write transaction. Accepted
+overlapping memberships are unioned into an existing canonical group; original
+member provenance and canonical display metadata are retained. Retired IDs resolve
+through a small sidecar redirect table, while audit snapshots preserve every
+changed group and redirect for checked undo. Counts are invalidated or recalculated
+as distinct article unions, never summed from overlapping cached counts.
+
+Group deletion, membership removal and undo notify a deduplicated local released-name
+queue. Discovery drains that queue in bounded batches, checks current membership
+again and retrieves dictionary counts through indexed name lookups. This avoids
+rewinding the entire frequency cursor, including for names previously skipped
+before receiving a frontier row. Existing retry limits, cooldowns, review protection
+and rejected pairs remain independent of membership eligibility.
+
+The new private proposal context binds overlap behavior and canonical representatives
+to its fingerprint. Legacy prepared operations retain their original validation
+and receipt material. Automatic reconciliation cannot use a rare alias to bypass
+the conservative comparison between two canonical representatives. Generic manual
+proposal validation keeps its original strict ownership rules. This is an overlap
+handling change; the publication policy still covers OCR/spelling equivalence.
+
+These changes are local to the curation sidecar and worker library; no new backend
+job type, inference response schema or server database migration is required.
