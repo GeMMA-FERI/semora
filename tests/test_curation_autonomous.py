@@ -224,8 +224,10 @@ def test_human_group_anchor_is_not_autonomously_extended(catalogue):
         expected_revision=0,
     )
     result = discover_task(catalogue, operation_id=uuid.uuid4().hex)
-    assert result["status"] == "empty"
-    assert "Human-reviewed" in result["reason"]
+    assert result["status"] == "prepared"
+    assert result["prepared"]["context"]["anchor"] == "marina"
+    assert "ljubljana" not in result["prepared"]["context"]["candidates"]
+    assert catalogue.store.group(catalogue.store.membership("ljubljana"))["members"] == ["ljubljana"]
 
 
 def test_late_evaluation_does_not_defer_successor_reservation(catalogue):
@@ -253,9 +255,18 @@ def test_lost_apply_ack_does_not_publish_successor_reservation(catalogue):
     catalogue.connection.execute("INSERT INTO names VALUES(5,'ljub1jana','Ljub1jana',1)")
     connection = catalogue.store.connection
     with connection:
+        # A newly encountered ungrouped alias should extend the established group,
+        # while the old grouped anchor is never scheduled for new model work.
         connection.execute("UPDATE autonomous_frontier SET status='queued' WHERE normalized_name='ljubljana'")
+        connection.execute("UPDATE autonomous_frontier SET status='deferred',next_due=1e12 "
+                           "WHERE normalized_name IN ('marina','marija')")
+        connection.execute(
+            "INSERT INTO autonomous_frontier(generation,policy_version,normalized_name,article_count,status) "
+            "VALUES(?,?,'ljub1jana',1,'queued')", (catalogue.entities.generation, POLICY_VERSION)
+        )
     second = discover_task(catalogue, operation_id=uuid.uuid4().hex)
     assert second["status"] == "prepared"
+    assert second["prepared"]["context"]["anchor"] == "ljub1jana"
     assert (
         apply_autonomous(
             catalogue, first["prepared"], answer(first["prepared"]), operation_id=operation, provenance=metadata
@@ -263,7 +274,7 @@ def test_lost_apply_ack_does_not_publish_successor_reservation(catalogue):
         == result
     )
     row = connection.execute(
-        "SELECT status,operation_id FROM autonomous_frontier WHERE normalized_name='ljubljana'"
+        "SELECT status,operation_id FROM autonomous_frontier WHERE normalized_name='ljub1jana'"
     ).fetchone()
     assert tuple(row) == ("prepared", second["discovery_id"])
 
@@ -436,3 +447,44 @@ def test_discovery_starts_with_common_high_id_before_rare_low_id(catalogue, tmp_
     result = discover_task(catalogue, operation_id=uuid.uuid4().hex, scan_limit=1)
     assert result["prepared"]["context"]["anchor"] == "ljubljana"
     assert not any("ORDER BY article_count" in sql for sql in traced)
+
+
+def test_grouped_rank_page_advances_without_model_work(catalogue):
+    catalogue.store.mutate(
+        "create_group", {"preferred_name": "Ljubljana", "members": ["ljubljana"]},
+        operation_id=uuid.uuid4().hex, actor="admin:1", expected_revision=0,
+    )
+    catalogue.suggest_variants = lambda *a, **k: pytest.fail("Grouped names must not reach proposal preparation")
+    result = discover_task(catalogue, operation_id=uuid.uuid4().hex, scan_limit=1)
+    assert result["status"] == "empty" and result["has_more"]
+    assert catalogue.store.connection.execute("SELECT after_rank FROM autonomous_frequency_cursors").fetchone()[0] == 1
+    assert catalogue.store.connection.execute("SELECT COUNT(*) FROM autonomous_frontier").fetchone()[0] == 0
+
+
+def test_grouped_queued_retirement_preserves_active_work_and_retry_history(catalogue):
+    first = discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    catalogue.store.mutate(
+        "create_group", {"preferred_name": "Marina", "members": ["marina"]},
+        operation_id=uuid.uuid4().hex, actor="admin:1", expected_revision=0,
+    )
+    connection = catalogue.store.connection
+    with connection:
+        connection.execute("UPDATE autonomous_frontier SET attempts=2,operation_id='old',next_due=123 "
+                           "WHERE normalized_name='marina'")
+    second = discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    assert second["prepared"]["context"]["anchor"] == "marija"
+    retired = connection.execute("SELECT status,attempts,operation_id,next_due FROM autonomous_frontier "
+                                 "WHERE normalized_name='marina'").fetchone()
+    assert tuple(retired) == ("grouped", 2, "old", 123)
+    active = connection.execute("SELECT status,operation_id FROM autonomous_frontier "
+                                "WHERE normalized_name='ljubljana'").fetchone()
+    assert tuple(active) == ("prepared", first["discovery_id"])
+
+
+def test_membership_page_lookup_uses_primary_key(catalogue):
+    plan = " ".join(row[3] for row in catalogue.store.connection.execute(
+        "EXPLAIN QUERY PLAN SELECT normalized_name FROM group_members WHERE normalized_name IN (?,?)",
+        ("ljubljana", "marina"),
+    ))
+    assert "SEARCH group_members USING COVERING INDEX" in plan
+    assert "SCAN group_members" not in plan

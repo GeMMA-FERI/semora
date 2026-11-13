@@ -13,7 +13,7 @@ from typing import Any
 from semora.ner.names import normalize_name
 
 from .frequency import FrequencyNotReady, frequency_page
-from .proposals import PROMPT_VERSION, digest, prepare_task, review_response, validate_response
+from .proposals import PROMPT_VERSION, RecordedState, digest, prepare_task, review_response, validate_response
 from .store import Conflict
 
 POLICY_VERSION = "conservative-ocr-v1"
@@ -33,6 +33,7 @@ def initialize_autonomous(connection):
             generation TEXT NOT NULL, policy_version TEXT NOT NULL, frequency_identity TEXT NOT NULL,
             after_rank INTEGER NOT NULL DEFAULT 0,
             exhausted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation,policy_version));
+        CREATE TABLE IF NOT EXISTS autonomous_released_names(normalized_name TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS autonomous_frontier (
             generation TEXT NOT NULL, policy_version TEXT NOT NULL, normalized_name TEXT NOT NULL,
             article_count INTEGER NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
@@ -102,10 +103,68 @@ def _empty_result(store, operation, generation, reason=None):
         "SELECT 1 FROM autonomous_frontier WHERE generation=? AND policy_version=? AND status='queued' LIMIT 1",
         (generation, POLICY_VERSION),
     ).fetchone()
-    result = {"status": "empty", "discovery_id": operation, "has_more": bool(queued or (cursor and not cursor[0]))}
+    released = store.connection.execute("SELECT 1 FROM autonomous_released_names LIMIT 1").fetchone()
+    result = {
+        "status": "empty", "discovery_id": operation,
+        "has_more": bool(queued or released or (cursor and not cursor[0])),
+    }
     if reason:
         result["reason"] = reason[:500]
     return result
+
+
+def _grouped_names(connection, names):
+    """Check one bounded page against the authoritative name-membership primary key."""
+    names = list(dict.fromkeys(names))
+    if not names:
+        return set()
+    return {row[0] for row in connection.execute(
+        "SELECT normalized_name FROM group_members WHERE normalized_name IN ("
+        + ",".join("?" for _ in names) + ")", names
+    )}
+
+
+def _stage_released(catalogue, generation, limit):
+    """Stage a bounded queue of names released by deletion/undo without resetting the rank cursor."""
+    if limit <= 0:
+        return 0
+    connection = catalogue.store.connection
+    names = [row[0] for row in connection.execute(
+        "SELECT normalized_name FROM autonomous_released_names ORDER BY normalized_name LIMIT ?", (limit,)
+    )]
+    if not names:
+        return 0
+    grouped = _grouped_names(connection, names)
+    placeholders = ",".join("?" for _ in names)
+    counts = {row[0]: row[1] for row in catalogue.connection.execute(
+        f"SELECT normalized_name,article_count FROM names WHERE normalized_name IN ({placeholders})", names
+    )}
+    prior = {row[0]: (row[1], row[2]) for row in connection.execute(
+        "SELECT normalized_name,status,attempts FROM autonomous_frontier WHERE generation=? AND policy_version=? "
+        f"AND normalized_name IN ({placeholders})", (generation, POLICY_VERSION, *names)
+    )}
+    staged, removed = [], []
+    for name in names:
+        if name in grouped or name not in counts:
+            removed.append(name)
+        else:
+            status, attempts = prior.get(name, (None, 0))
+            if status in ("preparing", "prepared"):
+                continue
+            # A release does not reset retries or shorten a previously recorded
+            # cooldown. Those rows are already managed by the normal frontier.
+            if status in (None, "queued", "grouped", "published") and attempts < MAX_ATTEMPTS:
+                staged.append((generation, POLICY_VERSION, name, counts[name]))
+            removed.append(name)
+    connection.executemany(
+        "INSERT INTO autonomous_frontier(generation,policy_version,normalized_name,article_count,status) "
+        "VALUES(?,?,?,?,'queued') ON CONFLICT(generation,policy_version,normalized_name) DO UPDATE SET "
+        "article_count=excluded.article_count,status='queued',next_due=0", staged
+    )
+    connection.executemany(
+        "DELETE FROM autonomous_released_names WHERE normalized_name=?", [(name,) for name in removed]
+    )
+    return sum(prior.get(row[2], (None, 0))[0] != "queued" for row in staged)
 
 
 def discover_task(
@@ -197,17 +256,33 @@ def discover_task(
                     "AND attempts=0 AND operation_id IS NULL",
                     (generation, POLICY_VERSION),
                 )
+            # Membership is the checkmark. Retire only queued work; keep saved
+            # receipts and active reservations unchanged for replay/reconciliation.
+            connection.execute(
+                "UPDATE autonomous_frontier SET status='grouped' WHERE generation=? AND policy_version=? "
+                "AND status='queued' AND EXISTS(SELECT 1 FROM group_members m "
+                "WHERE m.normalized_name=autonomous_frontier.normalized_name)",
+                (generation, POLICY_VERSION),
+            )
             active = connection.execute(
                 "SELECT COUNT(*) FROM autonomous_frontier WHERE generation=? AND policy_version=? "
                 "AND status IN ('queued','preparing','prepared')",
                 (generation, POLICY_VERSION),
             ).fetchone()[0]
             free = max(0, MAX_FRONTIER - active)
+            free -= _stage_released(catalogue, generation, min(scan_limit, free))
             due = connection.execute(
                 "SELECT normalized_name FROM autonomous_frontier WHERE generation=? AND policy_version=? "
                 "AND status='deferred' AND next_due<=? ORDER BY next_due,normalized_name LIMIT ?",
                 (generation, POLICY_VERSION, now, min(scan_limit, free)),
             ).fetchall()
+            grouped = _grouped_names(connection, [row[0] for row in due])
+            connection.executemany(
+                "UPDATE autonomous_frontier SET status='grouped' WHERE generation=? AND policy_version=? "
+                "AND normalized_name=?",
+                [(generation, POLICY_VERSION, name) for name in grouped],
+            )
+            due = [row for row in due if row[0] not in grouped]
             connection.executemany(
                 "UPDATE autonomous_frontier SET status='queued' WHERE generation=? AND policy_version=? "
                 "AND normalized_name=?",
@@ -223,11 +298,13 @@ def discover_task(
             capacity = min(scan_limit, max(0, free - len(due)))
             if capacity and not cursor["exhausted"]:
                 rows = frequency_page(catalogue.entities, cursor["after_rank"], capacity)
+                grouped = _grouped_names(connection, [row["normalized_name"] for row in rows])
                 connection.executemany(
                     "INSERT OR IGNORE INTO autonomous_frontier"
                     "(generation,policy_version,normalized_name,article_count,status) "
                     "VALUES(?,?,?,?,'queued')",
-                    [(generation, POLICY_VERSION, row["normalized_name"], row["article_count"]) for row in rows],
+                    [(generation, POLICY_VERSION, row["normalized_name"], row["article_count"])
+                     for row in rows if row["normalized_name"] not in grouped],
                 )
                 connection.execute(
                     "UPDATE autonomous_frequency_cursors SET after_rank=?,exhausted=? "
@@ -241,7 +318,9 @@ def discover_task(
                 )
             selected = connection.execute(
                 "SELECT normalized_name FROM autonomous_frontier WHERE generation=? AND policy_version=? "
-                "AND status='queued' ORDER BY article_count DESC,normalized_name LIMIT 1",
+                "AND status='queued' AND NOT EXISTS(SELECT 1 FROM group_members m "
+                "WHERE m.normalized_name=autonomous_frontier.normalized_name) "
+                "ORDER BY article_count DESC,normalized_name LIMIT 1",
                 (generation, POLICY_VERSION),
             ).fetchone()
             anchor = selected[0] if selected else None
@@ -264,10 +343,21 @@ def discover_task(
     try:
         group_id = store.membership(anchor)
         if group_id:
-            group = store.group(group_id)
-            if group.get("human_reviewed", True) or group.get("origin", "human") != "autonomous":
-                raise ValueError("Human-reviewed groups are not autonomous discovery anchors.")
-        prepared = prepare_task(catalogue, anchor, group_id=group_id, limit=candidate_limit)
+            # Another pipeline can publish between anchor selection and preparation.
+            # There is no model work to do once that spelling has a group.
+            with connection:
+                connection.execute(
+                    "UPDATE autonomous_frontier SET status='grouped' WHERE generation=? AND policy_version=? "
+                    "AND normalized_name=? AND operation_id=? AND status='preparing'",
+                    (generation, POLICY_VERSION, anchor, operation),
+                )
+            return _store_result(store, operation, _empty_result(
+                store, operation, generation, "Discovery anchor already belongs to a curation group."
+            ))
+        group = None
+        prepared = prepare_task(
+            catalogue, anchor, group_id=group_id, limit=candidate_limit, include_autonomous_groups=True
+        )
         stats = {}
         for name in [anchor, *prepared["context"]["candidates"]]:
             row = catalogue.connection.execute(
@@ -308,34 +398,97 @@ def _ocr_signature(value):
     return _letters(value).replace("rn", "m").translate(str.maketrans({"l": "i", "0": "o", "1": "i"}))
 
 
-def _policy_accepts(anchor, name, stats):
+def _policy_accepts(anchor, name, stats, *, symmetric=True):
     first, second = _letters(anchor), _letters(name)
     if first == second and len(first) >= 4:
         return True
     # Restricted confusion-equivalent spellings, not arbitrary edit-distance edges.
     # Frequency is a conservative tie-breaker, not a claim of semantic certainty.
+    first_count, second_count = stats[anchor]["article_count"], stats[name]["article_count"]
+    dominant = max(first_count, second_count) if symmetric else first_count
+    subordinate = min(first_count, second_count) if symmetric else second_count
     return (
         len(first) >= 8
         and len(second) >= 8
         and first[0] == second[0]
         and _ocr_signature(anchor) == _ocr_signature(name)
-        and stats[anchor]["article_count"] >= 10
-        and stats[anchor]["article_count"] >= 5 * max(1, stats[name]["article_count"])
+        and dominant >= 10
+        and dominant >= 5 * max(1, subordinate)
     )
 
 
-def _final_result(catalogue, prepared, response):
-    checked = validate_response(prepared, response, catalogue.store, catalogue.entities.generation)
+def _policy_representatives(catalogue, prepared, response):
+    """Use group canonicals instead of rare aliases when checking automatic unions."""
     context = prepared["context"]
+    stats = dict(context["autonomous"]["stats"])
+    names = [context["anchor"], *[d["name"] for d in response["decisions"] if d["decision"] == "include"]]
+    representatives, groups = {}, {}
+    nodes = []
+    for name in names:
+        owner = catalogue.store.membership(name)
+        if owner is None:
+            representatives[name] = name
+            if name == context["anchor"]:
+                nodes.append(name)
+            continue
+        if owner not in groups:
+            group = catalogue.store.group(owner, include_provenance=False)
+            if group.get("origin") != "autonomous" or group.get("human_reviewed") is not False:
+                raise Conflict("Autonomous union cannot modify a protected group.")
+            representative = normalize_name(group["preferred_name"])
+            snapshot = context.get("autonomous_groups", {}).get(owner)
+            if snapshot:
+                if representative != snapshot["representative"]:
+                    raise Conflict("Autonomous group representative changed during inference.")
+                value = snapshot["representative_stats"]
+            else:
+                # Only a concurrently created owner reaches this path. The pinned
+                # dictionary is immutable; a bounded UNIQUE lookup may reject an
+                # old model decision without changing its original operation hash.
+                row = catalogue.connection.execute(
+                    "SELECT name,article_count FROM names WHERE normalized_name=?", (representative,)
+                ).fetchone()
+                if row is None:
+                    raise Conflict("Autonomous group representative is absent from the publication.")
+                value = dict(row)
+            if not isinstance(catalogue.store, RecordedState) and representative not in group["members"]:
+                raise Conflict("Autonomous group representative is not a group member.")
+            groups[owner] = representative
+            stats[representative] = value
+            nodes.append(representative)
+        representatives[name] = groups[owner]
+    nodes = list(dict.fromkeys(nodes))
+    compatible = all(
+        _policy_accepts(first, second, stats)
+        for index, first in enumerate(nodes) for second in nodes[index + 1:]
+    )
+    baseline = max(nodes, key=lambda name: stats[name]["article_count"])
+    return representatives, stats, baseline, compatible
+
+
+def _final_result(catalogue, prepared, response):
+    context = prepared["context"]
+    overlap = context.get("overlap_version") == "unreviewed-union-v1"
+    checked = validate_response(
+        prepared, response, catalogue.store, catalogue.entities.generation, allow_autonomous_overlap=overlap
+    )
     automatic = context.get("autonomous", {})
     if automatic.get("policy_version") != POLICY_VERSION or context["prompt_version"] != PROMPT_VERSION:
         raise ValueError("Unsupported autonomous policy or prompt version.")
     stats = automatic["stats"]
     response = copy.deepcopy(json.loads(response) if isinstance(response, str) else response)
+    if overlap:
+        representatives, policy_stats, baseline, compatible = _policy_representatives(catalogue, prepared, response)
     added = []
     for decision in response["decisions"]:
         if decision["decision"] == "include":
-            if not _policy_accepts(context["anchor"], decision["name"], stats):
+            allowed = (
+                compatible and (
+                    baseline == representatives[decision["name"]]
+                    or _policy_accepts(baseline, representatives[decision["name"]], policy_stats)
+                ) if overlap else _policy_accepts(context["anchor"], decision["name"], stats, symmetric=False)
+            )
+            if not allowed:
                 decision.update(
                     decision="uncertain", reason="Deferred by conservative autonomous spelling policy.", evidence_ids=[]
                 )
@@ -345,7 +498,9 @@ def _final_result(catalogue, prepared, response):
         response["preferred_name"] = automatic["preferred_name"]
     elif normalize_name(response["preferred_name"]) != context["anchor"]:
         response["preferred_name"] = stats[context["anchor"]]["name"]
-    checked = validate_response(prepared, response, catalogue.store, catalogue.entities.generation)
+    checked = validate_response(
+        prepared, response, catalogue.store, catalogue.entities.generation, allow_autonomous_overlap=overlap
+    )
     result = {
         "status": "accepted" if added else "deferred",
         "prepared": prepared,
@@ -368,7 +523,10 @@ def evaluate_response(catalogue: Any, prepared: dict[str, Any], response: Any) -
     ).fetchone()
     if row:
         return json.loads(row[0])
-    checked = review_response(catalogue, prepared, response)
+    checked = review_response(
+        catalogue, prepared, response,
+        allow_autonomous_overlap=prepared["context"].get("overlap_version") == "unreviewed-union-v1",
+    )
     if "follow_up" in checked:
         result = {"status": "follow_up", "prepared": checked["follow_up"]}
     else:
@@ -447,6 +605,9 @@ def apply_autonomous(
         "evidence_ids": sorted({reference for decision in decisions for reference in decision["evidence_ids"]}),
     }
 
+    if context.get("overlap_version") == "unreviewed-union-v1":
+        provenance["overlap_version"] = context["overlap_version"]
+
     def validate():
         reservation = catalogue.store.connection.execute(
             "SELECT status,operation_id,next_due FROM autonomous_frontier WHERE generation=? AND policy_version=? "
@@ -460,7 +621,10 @@ def apply_autonomous(
             or reservation["next_due"] <= time.time()
         ):
             raise Conflict("Autonomous pipeline reservation expired or was superseded.")
-        return _final_result(catalogue, prepared, response)
+        current = _final_result(catalogue, prepared, response)
+        if current["status"] != "accepted" or set(current["validated"]["members"]) != set(selected["members"]):
+            raise Conflict("Autonomous group changes invalidate the accepted model decisions.")
+        return current
 
     result = catalogue.store.apply_autonomous(
         payload, provenance=provenance, operation_id=operation_id, validate=validate, authorize=authorize

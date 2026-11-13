@@ -61,7 +61,9 @@ class RecordedState:
     def membership(self, name):
         return self.context["state"]["memberships"].get(name)
 
-    def group(self, group_id):
+    def group(self, group_id, *, include_provenance=True):
+        if group_id in self.context.get("autonomous_groups", {}):
+            return self.context["autonomous_groups"][group_id]
         return {"version": self.context["state"]["group_version"]}
 
     def rejected(self, first, second):
@@ -124,7 +126,10 @@ def _build_task(context):
     return {**prepared, "fingerprint": digest(prepared)}
 
 
-def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limit: int = 8) -> dict[str, Any]:
+def prepare_task(
+    catalogue: Any, name: str, *, group_id: str | None = None, limit: int = 8,
+    include_autonomous_groups: bool = False,
+) -> dict[str, Any]:
     """Prepare only spellings; do not touch article evidence for obvious variants."""
     if type(limit) is not int or not 1 <= limit <= 12:
         raise ValueError("Use 1-12 proposal candidates.")
@@ -141,9 +146,33 @@ def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limi
     if len(existing) > 20:
         raise ValueError("Groups above 20 members require manual review.")
     discovered = catalogue.suggest_variants(anchor, group_id=group_id, limit=limit)
-    candidates = [c["normalized_name"] for c in discovered["candidates"] if not c["group_id"]]
+    candidates, autonomous_groups = [], {}
+    for candidate in discovered["candidates"]:
+        owner = candidate["group_id"]
+        if owner is None:
+            candidates.append(candidate["normalized_name"])
+        elif include_autonomous_groups:
+            if owner in autonomous_groups:
+                candidates.append(candidate["normalized_name"])
+                continue
+            owner_group = store.group(owner, include_provenance=False)
+            if owner_group.get("origin") == "autonomous" and owner_group.get("human_reviewed") is False:
+                representative = normalize_name(owner_group["preferred_name"])
+                row = catalogue.connection.execute(
+                    "SELECT name,article_count FROM names WHERE normalized_name=?", (representative,)
+                ).fetchone()
+                if representative not in owner_group["members"] or row is None:
+                    raise Conflict("Autonomous group has no published representative spelling.")
+                candidates.append(candidate["normalized_name"])
+                autonomous_groups[owner] = {
+                    key: owner_group[key]
+                    for key in ("group_id", "version", "origin", "human_reviewed", "preferred_name")
+                }
+                autonomous_groups[owner].update(
+                    representative=representative, representative_stats=dict(row)
+                )
     if not candidates:
-        raise ValueError("No ungrouped candidates available for model review.")
+        raise ValueError("No eligible candidates available for model review.")
     context = {
         "prompt_version": PROMPT_VERSION,
         "stage": "spelling",
@@ -158,15 +187,22 @@ def prepare_task(catalogue: Any, name: str, *, group_id: str | None = None, limi
         "candidates": candidates,
         "evidence": [],
     }
+    if include_autonomous_groups:
+        context["autonomous_groups"] = autonomous_groups
+        context["overlap_version"] = "unreviewed-union-v1"
     if store.metadata()["revision"] != revision:
         raise Conflict("Curation changed during task preparation; retry.")
     return _build_task(context)
 
 
-def review_response(catalogue: Any, prepared: dict[str, Any], response: Any) -> dict[str, Any]:
+def review_response(
+    catalogue: Any, prepared: dict[str, Any], response: Any, *, allow_autonomous_overlap: bool = False,
+) -> dict[str, Any]:
     """At most one bounded optional evidence round; all domain policy stays here."""
     store = catalogue.store
-    checked = validate_response(prepared, response, store, catalogue.entities.generation)
+    checked = validate_response(
+        prepared, response, store, catalogue.entities.generation, allow_autonomous_overlap=allow_autonomous_overlap
+    )
     if not checked.get("needs_evidence"):
         return checked
     import copy
@@ -206,12 +242,39 @@ def review_response(catalogue: Any, prepared: dict[str, Any], response: Any) -> 
     follow_up = _build_task(context)
     if not requested:
         # No useful passages: present uncertainty without spending another model call.
-        final = validate_response(follow_up, response, store, catalogue.entities.generation)
+        final = validate_response(
+            follow_up, response, store, catalogue.entities.generation,
+            allow_autonomous_overlap=allow_autonomous_overlap,
+        )
         return {**final, "prepared": follow_up, "response": response}
     return {"follow_up": follow_up}
 
 
-def validate_response(prepared: dict[str, Any], response: Any, store: Any, generation: str) -> dict[str, Any]:
+def _autonomous_owner(store, owner):
+    if owner is None:
+        return False
+    group = store.group(owner, include_provenance=False)
+    return group.get("origin") == "autonomous" and group.get("human_reviewed") is False
+
+
+def _compatible_state(expected, current, store, allow_autonomous_overlap):
+    if expected == current:
+        return True
+    if not allow_autonomous_overlap:
+        return False
+    if expected["group_version"] != current["group_version"] or expected["rejected_pairs"] != current["rejected_pairs"]:
+        return False
+    for name, before in expected["memberships"].items():
+        after = current["memberships"].get(name)
+        if before != after and (before is not None or not _autonomous_owner(store, after)):
+            return False
+    return True
+
+
+def validate_response(
+    prepared: dict[str, Any], response: Any, store: Any, generation: str, *,
+    allow_autonomous_overlap: bool = False,
+) -> dict[str, Any]:
     """Validate membership and evidence mechanically; semantic approval remains human."""
     if digest({k: prepared[k] for k in ("context", "task")}) != prepared["fingerprint"]:
         raise ValueError("Prepared task fingerprint differs.")
@@ -220,8 +283,11 @@ def validate_response(prepared: dict[str, Any], response: Any, store: Any, gener
     if (
         context["corpus_id"] != metadata["corpus_id"]
         or context["generation"] != generation
-        or context["state"]
-        != relevant_state(store, [*context["existing_members"], *context["candidates"]], context["group_id"])
+        or not _compatible_state(
+            context["state"],
+            relevant_state(store, [*context["existing_members"], *context["candidates"]], context["group_id"]),
+            store, allow_autonomous_overlap,
+        )
     ):
         raise Conflict("Proposal is stale; prepare a new task.")
     if isinstance(response, str):
@@ -264,7 +330,10 @@ def validate_response(prepared: dict[str, Any], response: Any, store: Any, gener
             cited_names = {evidence[r] for r in refs}
             if (legacy or refs) and not {context["anchor"], name} <= cited_names:
                 raise ValueError("Inclusion requires anchor and candidate source evidence.")
-            if store.membership(name) not in (None, context["group_id"]):
+            owner = store.membership(name)
+            if owner not in (None, context["group_id"]) and not (
+                allow_autonomous_overlap and _autonomous_owner(store, owner)
+            ):
                 raise Conflict("Candidate now belongs to another group.")
             members.append(name)
     for first, second in combinations(members, 2):
