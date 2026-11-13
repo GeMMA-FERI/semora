@@ -114,3 +114,57 @@ def test_preparation_rejects_borrowed_temp_state_without_dropping_it(source, tmp
     assert source.execute("SELECT value FROM caller_state").fetchone()[0] == "keep"
     assert source.execute("PRAGMA temp_store").fetchone()[0] == original
     assert not list(tmp_path.rglob("*.sqlite"))
+
+
+def test_optional_progress_retries_a_transient_viewer_lock(tmp_path, monkeypatch):
+    import json
+
+    from semora.curation import frequency
+
+    path = tmp_path / "progress.json"
+    original = frequency.os.replace
+    attempts = []
+
+    def replace(source, target):
+        attempts.append(target)
+        if len(attempts) == 1:
+            raise PermissionError("viewer briefly holds progress file")
+        return original(source, target)
+
+    monkeypatch.setattr(frequency.os, "replace", replace)
+    monkeypatch.setattr(frequency.time, "sleep", lambda _: None)
+    frequency.progress_reporter(path)({"state": "running", "completed": 2, "total": 5})
+    assert len(attempts) == 2
+    assert json.loads(path.read_text())["completed"] == 2
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+def test_locked_optional_progress_never_aborts_index_and_recovers(source, tmp_path, monkeypatch, caplog):
+    import json
+
+    from semora.curation import frequency
+
+    path = tmp_path / "progress.json"
+    path.write_text('{"completed":0}')
+    original = frequency.os.replace
+    attempts = []
+
+    def replace(source, target):
+        if target == path:
+            attempts.append(target)
+            raise PermissionError("viewer keeps progress file locked")
+        return original(source, target)
+
+    monkeypatch.setattr(frequency.os, "replace", replace)
+    monkeypatch.setattr(frequency.time, "sleep", lambda _: None)
+    report = frequency.progress_reporter(path)
+    result = prepare_frequency(source, tmp_path / "index", "dictionary", batch_size=2, progress=report)
+    assert result["names"] == 5
+    assert len(frequency_page(entity(result), 0, 20)) == 5
+    assert len(attempts) == 24  # Six snapshots, each with a bounded four attempts.
+    assert json.loads(path.read_text()) == {"completed": 0}
+    assert len([r for r in caplog.records if "indexing continues" in r.message]) == 1
+    assert not list(tmp_path.glob("*.tmp-*"))
+    monkeypatch.setattr(frequency.os, "replace", original)
+    report({"state": "completed", "completed": 5, "total": 5})
+    assert json.loads(path.read_text())["completed"] == 5

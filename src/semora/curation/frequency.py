@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import closing
@@ -14,6 +16,7 @@ from pathlib import Path
 
 from semora.retrieval.semantic_lock import SemanticBuildLock
 
+LOGGER = logging.getLogger(__name__)
 FORMAT = "semora.curation.frequency.v1"
 PAGE_SQL = "SELECT rank,entity_id,normalized_name,article_count FROM ranked_names WHERE rank>? ORDER BY rank LIMIT ?"
 
@@ -163,18 +166,14 @@ def prepare_frequency(
             source.execute(f"PRAGMA temp_store={original_temp_store}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index-dir", type=Path, required=True)
-    parser.add_argument("--progress-file", type=Path)
-    args = parser.parse_args()
-    from semora.retrieval import SearchEngine
+def progress_reporter(path: Path | None) -> Callable[[dict], None]:
+    """Publish optional monitoring without letting a viewer lock abort index work."""
+    unavailable = False
 
     def report(value):
-        if args.progress_file is None:
+        nonlocal unavailable
+        if path is None:
             return
-        path = args.progress_file
-        path.parent.mkdir(parents=True, exist_ok=True)
         value = {
             "format": "pebble.progress.v1",
             "title": "Prepare common entity order",
@@ -183,9 +182,41 @@ def main() -> None:
             **value,
         }
         temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
-        temporary.write_text(json.dumps(value), encoding="utf-8")
-        os.replace(temporary, path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(value), encoding="utf-8")
+            for attempt in range(4):
+                try:
+                    os.replace(temporary, path)
+                    unavailable = False
+                    return
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.025 * (attempt + 1))
+        except OSError as error:
+            # Report the first failure in a run of locked updates, then try again
+            # at the next durable checkpoint without flooding a long build's log.
+            if not unavailable:
+                LOGGER.warning("Could not publish optional frequency progress; indexing continues: %s", error)
+            unavailable = True
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.debug("Could not remove optional progress temporary file %s", temporary, exc_info=True)
 
+    return report
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--index-dir", type=Path, required=True)
+    parser.add_argument("--progress-file", type=Path)
+    args = parser.parse_args()
+    from semora.retrieval import SearchEngine
+
+    report = progress_reporter(args.progress_file)
     engine = SearchEngine(args.index_dir / "semora.sqlite")
     try:
         entities = engine._entities()
