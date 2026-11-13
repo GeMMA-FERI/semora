@@ -7,6 +7,7 @@ import pytest
 from semora.curation import CurationStore
 from semora.curation.autonomous import POLICY_VERSION, apply_autonomous, discover_task, evaluate_response
 from semora.curation.catalogue import CurationCatalogue
+from semora.curation.frequency import prepare_frequency
 from semora.curation.store import Conflict
 
 
@@ -27,8 +28,11 @@ def catalogue(tmp_path):
             (4, "marija", "Marija", 10),
         ],
     )
+    connection.commit()
     with CurationStore(tmp_path / "curation.sqlite", corpus_id="c", initialize=True) as store:
-        entities = SimpleNamespace(connection=connection, generation="g", run_id="ner")
+        frequency = prepare_frequency(connection, tmp_path / "frequency", "dictionary")
+        entities = SimpleNamespace(connection=connection, generation="g", run_id="ner",
+                                   frequency_path=frequency["path"], frequency_identity=frequency["identity"])
         entities.search_entities = lambda q: {
             "entities": [
                 {"name": row["name"], "article_count": row["article_count"], "distance": 1}
@@ -54,10 +58,10 @@ def test_discovery_replay_priority_cursor_and_request_identity(catalogue):
     first = discover_task(catalogue, operation_id=operation, scan_limit=2)
     assert first["status"] == "prepared"
     assert first["prepared"]["context"]["anchor"] == "ljubljana"
-    cursor = catalogue.store.connection.execute("SELECT after_entity_id FROM autonomous_cursors").fetchone()[0]
+    cursor = catalogue.store.connection.execute("SELECT after_rank FROM autonomous_frequency_cursors").fetchone()[0]
     assert cursor == 2
     assert discover_task(catalogue, operation_id=operation, scan_limit=2) == first
-    assert catalogue.store.connection.execute("SELECT after_entity_id FROM autonomous_cursors").fetchone()[0] == 2
+    assert catalogue.store.connection.execute("SELECT after_rank FROM autonomous_frequency_cursors").fetchone()[0] == 2
     with pytest.raises(Conflict):
         discover_task(catalogue, operation_id=operation, scan_limit=3)
     catalogue.entities.generation = "other"
@@ -130,7 +134,9 @@ def test_cooldown_and_exhaustion_do_not_rescan_names(catalogue):
     )
     for _ in range(4):
         discover_task(catalogue, operation_id=uuid.uuid4().hex, now=1)
-    cursor = catalogue.store.connection.execute("SELECT after_entity_id,exhausted FROM autonomous_cursors").fetchone()
+    cursor = catalogue.store.connection.execute(
+        "SELECT after_rank,exhausted FROM autonomous_frequency_cursors"
+    ).fetchone()
     assert tuple(cursor) == (4, 1)
     assert catalogue.store.connection.execute("SELECT MAX(attempts) FROM autonomous_frontier").fetchone()[0] == 1
 
@@ -348,3 +354,85 @@ def test_published_members_retain_bounded_decisions_and_evidence_references(cata
     assert "passages" not in retained and "evidence" not in retained
     assert len(evaluated["response"]["decisions"][0]["reason"]) == 240
     assert apply_autonomous(catalogue, follow_up, response, operation_id=operation, provenance=metadata) == result
+
+
+def test_frequency_upgrade_resets_only_unreserved_staging_and_preserves_history(catalogue):
+    import json
+
+    from semora.curation.autonomous import initialize_autonomous
+    from semora.curation.proposals import digest
+
+    connection = catalogue.store.connection
+    initialize_autonomous(connection)
+    old_operation = uuid.uuid4().hex
+    old_result = {"status": "prepared", "prepared": {"context": {"anchor": "old-active"}}}
+    with connection:
+        connection.execute("INSERT INTO autonomous_cursors VALUES(?,?,999,1)", ("g", POLICY_VERSION))
+        connection.executemany(
+            "INSERT INTO autonomous_frontier(generation,policy_version,normalized_name,article_count,status) "
+            "VALUES(?,?,?,1,'queued')",
+            [("g", POLICY_VERSION, f"old-unreserved-{i}") for i in range(512)],
+        )
+        connection.executemany(
+            "INSERT INTO autonomous_frontier VALUES(?,?,?,1,?,?,?,?,'history')",
+            [("g", POLICY_VERSION, "old-active", "prepared", 1, 99999999999, old_operation),
+             ("g", POLICY_VERSION, "old-retry", "queued", 2, 0, "previous-attempt"),
+             ("g", POLICY_VERSION, "old-deferred", "deferred", 2, 99999999999, "previous-deferred"),
+             ("g", POLICY_VERSION, "old-published", "published", 1, 0, "previous-publication")],
+        )
+        connection.execute("INSERT INTO autonomous_discovery_receipts VALUES(?,?,?,?,?,?)",
+                           (old_operation, "g", POLICY_VERSION, "old-active",
+                            digest({"scan_limit": 128, "candidate_limit": 8}), json.dumps(old_result)))
+    result = discover_task(catalogue, operation_id=uuid.uuid4().hex, now=1)
+    assert result["prepared"]["context"]["anchor"] == "ljubljana"
+    assert connection.execute(
+        "SELECT COUNT(*) FROM autonomous_frontier WHERE normalized_name LIKE 'old-unreserved-%'"
+    ).fetchone()[0] == 0
+    for name, status, attempts in [("old-active", "prepared", 1), ("old-retry", "queued", 2),
+                                   ("old-deferred", "deferred", 2), ("old-published", "published", 1)]:
+        row = connection.execute(
+            "SELECT status,attempts,reason FROM autonomous_frontier WHERE normalized_name=?", (name,)
+        ).fetchone()
+        assert tuple(row) == (status, attempts, "history")
+    assert tuple(connection.execute("SELECT after_entity_id,exhausted FROM autonomous_cursors").fetchone()) == (999, 1)
+    assert connection.execute("SELECT after_rank FROM autonomous_frequency_cursors").fetchone()[0] == 4
+    assert discover_task(catalogue, operation_id=old_operation, now=2) == old_result
+
+
+def test_missing_frequency_is_explicit_and_manual_reads_still_work(catalogue):
+    original = catalogue.entities.frequency_path
+    catalogue.entities.frequency_path = str(original) + ".missing"
+    result = discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    assert result["status"] == "empty" and result["has_more"]
+    assert "not ready" in result["reason"]
+    assert catalogue.find_names("lju")["names"]
+    assert catalogue.store.connection.execute("SELECT COUNT(*) FROM autonomous_frequency_cursors").fetchone()[0] == 0
+
+
+def test_rank_cursor_is_bound_to_artifact_identity(catalogue, tmp_path):
+    discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    original_rank = catalogue.store.connection.execute(
+        "SELECT after_rank FROM autonomous_frequency_cursors"
+    ).fetchone()[0]
+    other = prepare_frequency(catalogue.connection, tmp_path / "other", "different-dictionary")
+    catalogue.entities.frequency_path = other["path"]
+    catalogue.entities.frequency_identity = other["identity"]
+    with pytest.raises(Conflict, match="Frequency order changed"):
+        discover_task(catalogue, operation_id=uuid.uuid4().hex)
+    assert catalogue.store.connection.execute(
+        "SELECT after_rank FROM autonomous_frequency_cursors"
+    ).fetchone()[0] == original_rank
+
+
+def test_discovery_starts_with_common_high_id_before_rare_low_id(catalogue, tmp_path):
+    with catalogue.connection:
+        catalogue.connection.execute("UPDATE names SET entity_id=999 WHERE normalized_name='ljubljana'")
+        catalogue.connection.execute("INSERT INTO names VALUES(1,'#rare','#rare',1)")
+    ranked = prepare_frequency(catalogue.connection, tmp_path / "high-id", "high-id-dictionary")
+    catalogue.entities.frequency_path = ranked["path"]
+    catalogue.entities.frequency_identity = ranked["identity"]
+    traced = []
+    catalogue.connection.set_trace_callback(traced.append)
+    result = discover_task(catalogue, operation_id=uuid.uuid4().hex, scan_limit=1)
+    assert result["prepared"]["context"]["anchor"] == "ljubljana"
+    assert not any("ORDER BY article_count" in sql for sql in traced)

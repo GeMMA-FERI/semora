@@ -31,6 +31,8 @@ class EntitySearch:
             raise ValueError("Entity dictionary differs from the serving publication.")
         self.generation = publication["publication_id"] if publication is not None else legacy_generation
         self.run_id = manifest["ner_run_id"]
+        self.dictionary_generation = legacy_generation
+        self.advancement_token = ""
         path = manifest_path.parent / f"{legacy_generation}.sqlite"
         if path.is_symlink() or not path.resolve(strict=True).is_relative_to(manifest_path.parent.resolve()):
             raise ValueError("Entity dictionary file escapes its artifact root.")
@@ -53,6 +55,11 @@ class EntitySearch:
                     or binding["advancement_token"] != profile["advancement_token"]
                 ):
                     raise ValueError("Entity dictionary advancement differs from the corpus.")
+            from semora.curation.frequency import dictionary_advancement_token, frequency_identity, frequency_path
+
+            self.advancement_token = dictionary_advancement_token(self.connection)
+            self.frequency_identity = frequency_identity(legacy_generation, self.advancement_token)
+            self.frequency_path = frequency_path(manifest_path.parent, self.frequency_identity)
             load_spellfix(self.connection, extension_path(Path(engine.database.path).resolve().parent.parent))
             self.connection.execute(
                 "ATTACH DATABASE ? AS corpus", (Path(engine.database.path).resolve().as_uri() + "?mode=ro",)

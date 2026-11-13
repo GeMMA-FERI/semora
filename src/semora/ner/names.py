@@ -90,6 +90,9 @@ def build_entity_names(root, run_id="classla-sl", batch_size=10000):
                         target.execute("INSERT INTO name_spellfix(rowid,word,rank) "
                                        "SELECT entity_id,normalized_name,article_count FROM names")
                     count = target.execute("SELECT COUNT(*) FROM names").fetchone()[0]
+                    from semora.curation.frequency import prepare_frequency
+
+                    prepare_frequency(target, folder, generation)
             manifest = {"generation": generation, "ner_run_id": run_id, "names": count}
             temporary = folder / "manifest.tmp"
             temporary.write_text(json.dumps(manifest), encoding="utf-8")

@@ -183,3 +183,30 @@ recorded task state. The unreviewed first-round answer is not an assistant train
 target in the context-round export; raw exchanges remain separately retained.
 Historical examples remain exportable after later publications, without authorizing
 application of obsolete proposals. Tests: `tests/test_curation_proposals.py`.
+
+
+## Common-first autonomous discovery
+
+Autonomous discovery consumes a separate frequency-order artifact, keyed by the
+entity dictionary generation and advancement token. It ranks names by the number
+of distinct articles, descending, with entity ID as a stable tie-breaker. It never
+sorts the whole dictionary during a discovery request: bounded rank pages feed the
+curation frontier. Existing reservations, receipts, cooldowns and reviewed groups
+survive the transition from ID-order discovery.
+
+Full entity builds and completed additive entity-index batches prepare this
+auxiliary artifact once. For an existing publication, prepare it explicitly before
+enabling idle curation:
+
+```sh
+python -m semora.curation.frequency --index-dir ./indexes --progress-file ./frequency-progress.json
+```
+
+Preparation reads only name metadata and writes a separate SQLite artifact;
+source articles, the published dictionary and curation groups stay unchanged.
+The optional progress file follows `pebble.progress.v1`, with counts published
+after durable checkpoints. Preparation can require a disk-backed sort on large
+dictionaries, so run it while foreground workloads are idle. The completed file
+is published atomically; an interrupted build is retried from scratch. Artifacts
+are reused only for the exact source identity. Missing artifacts produce an
+explicit not-ready discovery result; manual curation remains available.

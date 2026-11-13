@@ -12,6 +12,7 @@ from typing import Any
 
 from semora.ner.names import normalize_name
 
+from .frequency import FrequencyNotReady, frequency_page
 from .proposals import PROMPT_VERSION, digest, prepare_task, review_response, validate_response
 from .store import Conflict
 
@@ -27,6 +28,10 @@ def initialize_autonomous(connection):
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS autonomous_cursors (
             generation TEXT NOT NULL, policy_version TEXT NOT NULL, after_entity_id INTEGER NOT NULL DEFAULT 0,
+            exhausted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation,policy_version));
+        CREATE TABLE IF NOT EXISTS autonomous_frequency_cursors (
+            generation TEXT NOT NULL, policy_version TEXT NOT NULL, frequency_identity TEXT NOT NULL,
+            after_rank INTEGER NOT NULL DEFAULT 0,
             exhausted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(generation,policy_version));
         CREATE TABLE IF NOT EXISTS autonomous_frontier (
             generation TEXT NOT NULL, policy_version TEXT NOT NULL, normalized_name TEXT NOT NULL,
@@ -90,7 +95,7 @@ def _defer(store, generation, anchor, reason, *, now, operation_id):
 
 def _empty_result(store, operation, generation, reason=None):
     cursor = store.connection.execute(
-        "SELECT exhausted FROM autonomous_cursors WHERE generation=? AND policy_version=?",
+        "SELECT exhausted FROM autonomous_frequency_cursors WHERE generation=? AND policy_version=?",
         (generation, POLICY_VERSION),
     ).fetchone()
     queued = store.connection.execute(
@@ -106,11 +111,7 @@ def _empty_result(store, operation, generation, reason=None):
 def discover_task(
     catalogue: Any, *, operation_id: str, scan_limit: int = 128, candidate_limit: int = 8, now: float | None = None
 ) -> dict[str, Any]:
-    """Stage a bounded window by indexed ID, then prioritize within that window.
-
-    This deliberately does not claim global frequency ordering. The durable cursor
-    eventually covers each generation; no query sorts or repeatedly scans all names.
-    """
+    """Stage globally common names from a prepared rank index using bounded keyset pages."""
     if type(scan_limit) is not int or not 1 <= scan_limit <= 512:
         raise ValueError("Use a discovery scan of 1-512 names.")
     if type(candidate_limit) is not int or not 1 <= candidate_limit <= 12:
@@ -172,10 +173,30 @@ def discover_task(
                     _empty_result(store, operation, generation, "The original discovery reservation expired."),
                 )
         else:
-            connection.execute(
-                "INSERT OR IGNORE INTO autonomous_cursors(generation,policy_version) VALUES(?,?)",
-                (generation, POLICY_VERSION),
-            )
+            try:
+                frequency_page(catalogue.entities, 0, 0)
+            except FrequencyNotReady as error:
+                result = {"status": "empty", "discovery_id": operation, "has_more": True,
+                          "reason": str(error)}
+                connection.execute(
+                    "INSERT INTO autonomous_discovery_receipts VALUES(?,?,?,?,?,?)",
+                    (operation, generation, POLICY_VERSION, None, request_hash, _json(result)),
+                )
+                connection.commit()
+                return result
+            new_order = connection.execute(
+                "INSERT OR IGNORE INTO autonomous_frequency_cursors"
+                "(generation,policy_version,frequency_identity) VALUES(?,?,?)",
+                (generation, POLICY_VERSION, catalogue.entities.frequency_identity),
+            ).rowcount
+            if new_order:
+                # Old ID-ordered staging has no reservations. Refill it from rank zero,
+                # preserving every in-flight lease, receipt, cooldown and published group.
+                connection.execute(
+                    "DELETE FROM autonomous_frontier WHERE generation=? AND policy_version=? AND status='queued' "
+                    "AND attempts=0 AND operation_id IS NULL",
+                    (generation, POLICY_VERSION),
+                )
             active = connection.execute(
                 "SELECT COUNT(*) FROM autonomous_frontier WHERE generation=? AND policy_version=? "
                 "AND status IN ('queued','preparing','prepared')",
@@ -193,16 +214,15 @@ def discover_task(
                 [(generation, POLICY_VERSION, row[0]) for row in due],
             )
             cursor = connection.execute(
-                "SELECT after_entity_id,exhausted FROM autonomous_cursors WHERE generation=? AND policy_version=?",
+                "SELECT after_rank,exhausted,frequency_identity FROM autonomous_frequency_cursors "
+                "WHERE generation=? AND policy_version=?",
                 (generation, POLICY_VERSION),
             ).fetchone()
+            if cursor["frequency_identity"] != catalogue.entities.frequency_identity:
+                raise Conflict("Frequency order changed within the published entity generation.")
             capacity = min(scan_limit, max(0, free - len(due)))
             if capacity and not cursor["exhausted"]:
-                rows = catalogue.connection.execute(
-                    "SELECT entity_id,normalized_name,article_count FROM names WHERE entity_id>? "
-                    "ORDER BY entity_id LIMIT ?",
-                    (cursor["after_entity_id"], capacity),
-                ).fetchall()
+                rows = frequency_page(catalogue.entities, cursor["after_rank"], capacity)
                 connection.executemany(
                     "INSERT OR IGNORE INTO autonomous_frontier"
                     "(generation,policy_version,normalized_name,article_count,status) "
@@ -210,10 +230,10 @@ def discover_task(
                     [(generation, POLICY_VERSION, row["normalized_name"], row["article_count"]) for row in rows],
                 )
                 connection.execute(
-                    "UPDATE autonomous_cursors SET after_entity_id=?,exhausted=? "
+                    "UPDATE autonomous_frequency_cursors SET after_rank=?,exhausted=? "
                     "WHERE generation=? AND policy_version=?",
                     (
-                        rows[-1]["entity_id"] if rows else cursor["after_entity_id"],
+                        rows[-1]["rank"] if rows else cursor["after_rank"],
                         int(len(rows) < capacity),
                         generation,
                         POLICY_VERSION,

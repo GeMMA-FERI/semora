@@ -317,6 +317,9 @@ def index_batch_entities(
                                 "total": eligible,
                             }
                         )
+                from semora.curation.frequency import prepare_frequency
+
+                prepare_frequency(target, root, _manifest_value["generation"], current_token)
                 return {
                     "batch_id": batch_id,
                     "stage": "entities",
