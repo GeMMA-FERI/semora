@@ -243,3 +243,33 @@ handling change; the publication policy still covers OCR/spelling equivalence.
 
 These changes are local to the curation sidecar and worker library; no new backend
 job type, inference response schema or server database migration is required.
+
+
+## Model-selected autonomous display names
+
+New automatic proposals use a private `display_name_version: model-display-v1`
+marker. The existing `preferred_name` response field asks for a readable canonical
+label, including standard capitalization and the usual base form. A label need
+not be a raw OCR spelling. This does not authorize additional member spellings or
+change the conservative OCR-equivalence policy; manual proposals remain strict.
+
+Matching and automatic publication use a separate representative selected from
+at most 100 current raw members through indexed dictionary lookups, preferring
+the highest published article count with a deterministic name tie-break. The
+prepared fingerprint binds the representative, counts and group version. Live
+publication recomputes that representative if the captured version or membership
+changed; immutable recorded-state validation retains the original proof for
+receipt replay. Display text never creates group identity or merges namesakes.
+
+A newly created group uses the validated model label. An existing autonomous,
+unreviewed group may change its label only when its current version matches the
+version captured by this proposal. Concurrently changed or newly encountered
+groups retain their current label while accepted member unions can still proceed.
+Human-reviewed and protected groups retain their existing protections. Label-only
+changes advance the audited group version and support undo without invalidating
+unchanged exact article counts or membership keys.
+
+Legacy prepared tasks retain their original prompt, selected-spelling clamp and
+receipt hashes. Existing groups are not relabeled in bulk: a future eligible
+proposal can improve an existing label. No additional model call, response field,
+backend API or database schema is needed.
